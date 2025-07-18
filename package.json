@@ -1,0 +1,58 @@
+{
+  "name": "tero",
+  "version": "1.4.0",
+  "description": "tero is a JSON document Manager, with ACID complaint and backup recovery mechanism.",
+  "main": "dist/index.js",
+  "type": "module",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codedynasty-dev/tero.git"
+  },
+  "author": "friday candour fridaycandours@gmail.com",
+  "bugs": {
+    "url": "https://github.com/codedynasty-dev/tero/issues"
+  },
+  "homepage": "https://github.com/codedynasty-dev/tero.git",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node run-tests.js",
+    "test:production": "node tests/production-test.js",
+    "test:legacy": "node tests/test.js",
+    "test:backup": "node tests/backup-test.js",
+    "test:schema": "node tests/schema-test.js",
+    "test:all": "npm run test",
+    "test:watch": "npm run test",
+    "prebuild": "echo 'Building Tero...'",
+    "postbuild": "echo 'Build completed successfully!'",
+    "pretest": "echo 'Running Tero test suite...'",
+    "posttest": "echo 'Test suite completed!'",
+    "prepublishOnly": "npm run test",
+    "verify": "node verify-build.js && npm run test",
+    "ci": "npm run verify"
+  },
+  "files": [
+    "dist/**/*"
+  ],
+  "keywords": [
+    "JSON",
+    "database",
+    "javascript"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "fs-ext": "^2.0.0",
+    "glob": "^9.3.4",
+    "tar": "^6.1.13",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/lib-storage": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/fs-ext": "^2.0.3",
+    "@types/glob": "^8.1.0",
+    "@types/node": "^24.0.14",
+    "@types/tar": "^6.1.13",
+    "typescript": "^5.8.3"
+  }
+}
