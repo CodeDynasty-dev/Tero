@@ -1,6 +1,6 @@
 {
   "name": "tero",
-  "version": "1.4.0",
+  "version": "0.0.0",
   "description": "tero is a JSON document Manager, with ACID complaint and backup recovery mechanism.",
   "main": "dist/index.js",
   "type": "module",
