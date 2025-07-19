@@ -7,38 +7,36 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](#)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen.svg)](#)
 
-**Production-ready ACID-compliant JSON document database with enterprise features**
+**JSON document database**
 
-Tero is a high-performance JSON database that provides ACID transactions, schema validation, cloud backup, and automatic recovery. Built for production environments requiring data integrity and reliability.
+Tero is a JSON database that provides ACID transactions, schema validation, cloud backup, and automatic recovery. Built for production environments requiring json data integrity and reliability.
 
-## 🚀 Key Features
+## Key Features
 
-### ACID Compliance
+### Transactions
 - **Atomicity**: All-or-nothing transactions ensure data consistency
 - **Consistency**: Schema validation and business rule enforcement
 - **Isolation**: Concurrent operations are properly isolated
 - **Durability**: Write-ahead logging ensures data survives system crashes
 
-### Production-Ready
+### Ready-To-Use
 - **High Performance**: Intelligent caching and batch operations
 - **Data Integrity**: Built-in corruption detection and recovery
 - **Schema Validation**: Flexible schema system with strict mode
 - **Error Handling**: Comprehensive error handling and recovery
 - **Memory Management**: Efficient memory usage with automatic cleanup
-
-### Enterprise Features
 - **Cloud Backup**: AWS S3 and Cloudflare R2 support
 - **Data Recovery**: Automatic crash recovery and cloud restore
 - **Monitoring**: Performance metrics and health checks
 - **Security**: Path traversal protection and input validation
 
-## 📦 Installation
+## Installation
 
 ```bash
 npm install tero
 ```
 
-## 🔧 Quick Start
+##  Quick Start
 
 ```javascript
 import { Tero } from 'tero';
@@ -56,7 +54,7 @@ await db.update('user1', { age: 30 });
 await db.remove('user1');
 ```
 
-## 🔒 ACID Transactions
+## ACID Transactions
 
 ### Automatic Transactions
 All basic operations are automatically wrapped in ACID transactions:
@@ -95,7 +93,7 @@ Demonstrates ACID properties with business logic:
 await db.transferMoney('savings', 'checking', 500);
 ```
 
-## 📋 Schema Validation
+## Schema Validation
 
 Define and enforce data schemas:
 
@@ -122,7 +120,7 @@ await db.create('user1', userData, {
 });
 ```
 
-## 📦 Batch Operations
+##  Batch Operations
 
 Efficient batch processing with ACID guarantees:
 
@@ -138,7 +136,7 @@ await db.batchWrite([
 const products = await db.batchRead(['product1', 'product2', 'product3']);
 ```
 
-## ☁️ Cloud Backup
+##  Cloud Backup
 
 Configure automatic cloud backups:
 
@@ -159,7 +157,7 @@ db.configureBackup({
 const result = await db.performBackup();
 ```
 
-## 🔄 Data Recovery
+##  Data Recovery
 
 Automatic crash recovery and cloud restore:
 
@@ -177,7 +175,7 @@ await db.recoverFromCloud('important-data');
 const result = await db.recoverAllFromCloud();
 ```
 
-## 📊 Monitoring
+##  Monitoring
 
 Built-in performance monitoring and health checks:
 
@@ -197,7 +195,7 @@ const activeTx = db.getActiveTransactions();
 console.log(`Active transactions: ${activeTx.length}`);
 ```
 
-## 🛡️ Error Handling
+##  Error Handling
 
 Comprehensive error handling with detailed messages:
 
@@ -213,7 +211,7 @@ try {
 }
 ```
 
-## 🔧 Configuration
+##  Configuration
 
 ### Database Options
 ```javascript
@@ -248,14 +246,14 @@ const db = new Tero({
 4. Monitor cache hit rates and adjust cache size
 5. Use transactions for related operations
 
-## 🔒 Security
+##  Security
 
 - **Path Traversal Protection**: Automatic key sanitization
 - **Input Validation**: Comprehensive data validation
 - **Error Handling**: No sensitive data in error messages
 - **Access Control**: File system permissions respected
 
-## 📚 API Reference
+## API Reference
 
 ### Core Methods
 - `create(key, data, options?)`: Create new document
@@ -290,7 +288,7 @@ const db = new Tero({
 - `clearCache()`: Clear memory cache
 - `destroy()`: Cleanup and shutdown
 
-## 🧪 Testing
+## Testing
 
 Run the production test suite:
 
@@ -298,11 +296,11 @@ Run the production test suite:
 npm run test:production
 ```
 
-## 📄 License
+## License
 
 MIT License - see LICENSE file for details.
 
-## 🤝 Contributing
+##  Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -310,7 +308,7 @@ MIT License - see LICENSE file for details.
 4. Ensure all tests pass
 5. Submit a pull request
 
-## 📞 Support
+##  Support
 
 For issues and questions:
 - GitHub Issues: [Report bugs and request features](https://github.com/codedynasty-dev/tero/issues)
