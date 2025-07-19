@@ -1,8 +1,8 @@
 import { Tero } from '../dist/index.js';
 import { existsSync, rmSync } from 'fs';
 
-async function runACIDTests() {
-    console.log('🧪 Running ACID Compliance Tests...\n');
+async function runTests() {
+    console.log('🧪 Running  Compliance Tests...\n');
 
     let passed = 0;
     let failed = 0;
@@ -20,7 +20,7 @@ async function runACIDTests() {
     };
 
     // Setup test database
-    const testDbPath = 'ACIDTestDB';
+    const testDbPath = 'TestDB';
 
     // Clean up any existing test data
     if (existsSync(testDbPath)) rmSync(testDbPath, { recursive: true, force: true });
@@ -31,27 +31,27 @@ async function runACIDTests() {
     });
 
     // Test 1: Atomicity - All operations in a transaction succeed or fail together
-    await test('ACID Atomicity - Transaction rollback on failure', async () => {
+    await test(' Atomicity - Transaction rollback on failure', async () => {
         // Create initial accounts
-        await db.createACID('account1', { name: 'Alice', balance: 1000 });
-        await db.createACID('account2', { name: 'Bob', balance: 500 });
+        await db.create('account1', { name: 'Alice', balance: 1000 });
+        await db.create('account2', { name: 'Bob', balance: 500 });
 
-        const txId = db.beginACIDTransaction();
+        const txId = db.beginTransaction();
 
         try {
             // Attempt to transfer more money than available
-            await db.acidWrite(txId, 'account1', { name: 'Alice', balance: -500 }); // Invalid balance
-            await db.acidWrite(txId, 'account2', { name: 'Bob', balance: 2000 });
+            await db.write(txId, 'account1', { name: 'Alice', balance: -500 }); // Invalid balance
+            await db.write(txId, 'account2', { name: 'Bob', balance: 2000 });
 
             // This should fail due to business logic
-            if ((await db.acidRead(txId, 'account1')).balance < 0) {
+            if ((await db.read(txId, 'account1')).balance < 0) {
                 throw new Error('Insufficient funds');
             }
 
-            await db.commitACIDTransaction(txId);
+            await db.commitTransaction(txId);
             throw new Error('Transaction should have failed');
         } catch (error) {
-            await db.rollbackACIDTransaction(txId);
+            await db.rollback(txId);
 
             // Verify original balances are preserved
             const account1 = await db.get('account1');
@@ -64,7 +64,7 @@ async function runACIDTests() {
     });
 
     // Test 2: Consistency - Money transfer maintains total balance
-    await test('ACID Consistency - Money transfer preserves total balance', async () => {
+    await test(' Consistency - Money transfer preserves total balance', async () => {
         const initialTotal = 1500; // 1000 + 500
 
         await db.transferMoney('account1', 'account2', 300);
@@ -83,28 +83,28 @@ async function runACIDTests() {
     });
 
     // Test 3: Isolation - Concurrent transactions don't interfere
-    await test('ACID Isolation - Concurrent transactions', async () => {
+    await test(' Isolation - Concurrent transactions', async () => {
         // Reset accounts
-        await db.updateACID('account1', { name: 'Alice', balance: 1000 });
-        await db.updateACID('account2', { name: 'Bob', balance: 500 });
+        await db.update('account1', { name: 'Alice', balance: 1000 });
+        await db.update('account2', { name: 'Bob', balance: 500 });
 
-        const tx1 = db.beginACIDTransaction();
-        const tx2 = db.beginACIDTransaction();
+        const tx1 = db.beginTransaction();
+        const tx2 = db.beginTransaction();
 
         // Both transactions try to read and modify account1
-        const account1_tx1 = await db.acidRead(tx1, 'account1');
-        const account1_tx2 = await db.acidRead(tx2, 'account1');
+        const account1_tx1 = await db.read(tx1, 'account1');
+        const account1_tx2 = await db.read(tx2, 'account1');
 
         // Modify in both transactions
-        await db.acidWrite(tx1, 'account1', { ...account1_tx1, balance: account1_tx1.balance - 100 });
-        await db.acidWrite(tx2, 'account1', { ...account1_tx2, balance: account1_tx2.balance - 200 });
+        await db.write(tx1, 'account1', { ...account1_tx1, balance: account1_tx1.balance - 100 });
+        await db.write(tx2, 'account1', { ...account1_tx2, balance: account1_tx2.balance - 200 });
 
         // Commit first transaction
-        await db.commitACIDTransaction(tx1);
+        await db.commitTransaction(tx1);
 
         // Second transaction should see consistent state
         try {
-            await db.commitACIDTransaction(tx2);
+            await db.commitTransaction(tx2);
             // If both commits succeed, check final state
             const finalAccount = await db.get('account1');
             // Due to isolation, one of the changes should be preserved
@@ -118,11 +118,11 @@ async function runACIDTests() {
     });
 
     // Test 4: Durability - Committed changes survive system restart
-    await test('ACID Durability - Changes survive restart simulation', async () => {
+    await test(' Durability - Changes survive restart simulation', async () => {
         const testKey = 'durability_test';
         const testData = { message: 'This should survive restart', timestamp: Date.now() };
 
-        await db.createACID(testKey, testData);
+        await db.create(testKey, testData);
 
         // Force checkpoint to ensure WAL is flushed
         db.forceCheckpoint();
@@ -141,10 +141,10 @@ async function runACIDTests() {
 
     // Test 5: Write-Ahead Logging functionality
     await test('Write-Ahead Logging - WAL entries created', async () => {
-        const txId = db.beginACIDTransaction();
+        const txId = db.beginTransaction();
 
-        await db.acidWrite(txId, 'wal_test', { data: 'test_wal' });
-        await db.commitACIDTransaction(txId);
+        await db.write(txId, 'wal_test', { data: 'test_wal' });
+        await db.commitTransaction(txId);
 
         // WAL file should exist
         const walPath = `${testDbPath}/.wal`;
@@ -164,8 +164,8 @@ async function runACIDTests() {
     // Test 6: Crash recovery simulation
     await test('Crash Recovery - Uncommitted transactions rolled back', async () => {
         // Start transaction but don't commit
-        const txId = db.beginACIDTransaction();
-        await db.acidWrite(txId, 'crash_test', { shouldNotExist: true });
+        const txId = db.beginTransaction();
+        await db.write(txId, 'crash_test', { shouldNotExist: true });
 
         // Don't commit - simulate crash
         // Create new instance to trigger recovery
@@ -179,8 +179,8 @@ async function runACIDTests() {
         db3.destroy();
     });
 
-    // Test 7: Batch operations with ACID guarantees
-    await test('Batch Operations - ACID batch write', async () => {
+    // Test 7: Batch operations with  guarantees
+    await test('Batch Operations -  batch write', async () => {
         const batchOps = [
             { key: 'batch1', data: { value: 1 } },
             { key: 'batch2', data: { value: 2 } },
@@ -199,7 +199,7 @@ async function runACIDTests() {
     });
 
     // Test 8: Batch read with consistency
-    await test('Batch Operations - ACID batch read', async () => {
+    await test('Batch Operations -  batch read', async () => {
         const keys = ['batch1', 'batch2', 'batch3'];
         const results = await db.batchRead(keys);
 
@@ -221,7 +221,7 @@ async function runACIDTests() {
             metadata: { created: Date.now() }
         };
 
-        await db.createACID('complex_test', complexData);
+        await db.create('complex_test', complexData);
 
         // Update nested property
         const update = {
@@ -231,7 +231,7 @@ async function runACIDTests() {
             }
         };
 
-        await db.updateACID('complex_test', update);
+        await db.update('complex_test', update);
 
         const result = await db.get('complex_test');
 
@@ -254,14 +254,14 @@ async function runACIDTests() {
         for (let i = 0; i < 5; i++) {
             promises.push((async () => {
                 try {
-                    const txId = db.beginACIDTransaction();
-                    const data = await db.acidRead(txId, 'account1');
-                    await db.acidWrite(txId, 'account1', {
+                    const txId = db.beginTransaction();
+                    const data = await db.read(txId, 'account1');
+                    await db.write(txId, 'account1', {
                         ...data,
                         lastAccessed: Date.now(),
                         accessCount: (data.accessCount || 0) + 1
                     });
-                    await db.commitACIDTransaction(txId);
+                    await db.commitTransaction(txId);
                     results.push('success');
                 } catch (error) {
                     results.push('failed');
@@ -312,16 +312,16 @@ async function runACIDTests() {
 
     // Test 13: Transaction timeout and cleanup
     await test('Transaction Management - Active transaction tracking', async () => {
-        const txId = db.beginACIDTransaction();
+        const txId = db.beginTransaction();
 
-        const activeBefore = db.getActiveACIDTransactions();
+        const activeBefore = db.getActiveTransactions();
         if (!activeBefore.includes(txId)) {
             throw new Error('Transaction not tracked as active');
         }
 
-        await db.rollbackACIDTransaction(txId);
+        await db.rollback(txId);
 
-        const activeAfter = db.getActiveACIDTransactions();
+        const activeAfter = db.getActiveTransactions();
         if (activeAfter.includes(txId)) {
             throw new Error('Transaction still tracked after rollback');
         }
@@ -330,7 +330,7 @@ async function runACIDTests() {
     // Test 14: Error handling and recovery
     await test('Error Handling - Invalid operations', async () => {
         try {
-            await db.acidWrite('invalid-tx-id', 'test', { data: 'test' });
+            await db.write('invalid-tx-id', 'test', { data: 'test' });
             throw new Error('Should have failed with invalid transaction ID');
         } catch (error) {
             if (!error.message.includes('Invalid transaction')) {
@@ -348,23 +348,23 @@ async function runACIDTests() {
         }
     });
 
-    // Test 15: Cache invalidation with ACID operations
-    await test('Cache Management - ACID operation cache invalidation', async () => {
+    // Test 15: Cache invalidation with  operations
+    await test('Cache Management -  operation cache invalidation', async () => {
         const testKey = 'cache_test';
 
         // Populate cache
-        await db.createACID(testKey, { value: 'original' });
+        await db.create(testKey, { value: 'original' });
         await db.get(testKey); // Load into cache
 
         const statsBefore = db.getCacheStats();
 
-        // Update using ACID
-        await db.updateACID(testKey, { value: 'updated' });
+        // Update using 
+        await db.update(testKey, { value: 'updated' });
 
         // Cache should be invalidated
         const data = await db.get(testKey);
         if (data.value !== 'updated') {
-            throw new Error('Cache not properly invalidated after ACID update');
+            throw new Error('Cache not properly invalidated after  update');
         }
     });
 
@@ -378,22 +378,22 @@ async function runACIDTests() {
     }
 
     // Summary
-    console.log(`\n📊 ACID Compliance Test Results:`);
+    console.log(`\n📊  Compliance Test Results:`);
     console.log(`✅ Passed: ${passed}`);
     console.log(`❌ Failed: ${failed}`);
     console.log(`📈 Success Rate: ${((passed / (passed + failed)) * 100).toFixed(1)}%`);
 
     if (failed === 0) {
-        console.log('\n🎉 All ACID compliance tests passed! The system is production-ready.');
-        console.log('\n🔒 ACID Properties Verified:');
+        console.log('\n🎉 All  compliance tests passed! The system is production-ready.');
+        console.log('\n🔒  Properties Verified:');
         console.log('   ⚛️  Atomicity: Transactions are all-or-nothing');
         console.log('   🔄 Consistency: Data integrity is maintained');
         console.log('   🔐 Isolation: Concurrent transactions don\'t interfere');
         console.log('   💾 Durability: Committed changes survive system failures');
     } else {
-        console.log('\n⚠️ Some ACID compliance tests failed. Please review the issues.');
+        console.log('\n⚠️ Some  compliance tests failed. Please review the issues.');
         process.exit(1);
     }
 }
 
-runACIDTests().catch(console.error);
+runTests().catch(console.error);
