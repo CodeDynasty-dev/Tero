@@ -3,6 +3,8 @@ import { ACIDStorageEngine } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
 import { BackupManager, BackupConfig, BackupMetadata } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
+import { randomBytes } from "node:crypto";
+import QuickLRU from "quick-lru";
 
 interface TeroConfig {
   directory?: string;
@@ -14,11 +16,10 @@ interface CacheEntry {
   lastAccessed: number;
   transactionId?: string; // Track which transaction cached this
 }
-
 export class Tero {
   private teroDirectory: string = "TeroDB";
   private cacheSize: number = 100;
-  private cache: Map<string, CacheEntry> = new Map();
+  private cache: QuickLRU<string, CacheEntry>;
   private cacheHits: number = 0;
   private cacheRequests: number = 0;
   private acidEngine: ACIDStorageEngine;
@@ -36,11 +37,16 @@ export class Tero {
       }
 
       if (typeof cacheSize === "number" && cacheSize > 0) {
-        this.cacheSize = Math.min(cacheSize, 10000); // Cap at 10k entries
+        this.cacheSize = Math.min(cacheSize, 1000); // Cap at 1k entries
       }
 
       // Create directories with proper error handling
       this.initializeDirectories();
+
+      // Initialize QuickLRU cache
+      this.cache = new QuickLRU<string, CacheEntry>({
+        maxSize: this.cacheSize
+      });
 
       // Initialize ACID storage engine (primary system)
       this.acidEngine = new ACIDStorageEngine(this.teroDirectory);
@@ -77,23 +83,7 @@ export class Tero {
     }
   }
 
-  private evictOldestCacheEntry(): void {
-    if (this.cache.size === 0) return;
 
-    let oldestKey = '';
-    let oldestTime = Date.now();
-
-    for (const [key, entry] of this.cache.entries()) {
-      if (entry.lastAccessed < oldestTime) {
-        oldestTime = entry.lastAccessed;
-        oldestKey = key;
-      }
-    }
-
-    if (oldestKey) {
-      this.cache.delete(oldestKey);
-    }
-  }
 
   private invalidateCacheKeys(keys: string[]): void {
     for (const key of keys) {
@@ -102,10 +92,6 @@ export class Tero {
   }
 
   private updateCache(key: string, data: any, transactionId?: string): void {
-    if (this.cache.size >= this.cacheSize) {
-      this.evictOldestCacheEntry();
-    }
-
     this.cache.set(key, {
       data: { ...data },
       lastAccessed: Date.now(),
@@ -213,13 +199,14 @@ export class Tero {
 
       await this.acidEngine.commitTransaction(transactionId);
 
-      // Clean up cache entries for this transaction
+      // Invalidate cache entries for this transaction to force fresh reads
+      const keysToInvalidate: string[] = [];
       for (const [key, entry] of this.cache.entries()) {
         if (entry.transactionId === transactionId) {
-          // Remove transaction ID to mark as committed
-          entry.transactionId = undefined;
+          keysToInvalidate.push(key);
         }
       }
+      this.invalidateCacheKeys(keysToInvalidate);
     } catch (error) {
       throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
@@ -539,6 +526,51 @@ export class Tero {
       this.backupManager.destroy();
     }
     this.clearCache();
+  }
+
+  /**
+   * Generates a unique identifier with a custom prefix.
+   * 
+   * This method creates MongoDB ObjectId-like unique identifiers that consist of:
+   * - 4-byte timestamp (seconds since Unix epoch)
+   * - 5-byte process-unique random value
+   * - 3-byte incrementing counter
+   * 
+   * The generated ID is guaranteed to be unique across processes and time,
+   * making it suitable for distributed systems and concurrent operations.
+   * 
+   * @param prefix - A string prefix to prepend to the generated ID
+   * @returns A unique identifier string in the format: `${prefix}-${hexString}`
+   * 
+   * @example
+   * ```typescript
+   * const db = new Tero();
+   * 
+   * // Generate unique IDs for different purposes
+   * const userId = db.getNewId('user');        // e.g., "user-507f1f77bcf86cd799439011"
+   * const sessionId = db.getNewId('session');  // e.g., "session-507f1f77bcf86cd799439012"
+   * const logId = db.getNewId('log');          // e.g., "log-507f1f77bcf86cd799439013"
+   * 
+   * // Use as document keys
+   * await db.create(userId, { name: 'Alice', email: 'alice@example.com' });
+   * ```
+   */
+  getNewId(prefix: string): string {
+    const PROCESS_UNIQUE = randomBytes(5);
+    const buffer = Buffer.allocUnsafe(12);
+    let index = ~~(Math.random() * 0xffffff);
+    const time = ~~(Date.now() / 1000);
+    const inc = (index = (index + 1) % 0xffffff);
+
+    // 4-byte timestamp (seconds since Unix epoch)
+    buffer.writeUInt32BE(time, 0);
+    // 5-byte process unique identifier
+    buffer.set(PROCESS_UNIQUE, 4);
+    // 3-byte incrementing counter
+    buffer.writeUIntBE(inc, 9, 3);
+
+    // Convert to hexadecimal string and prepend prefix
+    return prefix + "-" + buffer.toString("hex");
   }
 }
 

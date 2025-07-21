@@ -3,6 +3,7 @@ import { join, basename } from "path";
 import tar from "tar";
 import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import { CronJob } from "cron";
 
 export interface CloudStorageConfig {
   provider: 'aws-s3' | 'cloudflare-r2';
@@ -36,7 +37,7 @@ export interface BackupMetadata {
 
 export class BackupManager {
   private s3Client?: S3Client;
-  private scheduledBackups: Map<string, NodeJS.Timeout> = new Map();
+  private scheduledBackups: Map<string, CronJob> = new Map();
   private config: BackupConfig;
   private dbPath: string;
 
@@ -98,6 +99,36 @@ export class BackupManager {
       case 'w': return value * 7 * 24 * 60 * 60 * 1000; // weeks to ms
       case 'y': return value * 365 * 24 * 60 * 60 * 1000; // years to ms
       default: throw new Error(`Unsupported retention unit: ${unit}`);
+    }
+  }
+
+  private intervalToCron(interval: string): string {
+    const match = interval.match(/^(\d+)([hdw])$/);
+    if (!match) throw new Error(`Invalid interval format: ${interval}`);
+
+    const [, num, unit] = match;
+    const value = parseInt(num);
+
+    switch (unit) {
+      case 'h': // Every N hours
+        if (value === 1) return '0 * * * *'; // Every hour
+        if (value === 6) return '0 */6 * * *'; // Every 6 hours
+        if (value === 12) return '0 */12 * * *'; // Every 12 hours
+        if (24 % value === 0) return `0 */${value} * * *`; // Every N hours if divisible
+        throw new Error(`Unsupported hour interval: ${value}h`);
+
+      case 'd': // Every N days
+        if (value === 1) return '0 0 * * *'; // Daily at midnight
+        if (value === 7) return '0 0 * * 0'; // Weekly on Sunday
+        return `0 0 */${value} * *`; // Every N days
+
+      case 'w': // Every N weeks
+        if (value === 1) return '0 0 * * 0'; // Weekly on Sunday
+        if (value === 2) return '0 0 * * 0/2'; // Bi-weekly
+        throw new Error(`Unsupported week interval: ${value}w`);
+
+      default:
+        throw new Error(`Unsupported time unit: ${unit}`);
     }
   }
 
@@ -187,11 +218,10 @@ export class BackupManager {
     }
   }
 
+
   private async createIndividualBackup(): Promise<{ files: string[]; metadata: BackupMetadata }> {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupDir = this.config.localPath
-      ? join(this.config.localPath, `tero-backup-${timestamp}`)
-      : join(this.dbPath, `.backup-${timestamp}`);
+    // Use key-based backup instead of timestamp-based directories
+    const backupDir = this.config.localPath || join(this.dbPath, '.backup');
 
     try {
       const jsonFiles = await this.getJsonFiles();
@@ -207,7 +237,7 @@ export class BackupManager {
       const backedUpFiles: string[] = [];
       let totalSize = 0;
 
-      // Copy each JSON file
+      // Copy each JSON file using its key as the filename (no timestamp directories)
       for (const file of jsonFiles) {
         const destPath = join(backupDir, file.name);
         await fs.copyFile(file.path, destPath);
@@ -324,6 +354,30 @@ export class BackupManager {
     }
   }
 
+  private async uploadIndividualFilesToCloud(localDir: string): Promise<void> {
+    if (!this.s3Client || !this.config.cloudStorage) {
+      throw new Error('Cloud storage not configured');
+    }
+
+    try {
+      const fs = await import('fs/promises');
+      const files = await fs.readdir(localDir);
+
+      const uploadPromises = files
+        .filter(file => file.endsWith('.json')) // Only upload JSON files, skip metadata
+        .map(async (file) => {
+          const localFilePath = join(localDir, file);
+          // Use direct key-based cloud storage: each JSON file is stored with its key as the cloud key
+          const cloudKey = this.getCloudKey(file);
+          await this.uploadToCloud(localFilePath, cloudKey);
+        });
+
+      await Promise.all(uploadPromises);
+    } catch (error) {
+      throw new Error(`Failed to upload individual files to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
   private getCloudKey(filename: string): string {
     const prefix = this.config.cloudStorage?.pathPrefix || 'tero-backups';
     const dbName = basename(this.dbPath);
@@ -354,13 +408,11 @@ export class BackupManager {
         const { files, metadata: backupMetadata } = await this.createIndividualBackup();
         metadata = backupMetadata;
 
-        // Upload to cloud if configured
+        // Upload to cloud if configured - use key-based storage for direct recovery
         if (this.config.cloudStorage && this.s3Client) {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const cloudPrefix = this.getCloudKey(`individual-${timestamp}`);
-          await this.uploadDirectoryToCloud(files[0].split('/').slice(0, -1).join('/'), cloudPrefix);
+          await this.uploadIndividualFilesToCloud(files[0].split('/').slice(0, -1).join('/'));
           cloudUploaded = true;
-          console.log(`☁️ Uploaded individual backup to cloud: ${cloudPrefix}`);
+          console.log(`☁️ Uploaded individual backup to cloud using key-based storage`);
         }
 
         console.log(`✅ Individual backup completed: ${files.length} files`);
@@ -435,7 +487,8 @@ export class BackupManager {
     const scheduleId = `backup-${Date.now()}`;
 
     try {
-      const intervalMs = this.parseInterval(config.interval);
+      // Convert interval to cron expression
+      const cronExpression = this.intervalToCron(config.interval);
 
       // Update config with new retention if provided
       if (config.retention) {
@@ -447,14 +500,18 @@ export class BackupManager {
         await this.performBackup();
       };
 
-      // Perform initial backup
-      performScheduledBackup();
+      // Create cron job for recurring backups
+      const cronJob = new CronJob(
+        cronExpression,
+        performScheduledBackup,
+        null, // onComplete
+        true, // start immediately
+        'UTC' // timezone
+      );
 
-      // Schedule recurring backups
-      const timer = setInterval(performScheduledBackup, intervalMs);
-      this.scheduledBackups.set(scheduleId, timer);
+      this.scheduledBackups.set(scheduleId, cronJob);
 
-      console.log(`📅 Backup scheduled: ${config.interval} interval, ${config.retention || this.config.retention} retention`);
+      console.log(`📅 Backup scheduled with cron: ${cronExpression} (${config.interval} interval), ${config.retention || this.config.retention} retention`);
       return scheduleId;
     } catch (error) {
       throw new Error(`Failed to schedule backup: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -462,9 +519,9 @@ export class BackupManager {
   }
 
   cancelScheduledBackup(scheduleId: string): boolean {
-    const timer = this.scheduledBackups.get(scheduleId);
-    if (timer) {
-      clearInterval(timer);
+    const cronJob = this.scheduledBackups.get(scheduleId);
+    if (cronJob) {
+      cronJob.stop();
       this.scheduledBackups.delete(scheduleId);
       console.log(`❌ Cancelled scheduled backup: ${scheduleId}`);
       return true;
@@ -503,8 +560,8 @@ export class BackupManager {
 
   destroy(): void {
     // Cancel all scheduled backups
-    for (const [id, timer] of this.scheduledBackups) {
-      clearInterval(timer);
+    for (const [id, cronJob] of this.scheduledBackups) {
+      cronJob.stop();
     }
     this.scheduledBackups.clear();
     console.log('🛑 BackupManager destroyed, all scheduled backups cancelled');

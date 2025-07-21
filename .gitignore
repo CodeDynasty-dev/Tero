@@ -4,4 +4,5 @@ dist
 BackupFormatTestDB
 MyDatabase
 scheduled-backups
-TeroDB
+local_tests
+tasks.md

@@ -9,7 +9,7 @@
 
 **JSON document database**
 
-Tero is a JSON database that provides ACID transactions, schema validation, cloud backup, and automatic recovery. Built for production environments requiring json data integrity and reliability.
+Tero is a JSON database that provides ACID transactions, schema validation, automated cloud backup, and automatic cloud recovery.
 
 ## Key Features
 
@@ -175,14 +175,41 @@ await db.recoverFromCloud('important-data');
 const result = await db.recoverAllFromCloud();
 ```
 
+##  Unique ID Generation
+
+Generate MongoDB ObjectId-like unique identifiers:
+
+```javascript
+// Generate unique IDs for different purposes
+const userId = db.getNewId('user');        // e.g., "user-507f1f77bcf86cd799439011"
+const sessionId = db.getNewId('session');  // e.g., "session-507f1f77bcf86cd799439012"
+const orderId = db.getNewId('order');      // e.g., "order-507f1f77bcf86cd799439013"
+
+// Use as document keys
+await db.create(userId, { 
+  name: 'Alice', 
+  email: 'alice@example.com',
+  createdAt: new Date()
+});
+
+// IDs are guaranteed unique across processes and time
+const logId = db.getNewId('log');
+await db.create(logId, { 
+  level: 'info', 
+  message: 'User created',
+  userId: userId 
+});
+```
+
 ##  Monitoring
 
 Built-in performance monitoring and health checks:
 
 ```javascript
-// Cache performance
+// Cache performance (now using optimized QuickLRU)
 const cacheStats = db.getCacheStats();
 console.log(`Cache hit rate: ${cacheStats.hitRate}%`);
+console.log(`Cache size: ${cacheStats.size}/${cacheStats.maxSize}`);
 
 // Data integrity check
 const integrity = await db.verifyDataIntegrity();
@@ -286,6 +313,7 @@ const db = new Tero({
 - `getActiveTransactions()`: List active transactions
 - `forceCheckpoint()`: Force WAL flush
 - `clearCache()`: Clear memory cache
+- `getNewId(prefix)`: Generate unique identifiers with custom prefix
 - `destroy()`: Cleanup and shutdown
 
 ## Testing

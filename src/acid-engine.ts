@@ -192,6 +192,57 @@ export class WriteAheadLog {
     getCurrentLSN(): number {
         return this.currentLSN - 1;
     }
+
+    clearCommittedTransaction(transactionId: string): void {
+        try {
+            // First, flush any pending buffer entries to disk
+            this.flushBuffer();
+
+            if (!existsSync(this.logPath)) {
+                return;
+            }
+
+            // Read current log content
+            const logContent = readFileSync(this.logPath, 'utf-8');
+            const lines = logContent.trim().split('\n').filter(line => line.trim());
+
+            // Filter out entries for the committed transaction
+            const filteredLines: string[] = [];
+            let transactionCompleted = false;
+
+            for (const line of lines) {
+                try {
+                    const entry: LogEntry = JSON.parse(line);
+
+                    // Keep entries that don't belong to this transaction
+                    if (entry.transactionId !== transactionId) {
+                        filteredLines.push(line);
+                    } else {
+                        // For the committed transaction, only keep the COMMIT entry as a marker
+                        // This preserves the fact that the transaction was committed for recovery purposes
+                        if (entry.operation === 'COMMIT') {
+                            filteredLines.push(line);
+                            transactionCompleted = true;
+                        }
+                        // Skip BEGIN, WRITE, DELETE entries for committed transactions
+                    }
+                } catch (error) {
+                    // Keep corrupted entries as-is to avoid data loss
+                    filteredLines.push(line);
+                }
+            }
+
+            // Only rewrite the log if we actually found and processed the transaction
+            if (transactionCompleted) {
+                const newContent = filteredLines.length > 0 ? filteredLines.join('\n') + '\n' : '';
+                writeFileSync(this.logPath, newContent);
+            }
+
+        } catch (error) {
+            // Silent failure for production - WAL cleanup is an optimization, not critical
+            // The system will still work correctly even if cleanup fails
+        }
+    }
 }
 
 // Lock Manager for proper concurrency control
@@ -502,21 +553,42 @@ export class ACIDStorageEngine {
         await this.lockManager.acquireLock(key, transactionId, 'exclusive');
 
         try {
-            // Read current data for before image
-            const filePath = join(this.dbPath, `${key}.json`);
-            let beforeImage = null;
+            // Read current data for before image - check pending writes in this transaction first
+            let currentData = null;
+            const logEntries = this.wal.getLogEntries(transaction.startLSN);
+            const transactionEntries = logEntries.filter(entry =>
+                entry.transactionId === transactionId &&
+                entry.key === key &&
+                (entry.operation === 'WRITE' || entry.operation === 'DELETE')
+            );
 
-            if (existsSync(filePath)) {
-                try {
-                    const content = readFileSync(filePath, 'utf-8');
-                    beforeImage = content.trim() ? JSON.parse(content) : {};
-                } catch (error) {
-                    beforeImage = {};
+            if (transactionEntries.length > 0) {
+                // Use the most recent transaction state
+                const lastEntry = transactionEntries[transactionEntries.length - 1];
+                if (lastEntry.operation === 'DELETE') {
+                    currentData = null;
+                } else {
+                    currentData = lastEntry.afterImage || {};
+                }
+            } else {
+                // Read from disk
+                const filePath = join(this.dbPath, `${key}.json`);
+                if (existsSync(filePath)) {
+                    try {
+                        const content = readFileSync(filePath, 'utf-8');
+                        currentData = content.trim() ? JSON.parse(content) : {};
+                    } catch (error) {
+                        currentData = {};
+                    }
                 }
             }
 
+            const beforeImage = currentData;
+
             // Deep merge for proper data integrity
-            const afterImage = this.deepMerge(beforeImage || {}, data);
+            const afterImage = this.deepMerge(currentData || {}, data);
+
+
 
             // Write to WAL first (Write-Ahead Logging)
             this.wal.writeLog({
@@ -642,6 +714,8 @@ export class ACIDStorageEngine {
                 if (entry.operation === 'WRITE' && entry.key && entry.afterImage !== undefined) {
                     const filePath = join(this.dbPath, `${entry.key}.json`);
 
+
+
                     // Ensure directory exists
                     if (!existsSync(dirname(filePath))) {
                         mkdirSync(dirname(filePath), { recursive: true });
@@ -658,6 +732,9 @@ export class ACIDStorageEngine {
 
             // Update transaction status
             transaction.status = 'committed';
+
+            // Clear WAL entries for this committed transaction
+            this.wal.clearCommittedTransaction(transactionId);
 
             // Release all locks
             this.lockManager.releaseAllLocks(transactionId);
