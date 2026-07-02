@@ -7,3 +7,9 @@ scheduled-backups
 local_tests
 tasks.md
 prd.md
+TeroDB/account**.json
+TeroDB/batch**.json
+TeroDB/**test**.json
+TeroDB/**user**.json
+TeroDB/no_schema_doc.json
+TeroDB/.wal
