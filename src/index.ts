@@ -93,7 +93,7 @@ export class Tero {
 
   private updateCache(key: string, data: any, transactionId?: string): void {
     this.cache.set(key, {
-      data: { ...data },
+      data: data,
       lastAccessed: Date.now(),
       transactionId
     });
