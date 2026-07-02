@@ -15,7 +15,7 @@
   },
   "homepage": "https://github.com/codedynasty-dev/tero.git",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run test && tsc",
     "dev": "tsc --watch",
     "test": "node run-tests.js",
     "test:production": "node local_tests/production-test.js",
@@ -28,7 +28,6 @@
     "postbuild": "echo 'Build completed successfully!'",
     "pretest": "echo 'Running Tero test suite...'",
     "posttest": "echo 'Test suite completed!'",
-    "prepublishOnly": "npm run test",
     "verify": "node verify-build.js && npm run test",
     "ci": "npm run verify"
   },
