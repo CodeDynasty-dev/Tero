@@ -8,7 +8,7 @@ const execAsync = promisify(exec);
 
 class TestRunner {
     constructor() {
-        this.testsDir = './tests';
+        this.testsDir = './local_tests';
         this.totalTests = 0;
         this.passedTests = 0;
         this.failedTests = 0;
