@@ -1,6 +1,6 @@
 {
   "name": "tero",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Tero is a JSON database that provides ACID transactions, schema validation, automated cloud backup, and automatic cloud recovery",
   "main": "dist/index.js",
   "type": "module",
