@@ -21,7 +21,7 @@ export class WriteAheadLog {
     private currentLSN: number = 0;
     private logBuffer: LogEntry[] = [];
     private readonly BUFFER_SIZE = 100;
-    private readonly LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024; // 10MB
+    private readonly LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024; // 1MB
 
     constructor(dbPath: string) {
         this.logPath = join(dbPath, '.wal');
@@ -859,6 +859,12 @@ export class ACIDStorageEngine {
     }
 
     // Utility methods
+    getTransactionStatus(transactionId: string): 'active' | 'committed' | 'aborted' | 'not_found' {
+        const tx = this.activeTransactions.get(transactionId);
+        if (!tx) return 'not_found';
+        return tx.status;
+    }
+
     getActiveTransactions(): string[] {
         return Array.from(this.activeTransactions.keys()).filter(id =>
             this.activeTransactions.get(id)?.status === 'active'

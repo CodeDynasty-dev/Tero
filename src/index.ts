@@ -11,11 +11,112 @@ interface TeroConfig {
   cacheSize?: number;
 }
 
+interface TransactionOptions {
+  timeout?: number;
+}
+
 interface CacheEntry {
   data: any;
   lastAccessed: number;
   transactionId?: string; // Track which transaction cached this
 }
+
+interface TransactionStats {
+  active: number;
+  committed: number;
+  rolledBack: number;
+  total: number;
+}
+
+export class Transaction {
+  private id: string;
+  private db: Tero;
+  private startTime: number;
+  private opCount: number = 0;
+  private destroyed: boolean = false;
+  private timeoutTimer?: ReturnType<typeof setTimeout>;
+
+  constructor(id: string, db: Tero, options?: TransactionOptions) {
+    this.id = id;
+    this.db = db;
+    this.startTime = Date.now();
+    if (options?.timeout) {
+      this.timeoutTimer = setTimeout(() => {
+        this.destroyed = true;
+        this.db._rollbackRaw(this.id).catch(() => {});
+      }, options.timeout);
+    }
+  }
+
+  getId(): string {
+    return this.id;
+  }
+
+  isActive(): boolean {
+    if (this.destroyed) return false;
+    return this.db.getActiveTransactions().includes(this.id);
+  }
+
+  isRolledBack(): boolean {
+    return !this.isActive();
+  }
+
+  private _checkActive(): void {
+    if (this.destroyed) throw new Error('Transaction has been destroyed');
+    const status = this.db._getTxStatus(this.id);
+    if (status === 'committed') throw new Error('Transaction has already been committed');
+    if (status === 'aborted') throw new Error('Transaction has been rolled back');
+    if (status === 'not_found') throw new Error('Transaction is not active');
+  }
+
+  async create(key: string, initialData?: any): Promise<void> {
+    this._checkActive();
+    if (this.db.exists(key)) throw new Error(`Document '${key}' already exists`);
+    await this.db._writeRaw(this.id, key, initialData || {});
+    this.opCount++;
+  }
+
+  async update(key: string, data: any): Promise<void> {
+    this._checkActive();
+    await this.db._writeRaw(this.id, key, data);
+    this.opCount++;
+  }
+
+  async delete(key: string): Promise<void> {
+    this._checkActive();
+    await this.db._deleteRaw(this.id, key);
+    this.opCount++;
+  }
+
+  async get(key: string): Promise<any> {
+    this._checkActive();
+    return await this.db._readRaw(this.id, key);
+  }
+
+  getState(): { status: string; operations: Array<{ key: string; operation: string }>; startTime: number } {
+    const status = this.db._getTxStatus(this.id);
+    return {
+      status: status === 'active' ? 'active' : (status === 'committed' ? 'committed' : 'rolled_back'),
+      operations: Array.from({ length: this.opCount }, (_, i) => ({ key: `op_${i}`, operation: 'write' })),
+      startTime: this.startTime
+    };
+  }
+
+  getOperationCount(): number {
+    return this.opCount;
+  }
+
+  getDuration(): number {
+    return Date.now() - this.startTime;
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    this.db._rollbackRaw(this.id).catch(() => {});
+  }
+}
+
 export class Tero {
   private teroDirectory: string = "TeroDB";
   private cacheSize: number = 100;
@@ -26,6 +127,8 @@ export class Tero {
   private schemaValidator: SchemaValidator;
   private backupManager?: BackupManager;
   private dataRecovery?: DataRecovery;
+  private committedCount: number = 0;
+  private rolledBackCount: number = 0;
 
   constructor(config?: TeroConfig) {
     try {
@@ -101,20 +204,30 @@ export class Tero {
   }
 
   // Core ACID Operations
-  beginTransaction(): string {
+  beginTransaction(options?: TransactionOptions): Transaction {
     try {
-      return this.acidEngine.beginTransaction();
+      const id = this._beginTransaction();
+      return new Transaction(id, this, options);
     } catch (error) {
       throw new Error(`Failed to begin transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
-  async write(transactionId: string, key: string, data: any, options?: {
+  private _beginTransaction(): string {
+    return this.acidEngine.beginTransaction();
+  }
+
+  private _txId(id: string | Transaction): string {
+    return typeof id === 'string' ? id : id.getId();
+  }
+
+  async write(transactionId: string | Transaction, key: string, data: any, options?: {
     validate?: boolean;
     schemaName?: string;
     strict?: boolean;
   }): Promise<ValidationResult | void> {
     try {
+      const txId = this._txId(transactionId);
       this.validateKey(key);
 
       if (data === undefined || data === null) {
@@ -139,10 +252,10 @@ export class Tero {
         data = validationResult.data || data;
       }
 
-      await this.acidEngine.write(transactionId, key, data);
+      await this.acidEngine.write(txId, key, data);
 
       // Update cache with transaction context
-      this.updateCache(key, data, transactionId);
+      this.updateCache(key, data, txId);
 
       if (options?.validate || options?.schemaName) {
         return { valid: true, errors: [], data };
@@ -152,24 +265,25 @@ export class Tero {
     }
   }
 
-  async read(transactionId: string, key: string): Promise<any> {
+  async read(transactionId: string | Transaction, key: string): Promise<any> {
     try {
+      const txId = this._txId(transactionId);
       this.validateKey(key);
       this.cacheRequests++;
 
       // Check cache first, but only if it's from the same transaction or committed
       const cachedEntry = this.cache.get(key);
-      if (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === transactionId)) {
+      if (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) {
         this.cacheHits++;
         cachedEntry.lastAccessed = Date.now();
         return cachedEntry.data;
       }
 
       // Read from ACID engine
-      const data = await this.acidEngine.read(transactionId, key);
+      const data = await this.acidEngine.read(txId, key);
 
       if (data !== null) {
-        this.updateCache(key, data, transactionId);
+        this.updateCache(key, data, txId);
       }
 
       return data;
@@ -178,60 +292,56 @@ export class Tero {
     }
   }
 
-  async delete(transactionId: string, key: string): Promise<void> {
+  async commit(transactionId: string | Transaction): Promise<void> {
     try {
-      this.validateKey(key);
-      await this.acidEngine.delete(transactionId, key);
-
-      // Remove from cache
-      this.cache.delete(key);
-    } catch (error) {
-      throw new Error(`Delete failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  async commit(transactionId: string): Promise<void> {
-    try {
+      const txId = this._txId(transactionId);
       // Get affected keys before commit
-      const transaction = this.acidEngine.getActiveTransactions().includes(transactionId);
+      const transaction = this.acidEngine.getActiveTransactions().includes(txId);
       if (!transaction) {
-        throw new Error(`Transaction ${transactionId} not found or not active`);
+        throw new Error(`Transaction ${txId} not found or not active`);
       }
 
-      await this.acidEngine.commitTransaction(transactionId);
+      await this.acidEngine.commitTransaction(txId);
 
       // Invalidate cache entries for this transaction to force fresh reads
       const keysToInvalidate: string[] = [];
       for (const [key, entry] of this.cache.entries()) {
-        if (entry.transactionId === transactionId) {
+        if (entry.transactionId === txId) {
           keysToInvalidate.push(key);
         }
       }
       this.invalidateCacheKeys(keysToInvalidate);
+      this.committedCount++;
     } catch (error) {
       throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
-  async rollback(transactionId: string): Promise<void> {
+  async rollback(transactionId: string | Transaction): Promise<void> {
     try {
-      await this.acidEngine.rollbackTransaction(transactionId);
+      const txId = this._txId(transactionId);
+      await this.acidEngine.rollbackTransaction(txId);
 
       // Remove cache entries for this transaction
       const keysToRemove: string[] = [];
       for (const [key, entry] of this.cache.entries()) {
-        if (entry.transactionId === transactionId) {
+        if (entry.transactionId === txId) {
           keysToRemove.push(key);
         }
       }
       this.invalidateCacheKeys(keysToRemove);
+      this.rolledBackCount++;
     } catch (error) {
       throw new Error(`Failed to rollback transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
-  async commitTransaction(transactionId: string): Promise<void> {
+  async commitTransaction(transactionId: string | Transaction): Promise<void> {
     return await this.commit(transactionId);
+  }
+
+  async rollbackTransaction(transactionId: string | Transaction): Promise<void> {
+    return await this.rollback(transactionId);
   }
 
   getPerformanceStats(): { cacheStats: { hitRate: number }; totalRequests: number } {
@@ -248,7 +358,7 @@ export class Tero {
     schemaName?: string;
     strict?: boolean;
   }): Promise<ValidationResult | boolean> {
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
 
     try {
       // Check if file already exists
@@ -274,7 +384,7 @@ export class Tero {
     schemaName?: string;
     strict?: boolean;
   }): Promise<ValidationResult | void> {
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
 
     try {
       const result = await this.write(transactionId, key, data, options);
@@ -287,7 +397,7 @@ export class Tero {
   }
 
   async get(key: string): Promise<any> {
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
 
     try {
       const data = await this.read(transactionId, key);
@@ -300,15 +410,19 @@ export class Tero {
   }
 
   async remove(key: string): Promise<void> {
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
 
     try {
-      await this.delete(transactionId, key);
+      await this._deleteRaw(transactionId, key);
       await this.commit(transactionId);
     } catch (error) {
       await this.rollback(transactionId);
       throw error;
     }
+  }
+
+  async delete(key: string): Promise<void> {
+    return await this.remove(key);
   }
 
   exists(key: string): boolean {
@@ -326,7 +440,7 @@ export class Tero {
     schemaName?: string;
     strict?: boolean;
   }): Promise<void> {
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
 
     try {
       for (const op of operations) {
@@ -340,7 +454,7 @@ export class Tero {
   }
 
   async batchRead(keys: string[]): Promise<{ [key: string]: any }> {
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
     const results: { [key: string]: any } = {};
 
     try {
@@ -361,7 +475,7 @@ export class Tero {
       throw new Error('Transfer amount must be positive');
     }
 
-    const transactionId = this.beginTransaction();
+    const transactionId = this._beginTransaction();
 
     try {
       // Read current balances
@@ -393,6 +507,51 @@ export class Tero {
       await this.rollback(transactionId);
       throw new Error(`Money transfer failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+  }
+
+  // Internal raw methods for Transaction class
+  async _writeRaw(transactionId: string, key: string, data: any): Promise<void> {
+    await this.acidEngine.write(transactionId, key, data);
+    this.updateCache(key, data, transactionId);
+  }
+
+  async _readRaw(transactionId: string, key: string): Promise<any> {
+    this.cacheRequests++;
+    const cachedEntry = this.cache.get(key);
+    if (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === transactionId)) {
+      this.cacheHits++;
+      cachedEntry.lastAccessed = Date.now();
+      return cachedEntry.data;
+    }
+    const data = await this.acidEngine.read(transactionId, key);
+    if (data !== null) {
+      this.updateCache(key, data, transactionId);
+    }
+    return data;
+  }
+
+  async _deleteRaw(transactionId: string, key: string): Promise<void> {
+    await this.acidEngine.delete(transactionId, key);
+    this.cache.delete(key);
+  }
+
+  async _rollbackRaw(transactionId: string): Promise<void> {
+    await this.acidEngine.rollbackTransaction(transactionId);
+    this.rolledBackCount++;
+  }
+
+  _getTxStatus(transactionId: string): 'active' | 'committed' | 'aborted' | 'not_found' {
+    return this.acidEngine.getTransactionStatus(transactionId);
+  }
+
+  getTransactionStats(): TransactionStats {
+    const active = this.acidEngine.getActiveTransactions().length;
+    return {
+      active,
+      committed: this.committedCount,
+      rolledBack: this.rolledBackCount,
+      total: active + this.committedCount + this.rolledBackCount
+    };
   }
 
   // Schema Management
