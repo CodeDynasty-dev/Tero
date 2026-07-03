@@ -575,6 +575,46 @@ export class Tero {
     return this.schemaValidator.validate(collectionName, data);
   }
 
+  hasSchema(collectionName: string): boolean {
+    return this.schemaValidator.hasSchema(collectionName);
+  }
+
+  listSchemas(): string[] {
+    return this.schemaValidator.listSchemas();
+  }
+
+  exportSchemas(): Record<string, DocumentSchema> {
+    return this.schemaValidator.exportSchemas();
+  }
+
+  getSchemaStats(): { totalSchemas: number; schemaNames: string[]; totalFields: number } {
+    return this.schemaValidator.getSchemaStats();
+  }
+
+  async createWithValidation(key: string, initialData?: any, options?: {
+    validate?: boolean;
+    schemaName?: string;
+    strict?: boolean;
+  }): Promise<ValidationResult> {
+    const result = await this.create(key, initialData, { ...options, validate: true });
+    if (result === true || result === false) {
+      return { valid: result, errors: [], data: initialData || {} };
+    }
+    return result;
+  }
+
+  async updateWithValidation(key: string, data: any, options?: {
+    validate?: boolean;
+    schemaName?: string;
+    strict?: boolean;
+  }): Promise<ValidationResult> {
+    const result = await this.update(key, data, { ...options, validate: true });
+    if (!result) {
+      return { valid: true, errors: [], data };
+    }
+    return result as ValidationResult;
+  }
+
   // Backup Management
   configureBackup(config: BackupConfig): void {
     try {
