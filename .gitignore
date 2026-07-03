@@ -13,3 +13,6 @@ TeroDB/**test**.json
 TeroDB/**user**.json
 TeroDB/no_schema_doc.json
 TeroDB/.wal
+BenchmarkDB/batch**.json
+BenchmarkDB/bulk**.json
+BenchmarkDB/.wal
