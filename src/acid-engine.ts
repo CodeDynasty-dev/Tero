@@ -21,7 +21,7 @@ export class WriteAheadLog {
     private currentLSN: number = 0;
     private logBuffer: LogEntry[] = [];
     private readonly BUFFER_SIZE = 100;
-    private readonly LOG_FILE_SIZE_LIMIT = 10 * 1024 * 1024; // 10MB
+    private readonly LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024; // 10MB
 
     constructor(dbPath: string) {
         this.logPath = join(dbPath, '.wal');
@@ -145,7 +145,7 @@ export class WriteAheadLog {
             // Start new log with checkpoint
             writeFileSync(this.logPath, '');
             this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
-            
+
             // Clean up old archives to prevent indefinite growth
             this.cleanupOldArchives(3);
         } catch (error) {
