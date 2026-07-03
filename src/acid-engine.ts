@@ -324,6 +324,21 @@ export class LockManager {
                 return;
             }
 
+            // Handle shared-to-exclusive upgrade: release shared lock and retry
+            // This prevents deadlock when multiple shared holders attempt to upgrade
+            if (lockInfo.holders.has(transactionId) && lockInfo.type === 'shared' && lockType === 'exclusive' && lockInfo.holders.size > 1) {
+                lockInfo.holders.delete(transactionId);
+                // Retry grant after releasing shared hold
+                if (this.canGrantLock(lockInfo, lockType, transactionId)) {
+                    lockInfo.type = lockType;
+                    lockInfo.holders.clear();
+                    lockInfo.holders.add(transactionId);
+                    clearTimeout(timeout);
+                    resolve();
+                    return;
+                }
+            }
+
             // Add to wait queue
             lockInfo.waitQueue.push({
                 transactionId,
@@ -341,8 +356,14 @@ export class LockManager {
     }
 
     private canGrantLock(lockInfo: any, requestedType: 'shared' | 'exclusive', transactionId: string): boolean {
-        // If transaction already holds the lock
-        if (lockInfo.holders.has(transactionId)) {
+        const isHolder = lockInfo.holders.has(transactionId);
+
+        if (isHolder) {
+            // Upgrading from shared to exclusive is only allowed if this is the sole holder
+            if (lockInfo.type === 'shared' && requestedType === 'exclusive') {
+                return lockInfo.holders.size === 1;
+            }
+            // Same lock type or downgrade is always allowed for existing holders
             return true;
         }
 

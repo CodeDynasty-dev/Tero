@@ -29,11 +29,12 @@ export class Tero {
 
   constructor(config?: TeroConfig) {
     try {
-      const { directory, cacheSize } = config || {};
+      const rawDirectory = (config as any)?.Directory || config?.directory;
+      const { cacheSize } = config || {};
 
-      if (typeof directory === "string" && directory.trim()) {
+      if (typeof rawDirectory === "string" && rawDirectory.trim()) {
         // Sanitize directory path to prevent directory traversal
-        this.teroDirectory = directory.replace(/[^a-zA-Z0-9_\-\/]/g, '');
+        this.teroDirectory = rawDirectory.replace(/[^a-zA-Z0-9_\-\/]/g, '');
       }
 
       if (typeof cacheSize === "number" && cacheSize > 0) {
@@ -229,6 +230,18 @@ export class Tero {
     }
   }
 
+  async commitTransaction(transactionId: string): Promise<void> {
+    return await this.commit(transactionId);
+  }
+
+  getPerformanceStats(): { cacheStats: { hitRate: number }; totalRequests: number } {
+    const cacheStats = this.getCacheStats();
+    return {
+      cacheStats: { hitRate: cacheStats.hitRate },
+      totalRequests: this.cacheRequests
+    };
+  }
+
   // Convenience Methods (Auto-transaction)
   async create(key: string, initialData?: any, options?: {
     validate?: boolean;
@@ -279,7 +292,7 @@ export class Tero {
     try {
       const data = await this.read(transactionId, key);
       await this.commit(transactionId);
-      return data;
+      return data === null ? false : data;
     } catch (error) {
       await this.rollback(transactionId);
       throw error;
