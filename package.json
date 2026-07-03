@@ -15,7 +15,7 @@
   },
   "homepage": "https://github.com/codedynasty-dev/tero.git",
   "scripts": {
-    "build": "npm run test && tsc",
+    "build": "tsc && npm run test",
     "dev": "tsc --watch",
     "test": "node run-tests.js",
     "test:production": "node local_tests/production-test.js",
