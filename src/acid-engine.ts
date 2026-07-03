@@ -145,6 +145,30 @@ export class WriteAheadLog {
             // Start new log with checkpoint
             writeFileSync(this.logPath, '');
             this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
+            
+            // Clean up old archives to prevent indefinite growth
+            this.cleanupOldArchives(3);
+        } catch (error) {
+            // Silent failure for production
+        }
+    }
+
+    private cleanupOldArchives(keepCount: number): void {
+        try {
+            const dir = dirname(this.logPath);
+            if (!existsSync(dir)) return;
+            const files = readdirSync(dir);
+            const archiveFiles = files
+                .filter(f => f.startsWith('.wal.'))
+                .map(f => join(dir, f))
+                .sort();
+
+            while (archiveFiles.length > keepCount) {
+                const oldestFile = archiveFiles.shift();
+                if (oldestFile && existsSync(oldestFile)) {
+                    unlinkSync(oldestFile);
+                }
+            }
         } catch (error) {
             // Silent failure for production
         }
@@ -193,7 +217,7 @@ export class WriteAheadLog {
         return this.currentLSN - 1;
     }
 
-    clearCommittedTransaction(transactionId: string): void {
+    clearTransaction(transactionId: string): void {
         try {
             // First, flush any pending buffer entries to disk
             this.flushBuffer();
@@ -206,9 +230,9 @@ export class WriteAheadLog {
             const logContent = readFileSync(this.logPath, 'utf-8');
             const lines = logContent.trim().split('\n').filter(line => line.trim());
 
-            // Filter out entries for the committed transaction
+            // Filter out entries for the completed transaction
             const filteredLines: string[] = [];
-            let transactionCompleted = false;
+            let transactionProcessed = false;
 
             for (const line of lines) {
                 try {
@@ -218,13 +242,8 @@ export class WriteAheadLog {
                     if (entry.transactionId !== transactionId) {
                         filteredLines.push(line);
                     } else {
-                        // For the committed transaction, only keep the COMMIT entry as a marker
-                        // This preserves the fact that the transaction was committed for recovery purposes
-                        if (entry.operation === 'COMMIT') {
-                            filteredLines.push(line);
-                            transactionCompleted = true;
-                        }
-                        // Skip BEGIN, WRITE, DELETE entries for committed transactions
+                        // Remove ALL entries for the completed transaction to compact log
+                        transactionProcessed = true;
                     }
                 } catch (error) {
                     // Keep corrupted entries as-is to avoid data loss
@@ -233,14 +252,24 @@ export class WriteAheadLog {
             }
 
             // Only rewrite the log if we actually found and processed the transaction
-            if (transactionCompleted) {
+            if (transactionProcessed) {
                 const newContent = filteredLines.length > 0 ? filteredLines.join('\n') + '\n' : '';
                 writeFileSync(this.logPath, newContent);
             }
 
         } catch (error) {
-            // Silent failure for production - WAL cleanup is an optimization, not critical
-            // The system will still work correctly even if cleanup fails
+            // Silent failure for production - WAL cleanup is an optimization
+        }
+    }
+
+    truncateLog(): void {
+        try {
+            this.flushBuffer();
+            writeFileSync(this.logPath, '');
+            // Clean up all archives since the log is truncated and no active transactions exist
+            this.cleanupOldArchives(0);
+        } catch (error) {
+            // Silent failure
         }
     }
 }
@@ -733,8 +762,13 @@ export class ACIDStorageEngine {
             // Update transaction status
             transaction.status = 'committed';
 
-            // Clear WAL entries for this committed transaction
-            this.wal.clearCommittedTransaction(transactionId);
+            // Clear WAL entries for this completed transaction
+            this.wal.clearTransaction(transactionId);
+
+            // Truncate log completely if no more active transactions
+            if (this.getActiveTransactions().length === 0) {
+                this.wal.truncateLog();
+            }
 
             // Release all locks
             this.lockManager.releaseAllLocks(transactionId);
@@ -761,6 +795,14 @@ export class ACIDStorageEngine {
 
             // Update transaction status
             transaction.status = 'aborted';
+
+            // Clear WAL entries for this aborted transaction
+            this.wal.clearTransaction(transactionId);
+
+            // Truncate log completely if no more active transactions
+            if (this.getActiveTransactions().length === 0) {
+                this.wal.truncateLog();
+            }
 
             // Release all locks
             this.lockManager.releaseAllLocks(transactionId);
