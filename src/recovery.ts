@@ -9,8 +9,9 @@ export interface RecoveryConfig {
     localPath: string;
     autoRecover?: boolean; // Automatically recover missing files
     recoveryTimeout?: number; // Timeout for recovery operations (default: 30000ms)
-    mode?: 'all' | 'missing' | 'none'; // 'all' = overwrite local, 'missing' = only pull files not present locally
+    mode?: 'all' | 'missing' | 'none'; // 'all' overwrites local; 'missing' only pulls absent files
     continueOnError?: boolean; // Keep going when a real (non-404) error occurs for one file
+    concurrency?: number; // Parallel S3 GETs — default 10 for fast hydration (was sequential)
 }
 
 export interface RecoveryResult {
@@ -211,16 +212,32 @@ export class DataRecovery {
             // Recover each file. We catch real (non-404) errors here so a single
             // auth/network hiccup doesn't abort the whole batch — they go into `failed`
             // and the caller can decide whether to retry.
-            for (const key of keys) {
-                try {
-                    const success = await this.recoverSingleFile(key);
-                    if (success) {
-                        recovered.push(key);
+            //
+            // Parallel S3 GETs in batches of `concurrency` (default 10). A single-key
+            // sequential download takes ~30ms HTTP RTT to S3/R2; 50,000 keys sequentially
+            // takes 25 minutes (1,500 seconds). Batched parallelism reduces this to
+            // ~25ms × (50,000 / 10) ≈ 125 seconds (~2 min) and can be tuned higher.
+            const concurrency = this.config.concurrency ?? 10;
+            for (let i = 0; i < keys.length; i += concurrency) {
+                const batch = keys.slice(i, i + concurrency);
+                const results = await Promise.allSettled(
+                    batch.map(async (key) => {
+                        try {
+                            const success = await this.recoverSingleFile(key);
+                            return { key, success };
+                        } catch (error) {
+                            return { key, success: false, error };
+                        }
+                    })
+                );
+                for (const r of results) {
+                    if (r.status === 'fulfilled') {
+                        const { key, success } = r.value;
+                        if (success) recovered.push(key);
+                        else failed.push(key);
                     } else {
-                        failed.push(key);
+                        failed.push((r.reason as any)?.key || 'unknown');
                     }
-                } catch (error) {
-                    failed.push(key);
                 }
             }
 
