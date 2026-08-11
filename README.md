@@ -1,347 +1,306 @@
 # Tero
 
-[![npm version](https://badge.fury.io/js/tero.svg)](https://badge.fury.io/js/tero)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](#)
-[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen.svg)](#)
+An embedded ACID JSON database for the edge. Single-node durability via fsync-on-commit; cloud durability via the client's own bucket. The control plane only issues keys and observes — it never holds tenant data or cloud credentials.
 
-**JSON document database**
+```
+[edge Tero node] --WAL+snapshot--> [client-owned S3/R2/GCS bucket]
+       |
+       +-- heartbeat/metrics --> [control plane: key issuance + observability only]
+```
 
-Tero is a JSON database that provides ACID transactions, schema validation, automated cloud backup, and automatic cloud recovery.
+Tero is a **library**, not a service. You embed it in a worker, container, or edge runtime. There is no clustering, no Raft, no distributed consensus — by design. Durability and scale come from cheap object storage, the same pattern Litestream pioneered for SQLite.
 
-## Key Features
+## What it is
 
-### Transactions
-- **Atomicity**: All-or-nothing transactions ensure data consistency
-- **Consistency**: Schema validation and business rule enforcement
-- **Isolation**: Concurrent operations are properly isolated
-- **Durability**: Write-ahead logging ensures data survives system crashes
+- **Embedded JSON document DB** with key/value + batch operations
+- **Real ACID**: WAL with fsync barriers on COMMIT/ROLLBACK, atomic data-file writes (temp → rename → fsync), in-memory pending-writes index so transaction reads never re-scan the WAL
+- **WAL rotation** into archive segments — the durable ledger v2 backs up to the client bucket
+- **Schema validation** with strict mode (string/number/boolean/object/array/date/any, formats, enums, defaults, custom validators)
+- **Cloud backup** to AWS S3 or Cloudflare R2 (cron-scheduled), archive or individual-file format
+- **Cloud recovery** — full, single-file, or archive restore
+- **v2: hydrate on startup** — pull missing/all files from the client's bucket before the ACID engine initializes, so a fresh node reconstructs state from the durable ledger
+- **v2: bucket backup** — one-shot snapshot of all data files + retained WAL segments + a manifest that hydrate-on-startup can discover
+- **Per-instance client credentials** — every Tero instance holds its own bucket creds; the control plane has no path to them
 
-### Ready-To-Use
-- **High Performance**: Intelligent caching and batch operations
-- **Data Integrity**: Built-in corruption detection and recovery
-- **Schema Validation**: Flexible schema system with strict mode
-- **Error Handling**: Comprehensive error handling and recovery
-- **Memory Management**: Efficient memory usage with automatic cleanup
-- **Cloud Backup**: AWS S3 and Cloudflare R2 support
-- **Data Recovery**: Automatic crash recovery and cloud restore
-- **Monitoring**: Performance metrics and health checks
-- **Security**: Path traversal protection and input validation
+## What it is not
 
-## Installation
+- Not a server. No HTTP layer, no wire protocol. You embed it.
+- Not distributed. No multi-node consensus. Global durability is the bucket's job.
+- Not a query engine. Key/value + batch. No SQL, no indexes beyond the in-memory cache.
+- Not horizontally scalable beyond one node's filesystem. One file per document puts a practical ceiling around 10⁵–10⁶ docs per node; the bucket is what scales.
+
+These are deliberate. They keep Tero embeddable inside a 50 ms worker budget and keep the cloud bill on object-storage economics instead of managed-DB pricing.
+
+## Install
 
 ```bash
 npm install tero
 ```
 
-##  Quick Start
+## Quick start
 
 ```javascript
 import { Tero } from 'tero';
 
-// Initialize database
 const db = new Tero({
   directory: './mydata',
-  cacheSize: 1000
+  cacheSize: 1000,
 });
 
-// Basic operations
 await db.create('user1', { name: 'Alice', email: 'alice@example.com' });
 const user = await db.get('user1');
 await db.update('user1', { age: 30 });
 await db.remove('user1');
 ```
 
-## ACID Transactions
+## ACID transactions
 
-### Automatic Transactions
-All basic operations are automatically wrapped in ACID transactions:
-
-```javascript
-// These operations are automatically ACID-compliant
-await db.create('account', { balance: 1000 });
-await db.update('account', { balance: 1500 });
-```
-
-### Manual Transactions
-For complex operations requiring multiple steps:
+Every convenience method (`create`, `get`, `update`, `remove`) is auto-wrapped in a transaction. For multi-step operations, use explicit transactions:
 
 ```javascript
-const txId = db.beginTransaction();
+const tx = db.beginTransaction();
 
 try {
-  await db.write(txId, 'account1', { balance: 900 });
-  await db.write(txId, 'account2', { balance: 1100 });
-  
-  // Verify within transaction
-  const account1 = await db.read(txId, 'account1');
-  
-  await db.commit(txId);
+  await db.write(tx, 'account1', { balance: 900 });
+  await db.write(tx, 'account2', { balance: 1100 });
+  const a = await db.read(tx, 'account1');   // reads pending state within the tx
+  await db.commit(tx);
 } catch (error) {
-  await db.rollback(txId);
+  await db.rollback(tx);
   throw error;
 }
 ```
 
-### Money Transfer Example
-Demonstrates ACID properties with business logic:
+The money-transfer example demonstrates atomicity: `db.transferMoney('savings', 'checking', 500)` — both balances update or neither does, with the writer held to a durable commit before control returns.
+
+### Durability guarantee
+
+A `commit()` returns only after the WAL `COMMIT` record and all pending writes have been fsynced to disk. A crash after `commit()` returns cannot lose the transaction. A crash mid-`commit()` leaves either the old or new state on disk, never a partial of either — data files are written via temp-file → fsync → atomic rename.
+
+## Schema validation
 
 ```javascript
-// Atomic money transfer with validation
-await db.transferMoney('savings', 'checking', 500);
-```
-
-## Schema Validation
-
-Define and enforce data schemas:
-
-```javascript
-// Set schema
 db.setSchema('users', {
-  name: { type: 'string', required: true, min: 2, max: 50 },
+  name:  { type: 'string', required: true, min: 2, max: 50 },
   email: { type: 'string', required: true, format: 'email' },
-  age: { type: 'number', min: 0, max: 150 },
+  age:   { type: 'number', min: 0, max: 150 },
   profile: {
     type: 'object',
     properties: {
-      bio: { type: 'string', max: 500 },
-      website: { type: 'string', format: 'url' }
-    }
-  }
+      bio:     { type: 'string', max: 500 },
+      website: { type: 'string', format: 'url' },
+    },
+  },
 });
 
-// Create with validation
-await db.create('user1', userData, {
-  validate: true,
-  schemaName: 'users',
-  strict: true
-});
+await db.create('user1', userData, { validate: true, schemaName: 'users', strict: true });
 ```
 
-##  Batch Operations
+Field types: `string`, `number`, `boolean`, `object`, `array`, `date`, `any`.
+Validation options: `required`, `min`, `max`, `format` (email/url/uuid/date/time/datetime/phone/ip), `pattern`, `enum`, `default`, `custom`.
 
-Efficient batch processing with ACID guarantees:
+## Batch operations
 
 ```javascript
-// Batch write
 await db.batchWrite([
-  { key: 'product1', data: { name: 'Laptop', price: 999.99 } },
-  { key: 'product2', data: { name: 'Mouse', price: 29.99 } },
-  { key: 'product3', data: { name: 'Keyboard', price: 79.99 } }
+  { key: 'product1', data: { name: 'Laptop',  price: 999.99 } },
+  { key: 'product2', data: { name: 'Mouse',   price: 29.99  } },
+  { key: 'product3', data: { name: 'Keyboard', price: 79.99 } },
 ]);
 
-// Batch read
 const products = await db.batchRead(['product1', 'product2', 'product3']);
 ```
 
-##  Cloud Backup
-
-Configure automatic cloud backups:
+## Cloud backup (client-owned credentials)
 
 ```javascript
 db.configureBackup({
-  format: 'archive',
+  format: 'archive',   // or 'individual' for per-file backups
   cloudStorage: {
     provider: 'aws-s3',
     region: 'us-east-1',
-    bucket: 'my-backup-bucket',
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+    bucket: 'my-tenant-bucket',
+    accessKeyId: process.env.MY_TENANT_AWS_KEY_ID,       // the client's own keys
+    secretAccessKey: process.env.MY_TENANT_AWS_SECRET,   // never sent to the control plane
   },
-  retention: '30d'
+  retention: '30d',
 });
 
-// Perform backup
 const result = await db.performBackup();
+const scheduleId = db.scheduleBackup({ interval: '6h', retention: '7d' });
+db.cancelScheduledBackup(scheduleId);
 ```
 
-##  Data Recovery
+The control plane issues API keys and observes instances; it does not broker bucket access, and it never sees a tenant's cloud credentials. This is the security model that makes 5,000 tenants safe to host from one control plane.
 
-Automatic crash recovery and cloud restore:
+## Cloud recovery
 
 ```javascript
-// Configure data recovery
 db.configureDataRecovery({
   cloudStorage: cloudConfig,
-  localPath: './mydata'
+  localPath: './mydata',
+  autoRecover: true,
 });
 
-// Recover specific file
-await db.recoverFromCloud('important-data');
-
-// Recover all files
-const result = await db.recoverAllFromCloud();
+await db.recoverFromCloud('important-data');           // one file
+const result = await db.recoverAllFromCloud();         // all files
+const archives = await db.listAvailableArchives();     // discover tar.gz backups
+const info = await db.getRecoveryInfo();               // local vs cloud diff
 ```
 
-##  Unique ID Generation
+## v2: hydrate on startup
 
-Generate MongoDB ObjectId-like unique identifiers:
+`Tero.create()` is the async factory that pulls missing/all files from the client's bucket **before** the ACID engine runs crash recovery — so a fresh node boots with the latest durable state.
 
 ```javascript
-// Generate unique IDs for different purposes
-const userId = db.getNewId('user');        // e.g., "user-507f1f77bcf86cd799439011"
-const sessionId = db.getNewId('session');  // e.g., "session-507f1f77bcf86cd799439012"
-const orderId = db.getNewId('order');      // e.g., "order-507f1f77bcf86cd799439013"
-
-// Use as document keys
-await db.create(userId, { 
-  name: 'Alice', 
-  email: 'alice@example.com',
-  createdAt: new Date()
+const db = await Tero.create({
+  directory: './mydata',
+  hydrateOnStartup: {
+    cloudStorage: cloudConfig,
+    mode: 'missing',          // 'all' overwrites local; 'missing' only pulls absent files
+    continueOnError: true,    // don't block boot on a single failed download
+    timeout: 30000,
+  },
 });
 
-// IDs are guaranteed unique across processes and time
-const logId = db.getNewId('log');
-await db.create(logId, { 
-  level: 'info', 
-  message: 'User created',
-  userId: userId 
-});
+// Or run hydration any time after construction:
+db.configureDataRecovery({ cloudStorage: cloudConfig, localPath: './mydata' });
+await db.hydrate({ mode: 'missing' });
 ```
 
-##  Monitoring
+Hydration is non-fatal by design: a bad-creds or unreachable bucket never blocks engine startup. The local filesystem remains the source of truth; the bucket is the durable ledger.
 
-Built-in performance monitoring and health checks:
+## v2: bucket backup with WAL segments
+
+`backupToBucket()` snapshots every data JSON file plus any retained WAL archive segments and writes a manifest the hydrate path can discover:
 
 ```javascript
-// Cache performance (now using optimized QuickLRU)
-const cacheStats = db.getCacheStats();
-console.log(`Cache hit rate: ${cacheStats.hitRate}%`);
-console.log(`Cache size: ${cacheStats.size}/${cacheStats.maxSize}`);
+const result = await db.backupToBucket({ tag: 'hourly-snapshot' });
+// result: { success, uploadedDataFiles, uploadedWALSegments, duration, errors }
 
-// Data integrity check
+// Force a fresh WAL archive segment first, then back it up:
+await db.checkpointAndBackupToBucket({ tag: 'post-burst' });
+```
+
+This is the v2 RPO lever: rotate the WAL into a new immutable segment, push it to the bucket, and a rehydrated node can replay from that segment forward.
+
+## v2: read with cloud fallback
+
+```javascript
+const data = await db.getWithRecovery('maybe-missing');
+// returns the document from local or, if absent locally, fetches from the bucket.
+// returns false if absent on both sides. does not throw on cloud failure —
+// use recoverFromCloud() if you need to see those errors.
+
+const probe = await db.existsWithCloudCheck('user1');
+// { local: true, cloud: true, canRecover: false }
+```
+
+## Unique ID generation
+
+MongoDB ObjectId-style identifiers, unique across processes and time:
+
+```javascript
+const userId = db.getNewId('user');       // user-507f1f77bcf86cd799439011
+const orderId = db.getNewId('order');     // order-507f1f77bcf86cd799439012
+await db.create(userId, { name: 'Alice' });
+```
+
+Composition: 4-byte timestamp + 5-byte process-unique random + 3-byte incrementing counter.
+
+## Monitoring
+
+```javascript
+const cache = db.getCacheStats();              // { size, maxSize, hitRate }
+const tx = db.getTransactionStats();           // { active, committed, rolledBack, total }
 const integrity = await db.verifyDataIntegrity();
-if (!integrity.healthy) {
-  console.log(`Issues found: ${integrity.corruptedFiles.length} corrupted files`);
-}
-
-// Active transactions
-const activeTx = db.getActiveTransactions();
-console.log(`Active transactions: ${activeTx.length}`);
+// { totalFiles, corruptedFiles, missingFiles, healthy }
+const active = db.getActiveTransactions();
+db.forceCheckpoint();                          // flush a CHECKPOINT into the WAL
 ```
 
-##  Error Handling
+## Architecture
 
-Comprehensive error handling with detailed messages:
+```
+Tero instance (one per process)
+├── ACIDStorageEngine
+│   ├── WriteAheadLog ─── append-only, fsync on barriers, rotates to archive segments
+│   ├── LockManager   ─── per-key shared/exclusive locks with wait queue
+│   └── pendingWrites ─── in-memory per-transaction op index (O(1) reads within a tx)
+├── SchemaValidator
+├── BackupManager     ─── cron-scheduled snapshot + WAL segment upload to client bucket
+└── DataRecovery      ─── hydrate-on-startup + runtime getWithRecovery
+```
+
+The control plane (not in this repo) is a separate service that:
+- Issues API keys to tenants
+- Receives heartbeats and metrics from Tero instances
+- Triggers no data movement and holds no bucket credentials
+
+This separation is what keeps tenant data sovereign. A compromised control plane cannot read tenant data and cannot mutate tenant backups.
+
+## Error handling
 
 ```javascript
 try {
   await db.create('user', invalidData, { validate: true, strict: true });
 } catch (error) {
-  if (error.message.includes('Schema validation failed')) {
-    // Handle validation error
-  } else if (error.message.includes('already exists')) {
-    // Handle duplicate key error
-  }
+  if (error.message.includes('Schema validation failed')) { /* validation error */ }
+  else if (error.message.includes('already exists'))     { /* duplicate key */ }
 }
 ```
 
-##  Configuration
+Keys are validated to prevent path traversal (`..`, `/`, `\` are rejected).
 
-### Database Options
+## Configuration
+
 ```javascript
 const db = new Tero({
-  directory: './data',     // Database directory
-  cacheSize: 1000         // Maximum cache entries
+  directory: './data',     // default: 'TeroDB'
+  cacheSize: 1000,        // default: 100, capped at 1000
+  backup: { ... },        // optional: install a BackupConfig at construction
+  hydrateOnStartup: { ... }, // optional: v2 hydration before engine init
 });
 ```
 
-### Schema Field Types
-- `string`: Text data with length and format validation
-- `number`: Numeric data with range validation
-- `boolean`: True/false values
-- `object`: Nested objects with property schemas
-- `array`: Arrays with item type validation
-- `date`: Date/time values
-- `any`: Any data type (no validation)
-
-### Schema Validation Options
-- `required`: Field is mandatory
-- `min/max`: Length/value constraints
-- `format`: Built-in formats (email, url, uuid, etc.)
-- `pattern`: Regular expression validation
-- `enum`: Allowed values list
-- `default`: Default value if not provided
-- `custom`: Custom validation function
-
-### Optimization Tips
-1. Use batch operations for multiple documents
-2. Enable caching for frequently accessed data
-3. Use schema validation to catch errors early
-4. Monitor cache hit rates and adjust cache size
-5. Use transactions for related operations
-
-##  Security
-
-- **Path Traversal Protection**: Automatic key sanitization
-- **Input Validation**: Comprehensive data validation
-- **Error Handling**: No sensitive data in error messages
-- **Access Control**: File system permissions respected
-
-## API Reference
-
-### Core Methods
-- `create(key, data, options?)`: Create new document
-- `get(key)`: Read document
-- `update(key, data, options?)`: Update document
-- `remove(key)`: Delete document
-- `exists(key)`: Check if document exists
-
-### Transaction Methods
-- `beginTransaction()`: Start new transaction
-- `write(txId, key, data, options?)`: Write in transaction
-- `read(txId, key)`: Read in transaction
-- `delete(txId, key)`: Delete in transaction
-- `commit(txId)`: Commit transaction
-- `rollback(txId)`: Rollback transaction
-
-### Batch Methods
-- `batchWrite(operations, options?)`: Batch write operations
-- `batchRead(keys)`: Batch read operations
-
-### Schema Methods
-- `setSchema(name, schema)`: Define schema
-- `getSchema(name)`: Get schema definition
-- `removeSchema(name)`: Remove schema
-- `validateData(name, data)`: Validate against schema
-
-### Utility Methods
-- `getCacheStats()`: Cache performance metrics
-- `verifyDataIntegrity()`: Check data health
-- `getActiveTransactions()`: List active transactions
-- `forceCheckpoint()`: Force WAL flush
-- `clearCache()`: Clear memory cache
-- `getNewId(prefix)`: Generate unique identifiers with custom prefix
-- `destroy()`: Cleanup and shutdown
-
 ## Testing
 
-Run the production test suite:
-
 ```bash
-npm run test:production
+npm run build           # tsc + full test suite
+npm run test            # full suite (includes the ~60s benchmark)
+npm run test:production # ACID + schema + transactions + perf
+npm run test:backup     # backup + scheduling + retention
+npm run test:schema     # schema validation
+npm run test:legacy     # legacy suite
+node local_tests/v2-test.js   # v2: hydrate + bucket backup surface
 ```
+
+## Performance characteristics
+
+- Synchronous fsync-per-commit (real Durability): ~50–70 ms per commit on consumer SSDs, bounded by the disk's fsync latency. Batch many writes into one transaction to amortize.
+- In-memory pending-writes index: O(1) reads within a transaction; no WAL re-scan per op.
+- WAL rotation at 1 MB or every 500 commits (whichever comes first), keeping recovery replays bounded.
+- LRU cache (QuickLRU) capped at 1000 entries to bound memory.
+
+This is single-node throughput, not cluster throughput. For higher write rates than a single fsync-per-commit allows, run multiple Tero instances behind a sharding layer; each owns its own bucket and directory.
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT — see [LICENSE](./LICENSE).
 
-##  Contributing
+## Contributing
 
-1. Fork the repository
+1. Fork the repo
 2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
+3. Add tests in `local_tests/` for new functionality
+4. Ensure `npm run build` is green
+5. Open a pull request
 
-##  Support
+## Support
 
-For issues and questions:
-- GitHub Issues: [Report bugs and request features](https://github.com/codedynasty-dev/tero/issues)
-- Documentation: [Full API documentation](https://github.com/codedynasty-dev/tero/wiki)
+- GitHub Issues: https://github.com/codedynasty-dev/tero/issues
+- The control-plane binary (key issuance + observability) is a separate repo.
 
 ---
 
-**Tero** - Production-ready ACID JSON database for modern applications.
+**Tero** — embedded ACID JSON for the edge. The bucket is the ledger; the control plane only watches.
