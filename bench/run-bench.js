@@ -392,7 +392,9 @@ async function runBenchmarks() {
                 if (e.startsWith('.')) continue;
                 const sub = join(dir, e);
                 try {
-                    (statSync(sub) as any).isDirectory() ? walk(sub) : (e.endsWith('.json') && dataFileCount++);
+                    const s = statSync(sub);
+                    if (s.isDirectory()) walk(sub);
+                    else if (e.endsWith('.json')) dataFileCount++;
                 } catch {}
             }
         } catch {}
