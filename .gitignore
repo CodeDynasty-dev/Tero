@@ -20,3 +20,5 @@ BenchmarkDB/.wal.**
 .wal
 BenchmarkDB/bat**
 RecoveryTestDB/**
+BenchDB/
+RecoveryBench**
