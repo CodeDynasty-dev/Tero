@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, statSync, existsSync as existsSyncFs } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { ACIDStorageEngine, SynchronousMode } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
@@ -160,11 +160,13 @@ export class Tero {
   private rolledBackCount: number = 0;
 
   /**
-   * In-memory set of keys known to exist on disk (or in committedBuffer). Updated on
-   * create/delete/commit. Replaces existsSync() in the hot path of create()/get() —
-   * saves ~9μs per op (a syscall + path join).
+   * Bounded LRU of known-existing keys. Replaces the unbounded Set<string>
+   * that grew linearly with key count (catastrophic memory at 1M+ keys/tenant).
+   * Capped at KNOWN_KEYS_MAX (10k) ~ 800KB peak vs ~80MB at 1M keys for Set.
+   * Falls back to disk (partitioned path existsSync) on LRU miss.
    */
-  private knownKeys: Set<string> = new Set();
+  private knownKeys: QuickLRU<string, boolean>;
+  private readonly KNOWN_KEYS_MAX: number = 10000;
 
   /**
    * Construct an embedded Tero instance synchronously.
@@ -195,6 +197,10 @@ export class Tero {
       this.cache = new QuickLRU<string, CacheEntry>({
         maxSize: this.cacheSize
       });
+
+      // Initialize bounded LRU for known-keys (caps memory at ~800KB vs ~80MB
+      // for an unbounded Set at 1M keys — addresses cloud-scale heap bloat).
+      this.knownKeys = new QuickLRU<string, boolean>({ maxSize: this.KNOWN_KEYS_MAX });
 
       // Initialize ACID storage engine (primary system)
       const syncMode: SynchronousMode = synchronous ?? 'full';
@@ -519,7 +525,7 @@ export class Tero {
     try {
       const result = await this.write(transactionId, key, initialData || {}, options);
       await this.commit(transactionId);
-      this.knownKeys.add(key);
+      this.knownKeys.set(key, true);
 
       return result || true;
     } catch (error) {
@@ -552,7 +558,8 @@ export class Tero {
    * Fast path (3 tiers, zero-syscall on hit):
    *   1. LRU cache (committed entries) — pure memory, 900k+ ops/s
    *   2. committedBuffer (committed but not yet flushed to disk) — pure memory
-   *   3. Read from data file on disk — one readFileSync (atomic rename guarantees valid JSON)
+   *   3. Read from data file via 2-level hash-prefix partitioned path (atomic
+   *      rename guarantees valid JSON; no single dentry holds >50k files)
    *
    * NO transaction is created, NO WAL I/O, NO lock acquired.
    */
@@ -572,15 +579,15 @@ export class Tero {
     const committed = this.acidEngine.getCommittedData(key);
     if (committed !== undefined) {
       if (committed === null) return false;
-      // Cache as a committed entry so future gets hit tier 1
       this.updateCache(key, committed, undefined);
       return committed;
     }
 
-    // 3. Slow path: read directly from disk (atomic rename guarantees consistency)
-    const { readFileSync } = await import('fs');
-    const filePath = `${this.teroDirectory}/${key}.json`;
-    if (!existsSync(filePath)) {
+    // 3. Slow path: read directly from disk (partitioned path; atomic rename = consistent)
+    const { readFileSync, existsSync: existsSyncFs } = await import('fs');
+    const { join } = await import('path');
+    const filePath = this.keyToPath(key);
+    if (!existsSyncFs(filePath)) {
       return false;
     }
 
@@ -592,6 +599,21 @@ export class Tero {
     } catch (error) {
       throw new Error(`Read failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+  }
+
+  /**
+   * Map a document key to its partitioned path on disk (2-level hash-prefix).
+   * Matches the layout used by ACIDStorageEngine — same key resolves to same path.
+   */
+  private keyToPath(key: string): string {
+    // FNV-1a 32-bit of the key — same dispersion as partitionedPath() in acid-engine.ts
+    let h = 0x811c9dc5;
+    for (let i = 0; i < key.length; i++) {
+      h ^= key.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    const hex = h.toString(16).padStart(8, '0');
+    return `${this.teroDirectory}/${hex.slice(0, 2)}/${hex.slice(2, 4)}/${key}.json`;
   }
 
   async remove(key: string): Promise<void> {
@@ -616,9 +638,10 @@ export class Tero {
       this.validateKey(key);
       // Fast path: in-memory set
       if (this.knownKeys.has(key)) return true;
-      // Slow path: check disk (covers data created by another process / hydrated)
-      if (existsSync(`${this.teroDirectory}/${key}.json`)) {
-        this.knownKeys.add(key); // memoize
+      // Slow path: check disk via partitioned path (covers data created by another
+      // process / hydrated / written to a partition the LRU has evicted)
+      if (existsSync(this.keyToPath(key))) {
+        this.knownKeys.set(key, true);
         return true;
       }
       return false;
@@ -641,7 +664,7 @@ export class Tero {
       }
       await this.commit(transactionId);
       // Register all written keys in knownKeys so future exists() calls are O(1)
-      for (const op of operations) this.knownKeys.add(op.key);
+      for (const op of operations) this.knownKeys.set(op.key, true);
     } catch (error) {
       await this.rollback(transactionId);
       throw new Error(`Batch write failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -1114,27 +1137,26 @@ export class Tero {
     };
 
     try {
-      const files = readdirSync(this.teroDirectory)
-        .filter((file: string) => file.endsWith('.json'));
-
-      result.totalFiles = files.length;
-
-      for (const file of files) {
+      // Streaming partition walk — no readdirSync array allocation. Each leaf
+      // directory is visited async via fs.opendir iteration, so a 1M-key
+      // database doesn't allocate ~80MB of JS string objects in one tick.
+      const { walkPartitions } = await import('./acid-engine.js');
+      const { basename } = await import('path');
+      await walkPartitions(this.teroDirectory, async (filePath) => {
+        const file = basename(filePath);
         const key = file.replace('.json', '');
+        result.totalFiles++;
         try {
           const data = await this.get(key);
-          // FIX: previously this checked `=== null` but `get()` returns `false` for absent
-          // docs, so missing files were never reported. Now report either falsy contract.
           if (data === null || data === false) {
             result.missingFiles.push(key);
             result.healthy = false;
           }
         } catch (error) {
-          // Unexpected error (e.g. JSON parse failure) → mark as corrupted.
           result.corruptedFiles.push(key);
           result.healthy = false;
         }
-      }
+      });
 
       return result;
     } catch (error) {

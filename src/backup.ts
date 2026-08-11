@@ -152,24 +152,37 @@ export class BackupManager {
     });
   }
 
+  /**
+   * Enumerate *.json files across the 2-level hash-prefix partition tree using
+   * async fs.opendir iteration. Replaces the previous readdirSync() flat scan
+   * that allocated a giant array of all filenames in one tick — at 1M keys the
+   * old call alone consumed ~80MB and froze the event loop for seconds.
+   *
+   * Streaming walks each leaf directory one entry at a time.
+   */
   private async getJsonFiles(): Promise<Array<{ path: string; name: string; size: number; mtime: Date }>> {
     try {
       if (!existsSync(this.dbPath)) {
         return [];
       }
 
-      const files = readdirSync(this.dbPath)
-        .filter(file => file.endsWith('.json'))
-        .map(file => {
-          const filePath = join(this.dbPath, file);
+      const { walkPartitions } = await import('./acid-engine.js');
+      const { basename } = await import('path');
+      const files: Array<{ path: string; name: string; size: number; mtime: Date }> = [];
+
+      await walkPartitions(this.dbPath, async (filePath) => {
+        try {
           const stats = statSync(filePath);
-          return {
+          files.push({
             path: filePath,
-            name: file,
+            name: basename(filePath),
             size: stats.size,
             mtime: stats.mtime
-          };
-        });
+          });
+        } catch {
+          // file may be removed mid-walk — skip
+        }
+      });
 
       return files;
     } catch (error) {
