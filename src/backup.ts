@@ -210,7 +210,10 @@ export class BackupManager {
         await fs.mkdir(this.config.localPath, { recursive: true });
       }
 
-      // Create tar.gz archive
+      // Create tar.gz archive — pass relative paths from dbPath so the
+      // 2-level hash-prefix partition dirs are preserved in the archive.
+      // (was: jsonFiles.map(f => f.name) — broke when files moved to XX/YY/key.json)
+      const fileList = jsonFiles.map(f => f.path.slice(this.dbPath.length + 1));
       await tar.create(
         {
           file: backupPath,
@@ -218,7 +221,7 @@ export class BackupManager {
           gzip: true,
           prefix: 'tero-data/'
         },
-        jsonFiles.map(f => f.name)
+        fileList
       );
 
       const stats = statSync(backupPath);

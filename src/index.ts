@@ -32,8 +32,11 @@ interface TeroConfig {
 
 interface HydrateConfig {
   cloudStorage: CloudStorageConfig;
-  /** 'all' overwrites local files from the bucket; 'missing' (default) only pulls files absent locally. */
-  mode?: 'all' | 'missing';
+  /** 'all' overwrites local files from the bucket; 'missing' (default) only pulls files absent
+   *  locally; 'snapshot' downloads the most recent tar.gz archive first then falls back
+   *  to individual files. Snapshot mode is the Google-recommended approach — one bulk
+   *  download vs thousands of individual S3 GETs. */
+  mode?: 'all' | 'missing' | 'snapshot';
   /** Continue when a single file fails to download (default true). */
   continueOnError?: boolean;
   /** Maximum time to wait for hydration before attempting engine init (ms). */
@@ -244,21 +247,36 @@ export class Tero {
     const recovery = new DataRecovery({
       cloudStorage: hydrate.cloudStorage,
       localPath: teroDirectory,
-      mode: hydrate.mode ?? 'missing',
+      mode: hydrate.mode === 'all' ? 'all' : 'missing',
       continueOnError: hydrate.continueOnError ?? true,
     });
 
     try {
-      if ((hydrate.mode ?? 'missing') === 'all') {
+      const mode = hydrate.mode ?? 'missing';
+      if (mode === 'all') {
         const r = await recovery.recoverIndividualFiles();
-        if (!r.success && r.failed.length > 0) {
-          // continue with what we have, surface via stats — never block startup
+        if (!r.success && r.failed.length > 0) { /* continue */ }
+      } else if (mode === 'snapshot') {
+        // Snapshot-first: download the most recent tar.gz archive, extract it
+        // locally in bulk (one HTTP GET for potentially thousands of docs), then
+        // fill gaps with individual file recovery for any data written since the
+        // snapshot's checkpoint. This is the Google-recommended hydration pattern:
+        // one bulk download instead of sequential individual S3 GETs.
+        try {
+          const snapshotResult = await recovery.recoverFromArchive();
+          if (!snapshotResult.success) {
+            // Fall back to individual file recovery if no archive exists
+            const r = await recovery.recoverMissingFiles();
+            if (!r.success && r.failed.length > 0) { /* continue */ }
+          }
+        } catch {
+          // Archive may not exist or may be corrupted; fall back gracefully
+          const r = await recovery.recoverMissingFiles();
+          if (!r.success && r.failed.length > 0) { /* continue */ }
         }
       } else {
         const r = await recovery.recoverMissingFiles();
-        if (!r.success && r.failed.length > 0) {
-          // same — partial hydration then continue
-        }
+        if (!r.success && r.failed.length > 0) { /* continue */ }
       }
     } catch (error) {
       // Hydration errors are non-fatal; engine init proceeds with whatever local data exists.
@@ -281,7 +299,7 @@ export class Tero {
    * `configureDataRecovery(...)` to have been called, or `hydrateOnStartup` in
    * the constructor config.
    */
-  async hydrate(options?: { mode?: 'all' | 'missing'; timeout?: number }): Promise<RecoveryResult> {
+  async hydrate(options?: { mode?: 'all' | 'missing' | 'snapshot'; timeout?: number }): Promise<RecoveryResult> {
     const recovery = this.dataRecovery;
     if (!recovery) {
       throw new Error('Data recovery not configured. Call configureDataRecovery() or pass hydrateOnStartup in config.');
@@ -289,6 +307,12 @@ export class Tero {
     const mode = options?.mode ?? 'missing';
     if (mode === 'all') {
       return await recovery.recoverIndividualFiles();
+    } else if (mode === 'snapshot') {
+      try {
+        return await recovery.recoverFromArchive();
+      } catch {
+        return await recovery.recoverMissingFiles();
+      }
     } else {
       return await recovery.recoverMissingFiles();
     }
