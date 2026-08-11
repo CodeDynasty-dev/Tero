@@ -434,7 +434,7 @@ function generateHTML(data) {
     const batchAmortization = (suites.write.batch_create.opsPerSec * 100) / Math.max(1, suites.write.single_create.opsPerSec);
     const hotVsColdRatio = suites.read.hot.opsPerSec / Math.max(1, suites.read.cold_random.opsPerSec);
     const rollbackVsCommit = suites.transaction.rollback.opsPerSec / Math.max(1, suites.transaction.single_write_commit.opsPerSec);
-    const fileCountScale = suites.fileCount[2000].scanMs / Math.max(1, suites.fileCount[100].scanMs);
+    const fileCountScale = suites.fileCount[counts[counts.length - 1]].scanMs / Math.max(1, suites.fileCount[counts[0]].scanMs);
 
     // Determining verdict
     const verdicts = [];

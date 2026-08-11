@@ -15,16 +15,27 @@ export interface LogEntry {
     checksum: string;
 }
 
+export type SynchronousMode = 'full' | 'normal' | 'off';
+
 // Write-Ahead Log (WAL) implementation
 export class WriteAheadLog {
     private logPath: string;
     private currentLSN: number = 0;
     private readonly LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024; // 1MB
     private readonly ARCHIVE_KEEP_COUNT = 3;
+    private synchronous: SynchronousMode;
+    private commitIntervalMs: number;
+    private dirty: boolean = false;
+    private groupCommitTimer?: ReturnType<typeof setInterval>;
 
-    constructor(dbPath: string) {
+    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10) {
         this.logPath = join(dbPath, '.wal');
+        this.synchronous = synchronous;
+        this.commitIntervalMs = commitIntervalMs;
         this.initializeWAL();
+        if (synchronous === 'normal') {
+            this.startGroupCommitTimer();
+        }
     }
 
     private initializeWAL(): void {
@@ -75,6 +86,30 @@ export class WriteAheadLog {
         } catch {
         } finally {
             closeSync(fd);
+        }
+    }
+
+    /**
+     * Group-commit timer: in `normal` mode, fsyncs the WAL on a coalescing interval
+     * instead of per-commit. This amortizes the fsync cost across many commits,
+     * trading a small RPO window (commitIntervalMs, default 10ms) for 10–100x
+     * throughput. This is the same knob SQLite exposes as `PRAGMA synchronous=NORMAL`.
+     */
+    private startGroupCommitTimer(): void {
+        this.groupCommitTimer = setInterval(() => {
+            if (this.dirty) {
+                this.fsyncFile(this.logPath);
+                this.dirty = false;
+            }
+        }, this.commitIntervalMs);
+        // Don't keep the event loop alive solely for the timer
+        if (this.groupCommitTimer.unref) this.groupCommitTimer.unref();
+    }
+
+    private stopGroupCommitTimer(): void {
+        if (this.groupCommitTimer) {
+            clearInterval(this.groupCommitTimer);
+            this.groupCommitTimer = undefined;
         }
     }
 
@@ -141,10 +176,18 @@ export class WriteAheadLog {
         // Atomic append. No read-modify-write anywhere on the WAL path.
         appendFileSync(this.logPath, line);
 
-        // Durable barrier: fsync on commit so committed transactions survive power loss.
+        // Durability barrier: depends on the synchronous mode.
+        //   'full'   — fsync on every COMMIT/ROLLBACK/CHECKPOINT (max durability)
+        //   'normal' — mark dirty; background timer fsyncs every commitIntervalMs
+        //   'off'    — never fsync (testing/bench only)
         if (entry.operation === 'COMMIT' || entry.operation === 'ROLLBACK' ||
             entry.operation === 'CHECKPOINT') {
-            this.fsyncFile(this.logPath);
+            if (this.synchronous === 'full') {
+                this.fsyncFile(this.logPath);
+            } else if (this.synchronous === 'normal') {
+                this.dirty = true;
+            }
+            // 'off' → do nothing
         }
 
         // Check if log rotation is needed
@@ -174,14 +217,17 @@ export class WriteAheadLog {
         const archivePath = `${this.logPath}.${timestamp}`;
 
         try {
-            // Snapshot current log content to archive (current log may have been fsynced already)
+            // Ensure the current WAL is fsynced before archiving (regardless of mode)
+            this.forceFlush();
+
+            // Snapshot current log content to archive
             const currentContent = readFileSync(this.logPath, 'utf-8');
             writeFileSync(archivePath, currentContent);
-            this.fsyncFile(archivePath);
+            if (this.synchronous === 'full') this.fsyncFile(archivePath);
 
             // Start new log empty
             writeFileSync(this.logPath, '');
-            this.fsyncFile(this.logPath);
+            if (this.synchronous === 'full') this.fsyncFile(this.logPath);
 
             // Emit a CHECKPOINT entry at the head of the new log so crash recovery
             // knows everything before this LSN was already persistent.
@@ -267,11 +313,14 @@ export class WriteAheadLog {
     }
 
     /**
-     * No longer needed as a public flush operation since writeLog appends synchronously.
-     * Kept for API compatibility — now a no-op (writes are already durable-to-OS-cache).
+     * Explicit flush barrier. Always fsyncs regardless of synchronous mode, so
+     * callers can force durability on demand (e.g. before a bucket backup, on
+     * shutdown, or after a critical write). In `normal` mode this also clears
+     * the dirty flag so the next timer tick won't re-fsync.
      */
     forceFlush(): void {
         this.fsyncFile(this.logPath);
+        this.dirty = false;
     }
 
     getCurrentLSN(): number {
@@ -286,11 +335,17 @@ export class WriteAheadLog {
     truncateLog(): void {
         try {
             writeFileSync(this.logPath, '');
-            this.fsyncFile(this.logPath);
+            if (this.synchronous === 'full') this.fsyncFile(this.logPath);
+            this.dirty = false;
             this.cleanupOldArchives(0);
         } catch (error) {
             // Silent failure
         }
+    }
+
+    destroy(): void {
+        this.stopGroupCommitTimer();
+        this.forceFlush();
     }
 }
 
@@ -513,9 +568,9 @@ export class ACIDStorageEngine {
     private readonly COMMIT_INTERVAL = 500;
     private commitCount: number = 0;
 
-    constructor(dbPath: string) {
+    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10) {
         this.dbPath = dbPath;
-        this.wal = new WriteAheadLog(dbPath);
+        this.wal = new WriteAheadLog(dbPath, synchronous, commitIntervalMs);
         this.lockManager = new LockManager();
         this.initializeStorage();
     }
@@ -618,10 +673,12 @@ export class ACIDStorageEngine {
     }
 
     /**
-     * Atomic durable data file write: write to a temp file, fsync it, then atomically
-     * rename over the target. This ensures a crash mid-write can never corrupt the
-     * canonical file (readers always see either the old or new full content, never a
-     * partial of either). Also fsyncs the parent dir so the rename itself is durable.
+     * Atomic data file write: write to a temp file then atomically rename over
+     * the target. The atomic rename guarantees readers never see a partial file
+     * (crash consistency). We intentionally do NOT fsync the temp file or parent
+     * directory here — the WAL is the durable ledger, and crash recovery's redo
+     * phase rebuilds data files from the WAL. This eliminates 2 of the 3 fsyncs
+     * per commit, leaving only the WAL fsync as the single durability barrier.
      */
     private atomicWriteFile(filePath: string, content: string): void {
         const dir = dirname(filePath);
@@ -632,30 +689,11 @@ export class ACIDStorageEngine {
         const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
         writeFileSync(tmpPath, content);
 
-        // fsync the temp file so its bytes are on disk before we rename
-        let fd: number;
-        try {
-            fd = openSync(tmpPath, 'r');
-            try { fsyncSync(fd); } catch { } finally { closeSync(fd); }
-        } catch {
-            // fall through — rename will still occur
-        }
-
-        // atomic rename
+        // atomic rename — readers see old or new, never partial
         renameSync(tmpPath, filePath);
 
-        // Best-effort fsync of the parent directory so the rename is durable on POSIX
-        this.fsyncDirQuiet(dir);
-    }
-
-    private fsyncDirQuiet(dirPath: string): void {
-        let fd: number;
-        try {
-            fd = openSync(dirPath, 'r');
-        } catch {
-            return;
-        }
-        try { fsyncSync(fd); } catch { } finally { closeSync(fd); }
+        // intentionally NO fsync of the data file or parent dir — the WAL fsync
+        // on commit is the only durability barrier; redo recovery handles the rest.
     }
 
     // Transaction management

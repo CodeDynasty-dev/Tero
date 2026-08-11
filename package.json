@@ -29,7 +29,9 @@
     "pretest": "echo 'Running Tero test suite...'",
     "posttest": "echo 'Test suite completed!'",
     "verify": "node verify-build.js && npm run test",
-    "ci": "npm run verify"
+    "ci": "npm run verify",
+    "bench": "node bench/run-bench.js",
+    "bench:quick": "node bench/run-bench.js --quick"
   },
   "files": [
     "dist/**/*"
