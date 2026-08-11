@@ -35,6 +35,14 @@ export interface BackupMetadata {
   retention: string;
 }
 
+export interface BucketBackupResult {
+  success: boolean;
+  uploadedDataFiles: number;
+  uploadedWALSegments: number;
+  duration: number;
+  errors: string[];
+}
+
 export class BackupManager {
   private s3Client?: S3Client;
   private scheduledBackups: Map<string, CronJob> = new Map();
@@ -556,6 +564,121 @@ export class BackupManager {
         message: `Cloud storage connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
+  }
+
+  /**
+   * v2: One-shot bucket backup of all data JSON files + any WAL archive segments
+   * the caller passes in. Designed for scheduled "snapshot to bucket" runs that a
+   * client triggers with its OWN bucket credentials — the control plane never holds
+   * the client's cloud keys, it only observes results via heartbeats.
+   *
+   * Returns a structured result with per-stream counts and surfaced errors.
+   */
+  async backupToBucket(options?: {
+    walArchivePaths?: string[];
+    tag?: string;
+  }): Promise<BucketBackupResult> {
+    const startTime = Date.now();
+    const errors: string[] = [];
+    let uploadedDataFiles = 0;
+    let uploadedWALSegments = 0;
+
+    if (!this.s3Client || !this.config.cloudStorage) {
+      errors.push('Cloud storage not configured');
+      return {
+        success: false,
+        uploadedDataFiles: 0,
+        uploadedWALSegments: 0,
+        duration: Date.now() - startTime,
+        errors,
+      };
+    }
+
+    try {
+      // 1) Snapshot all data JSON files to bucket.
+      const jsonFiles = await this.getJsonFiles();
+      for (const file of jsonFiles) {
+        try {
+          const cloudKey = this.getCloudKey(file.name);
+          await this.uploadToCloud(file.path, cloudKey);
+          uploadedDataFiles++;
+        } catch (error) {
+          errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      }
+
+      // 2) Stream WAL archive segments the caller wants persisted.
+      const walPaths = options?.walArchivePaths ?? [];
+      for (const archivePath of walPaths) {
+        if (!existsSync(archivePath)) continue;
+        try {
+          const segName = basename(archivePath);
+          const prefix = this.config.cloudStorage.pathPrefix || 'tero-backups';
+          const dbName = basename(this.dbPath);
+          const cloudKey = `${prefix}/${dbName}/wal/${segName}`;
+          await this.uploadToCloud(archivePath, cloudKey);
+          uploadedWALSegments++;
+        } catch (error) {
+          errors.push(`wal:${basename(archivePath)}:${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      }
+
+      // 3) Emit a backup manifest so hydrate-on-startup can discover the latest snapshot.
+      try {
+        const manifest = {
+          timestamp: new Date().toISOString(),
+          tag: options?.tag ?? 'manual',
+          dataFiles: jsonFiles.map(f => f.name),
+          walSegments: walPaths.map(p => basename(p)),
+          dbPath: basename(this.dbPath),
+        };
+        const manifestKey = `${this.config.cloudStorage.pathPrefix || 'tero-backups'}/${basename(this.dbPath)}/MANIFEST.json`;
+        await this.uploadBuffer(
+          JSON.stringify(manifest, null, 2),
+          manifestKey,
+          'application/json'
+        );
+      } catch (error) {
+        errors.push(`manifest:${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+
+      return {
+        success: errors.length === 0,
+        uploadedDataFiles,
+        uploadedWALSegments,
+        duration: Date.now() - startTime,
+        errors,
+      };
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : 'Unknown error');
+      return {
+        success: false,
+        uploadedDataFiles,
+        uploadedWALSegments,
+        duration: Date.now() - startTime,
+        errors,
+      };
+    }
+  }
+
+  /**
+   * Upload an arbitrary buffer (used for the bucket manifest and small artifacts).
+   */
+  private async uploadBuffer(content: string, cloudKey: string, contentType: string): Promise<void> {
+    if (!this.s3Client || !this.config.cloudStorage) {
+      throw new Error('Cloud storage not configured');
+    }
+    const cmd = new PutObjectCommand({
+      Bucket: this.config.cloudStorage.bucket,
+      Key: cloudKey,
+      Body: content,
+      ContentType: contentType,
+      Metadata: {
+        'backup-timestamp': new Date().toISOString(),
+        'source-db': basename(this.dbPath),
+      },
+    });
+    await this.s3Client.send(cmd);
   }
 
   destroy(): void {

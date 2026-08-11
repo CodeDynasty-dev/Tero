@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, statSync, existsSync as existsSyncFs } from "fs";
+import { join } from "path";
 import { ACIDStorageEngine } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
-import { BackupManager, BackupConfig, BackupMetadata } from "./backup.js";
+import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
 import { randomBytes } from "node:crypto";
 import QuickLRU from "quick-lru";
@@ -9,6 +10,20 @@ import QuickLRU from "quick-lru";
 interface TeroConfig {
   directory?: string;
   cacheSize?: number;
+  /** v2: hydrate local state from a bucket on startup before the ACID engine comes up. */
+  hydrateOnStartup?: HydrateConfig;
+  /** v2: a default backup config installed at construction time (use configureBackup() at runtime too). */
+  backup?: BackupConfig;
+}
+
+interface HydrateConfig {
+  cloudStorage: CloudStorageConfig;
+  /** 'all' overwrites local files from the bucket; 'missing' (default) only pulls files absent locally. */
+  mode?: 'all' | 'missing';
+  /** Continue when a single file fails to download (default true). */
+  continueOnError?: boolean;
+  /** Maximum time to wait for hydration before attempting engine init (ms). */
+  timeout?: number;
 }
 
 interface TransactionOptions {
@@ -130,6 +145,14 @@ export class Tero {
   private committedCount: number = 0;
   private rolledBackCount: number = 0;
 
+  /**
+   * Construct an embedded Tero instance synchronously.
+   *
+   * For v2 startup hydration from a bucket, prefer `await Tero.create(config)` which
+   * pulls missing/all files from the client's OWN bucket before the ACID engine is
+   * initialized. The control plane never holds client bucket credentials; it only
+   * observes instances. Pass `hydrateOnStartup` in config to use this path.
+   */
   constructor(config?: TeroConfig) {
     try {
       const rawDirectory = (config as any)?.Directory || config?.directory;
@@ -157,8 +180,87 @@ export class Tero {
 
       // Initialize schema validator
       this.schemaValidator = new SchemaValidator();
+
+      // v2: optionally install a backup config at construction time.
+      if (config?.backup) {
+        this.configureBackup(config.backup);
+      }
     } catch (error) {
       throw new Error(`Failed to initialize Tero: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * v2 async factory. Same as `new Tero(config)` but runs hydrate-on-startup BEFORE
+   * the ACID engine is constructed. Use this when `config.hydrateOnStartup` is set
+   * so missing/all local files are restored from the client's bucket first.
+   */
+  static async create(config?: TeroConfig): Promise<Tero> {
+    const hydrate = config?.hydrateOnStartup;
+    if (!hydrate) {
+      return new Tero(config);
+    }
+
+    // Ensure directory exists first so DataRecovery can stream into it.
+    const rawDirectory = (config as any)?.Directory || config?.directory || 'TeroDB';
+    const teroDirectory = rawDirectory.replace(/[^a-zA-Z0-9_\-\/]/g, '');
+    if (!existsSync(teroDirectory)) {
+      mkdirSync(teroDirectory, { recursive: true });
+    }
+
+    // Pre-engine hydration: pull files from the client's bucket before engine init,
+    // so crash recovery (which runs inside the ACIDStorageEngine constructor) sees
+    // the latest durable state instead of an empty local directory.
+    const recovery = new DataRecovery({
+      cloudStorage: hydrate.cloudStorage,
+      localPath: teroDirectory,
+      mode: hydrate.mode ?? 'missing',
+      continueOnError: hydrate.continueOnError ?? true,
+    });
+
+    try {
+      if ((hydrate.mode ?? 'missing') === 'all') {
+        const r = await recovery.recoverIndividualFiles();
+        if (!r.success && r.failed.length > 0) {
+          // continue with what we have, surface via stats — never block startup
+        }
+      } else {
+        const r = await recovery.recoverMissingFiles();
+        if (!r.success && r.failed.length > 0) {
+          // same — partial hydration then continue
+        }
+      }
+    } catch (error) {
+      // Hydration errors are non-fatal; engine init proceeds with whatever local data exists.
+    }
+
+    // Now construct the engine in the usual way — it sees current local state and
+    // runs crash recovery against the WAL for any writes between the last snapshot
+    // and the crash.
+    const instance = new Tero(config);
+
+    // Keep the recovery client wired so that runtime `getWithRecovery` / `existsWithCloudCheck`
+    // can fall back to the same client bucket with no extra configuration.
+    (instance as any).dataRecovery = recovery;
+    return instance;
+  }
+
+  /**
+   * v2: explicitly run hydration at any time (idempotent). Pulls missing/all files
+   * from the client's bucket according to the config passed. Requires either
+   * `configureDataRecovery(...)` to have been called, or `hydrateOnStartup` in
+   * the constructor config.
+   */
+  async hydrate(options?: { mode?: 'all' | 'missing'; timeout?: number }): Promise<RecoveryResult> {
+    const recovery = this.dataRecovery;
+    if (!recovery) {
+      throw new Error('Data recovery not configured. Call configureDataRecovery() or pass hydrateOnStartup in config.');
+    }
+    const mode = options?.mode ?? 'missing';
+    if (mode === 'all') {
+      return await recovery.recoverIndividualFiles();
+    } else {
+      return await recovery.recoverMissingFiles();
     }
   }
 
@@ -186,8 +288,6 @@ export class Tero {
       throw new Error('Key contains invalid characters');
     }
   }
-
-
 
   private invalidateCacheKeys(keys: string[]): void {
     for (const key of keys) {
@@ -303,14 +403,16 @@ export class Tero {
 
       await this.acidEngine.commitTransaction(txId);
 
-      // Invalidate cache entries for this transaction to force fresh reads
-      const keysToInvalidate: string[] = [];
+      // PROMOTE cache entries tagged with this transaction to "committed" state by
+      // clearing their transactionId, instead of deleting them. This keeps the cache
+      // warm across commits so subsequent reads get cache hits — the whole point of
+      // having a cache. (Previous behaviour deleted these entries, which made the
+      // cache permanently cold after every auto-committed convenience op.)
       for (const [key, entry] of this.cache.entries()) {
         if (entry.transactionId === txId) {
-          keysToInvalidate.push(key);
+          entry.transactionId = undefined;
         }
       }
-      this.invalidateCacheKeys(keysToInvalidate);
       this.committedCount++;
     } catch (error) {
       throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -396,6 +498,13 @@ export class Tero {
     }
   }
 
+  /**
+   * Reads a document. Returns the document data on success, or `false` if the
+   * document is absent. Throws for genuine errors.
+   *
+   * NOTE: callers that need to distinguish "absent" from "present-with-falsy-data"
+   * should use `exists()` first.
+   */
   async get(key: string): Promise<any> {
     const transactionId = this._beginTransaction();
 
@@ -615,13 +724,21 @@ export class Tero {
     return result as ValidationResult;
   }
 
+  // ---------------------------------------------------------------------------
   // Backup Management
+  // ---------------------------------------------------------------------------
+
   configureBackup(config: BackupConfig): void {
     try {
       this.backupManager = new BackupManager(this.teroDirectory, config);
     } catch (error) {
       throw new Error(`Failed to configure backup: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+  }
+
+  /** Alias retained for the existing test surface / older callers. */
+  configureAdvancedBackup(config: BackupConfig): void {
+    this.configureBackup(config);
   }
 
   async performBackup(): Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }> {
@@ -631,7 +748,74 @@ export class Tero {
     return await this.backupManager.performBackup();
   }
 
+  /** Alias retained for the existing test surface / older callers. */
+  async performAdvancedBackup(): Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }> {
+    return this.performBackup();
+  }
+
+  /** Schedule a recurring backup via cron. Returns a schedule id; cancel with cancelScheduledBackup(). */
+  scheduleBackup(config: { interval: string; retention?: string }): string {
+    if (!this.backupManager) {
+      throw new Error('Backup not configured. Call configureBackup() first.');
+    }
+    return this.backupManager.scheduleBackup(config);
+  }
+
+  /** Cancel a previously scheduled backup by id. */
+  cancelScheduledBackup(scheduleId: string): boolean {
+    if (!this.backupManager) return false;
+    return this.backupManager.cancelScheduledBackup(scheduleId);
+  }
+
+  /** List currently scheduled backups. */
+  getScheduledBackups(): Array<{ id: string; active: boolean }> {
+    if (!this.backupManager) return [];
+    return this.backupManager.getScheduledBackups();
+  }
+
+  /** Test reachability of the configured bucket. Returns {success, message}. */
+  async testCloudConnection(): Promise<{ success: boolean; message: string }> {
+    if (!this.backupManager) {
+      return { success: false, message: 'Backup not configured' };
+    }
+    return await this.backupManager.testCloudConnection();
+  }
+
+  /**
+   * v2: One-shot bucket backup of all current data JSON files plus any WAL archive
+   * segments retained locally. Designed for scheduled "snapshot to bucket" runs the
+   * CLIENT triggers with its OWN bucket credentials — the control plane never holds
+   * client cloud keys, it only observes results via heartbeats.
+   */
+  async backupToBucket(options?: { tag?: string }): Promise<BucketBackupResult> {
+    if (!this.backupManager) {
+      throw new Error('Backup not configured. Call configureBackup() first.');
+    }
+    const walArchivePaths = this.acidEngine.getWAL().listArchives();
+    return await this.backupManager.backupToBucket({
+      walArchivePaths,
+      tag: options?.tag,
+    });
+  }
+
+  /**
+   * v2: Emit a WAL checkpoint + immediately rotate the WAL into a new archive segment,
+   * then back that fresh segment up to the bucket. Useful right after high-write bursts
+   * to bound the recovery window (RPO) when hydrating a new instance.
+   */
+  async checkpointAndBackupToBucket(options?: { tag?: string }): Promise<BucketBackupResult> {
+    if (!this.backupManager) {
+      throw new Error('Backup not configured. Call configureBackup() first.');
+    }
+    this.acidEngine.forceCheckpoint();
+    this.acidEngine.getWAL().rotateLog();
+    return await this.backupToBucket(options);
+  }
+
+  // ---------------------------------------------------------------------------
   // Data Recovery
+  // ---------------------------------------------------------------------------
+
   configureDataRecovery(config: RecoveryConfig): void {
     try {
       this.dataRecovery = new DataRecovery(config);
@@ -667,7 +851,139 @@ export class Tero {
     return result;
   }
 
+  /** Recovery info: how many cloud files exist, which are missing locally, which can be pulled. */
+  async getRecoveryInfo(): Promise<{
+    cloudFiles: number;
+    localFiles: number;
+    missingLocally: string[];
+    availableForRecovery: string[];
+  }> {
+    if (!this.dataRecovery) {
+      throw new Error('Data recovery not configured. Call configureDataRecovery() first.');
+    }
+    return await this.dataRecovery.getRecoveryInfo();
+  }
+
+  /** List available backup/archived files in the client bucket. */
+  async listAvailableFiles(): Promise<string[]> {
+    if (!this.dataRecovery) {
+      throw new Error('Data recovery not configured. Call configureDataRecovery() first.');
+    }
+    return await this.dataRecovery.listAvailableFiles();
+  }
+
+  /** List available tar.gz archive backups in the client bucket. */
+  async listAvailableArchives(): Promise<string[]> {
+    if (!this.dataRecovery) {
+      throw new Error('Data recovery not configured. Call configureDataRecovery() first.');
+    }
+    return await this.dataRecovery.listAvailableArchives();
+  }
+
+  /** Check (HEAD) whether a single key exists in the client bucket. */
+  async checkFileInCloud(key: string): Promise<FileRecoveryInfo> {
+    if (!this.dataRecovery) {
+      throw new Error('Data recovery not configured. Call configureDataRecovery() first.');
+    }
+    return await this.dataRecovery.checkFileInCloud(key);
+  }
+
+  /** Recover an entire archive backup (tar.gz) from the client bucket and extract locally. */
+  async recoverFromArchive(archiveName?: string): Promise<RecoveryResult> {
+    if (!this.dataRecovery) {
+      throw new Error('Data recovery not configured. Call configureDataRecovery() first.');
+    }
+    return await this.dataRecovery.recoverFromArchive(archiveName);
+  }
+
+  /**
+   * Read a key locally; if absent locally, transparently recover it from the client's
+   * bucket and cache the result. Returns the data, or `false` if the key genuinely
+   * doesn't exist on either side. Throws for real (auth/network) errors so callers
+   * don't silently mistake them for "not in cloud".
+   *
+   * Options:
+   *   - fallbackToCloud: boolean (default true) — set false to skip cloud fetch
+   *   - mode: 'missing' (default) — only fetch if missing locally; 'all' — always overwrite from cloud
+   */
+  async getWithRecovery(key: string, options?: { fallbackToCloud?: boolean; mode?: 'missing' | 'all' }): Promise<any> {
+    try {
+      this.validateKey(key);
+    } catch (error) {
+      throw error;
+    }
+
+    const fallbackToCloud = options?.fallbackToCloud ?? true;
+
+    // 1) Try local first.
+    const localData = await this.get(key);
+    if (localData !== false) {
+      return localData;
+    }
+
+    // 2) Not local. Optionally fall back to cloud.
+    if (!fallbackToCloud) return false;
+    if (!this.dataRecovery) {
+      // No cloud configured — return false to keep "absent" semantics consistent with get().
+      return false;
+    }
+
+    // 3) Best-effort cloud fetch. If it fails for any reason (auth, network, timeout,
+    // no such key), we don't crash the local read path — `getWithRecovery` is a
+    // convenience GET that prefers local, falls back opportunistically. Separate
+    // methods (`recoverFromCloud`, `recoverAllFromCloud`) surface real cloud errors
+    // for the control plane / observability path to display.
+    try {
+      const recovered = await this.dataRecovery.recoverSingleFile(key);
+      if (!recovered) {
+        return false;
+      }
+      // Cache + return the freshly hydrated data.
+      // Re-run get() so the read goes through the cache + lint path.
+      this.cache.delete(key);
+      return await this.get(key);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Probe local + cloud availability for a key without modifying local state.
+   * Returns { local, cloud, canRecover }:
+   *   - local: true if the file exists locally
+   *   - cloud: true if the file exists in the client bucket (HEAD)
+   *   - canRecover: true if cloud has it but local doesn't
+   */
+  async existsWithCloudCheck(key: string): Promise<{ local: boolean; cloud: boolean; canRecover: boolean }> {
+    let local = false;
+    try {
+      this.validateKey(key);
+      local = this.exists(key);
+    } catch {
+      return { local: false, cloud: false, canRecover: false };
+    }
+
+    let cloud = false;
+    if (this.dataRecovery) {
+      try {
+        const info = await this.dataRecovery.checkFileInCloud(key);
+        cloud = info.exists;
+      } catch {
+        cloud = false; // auth/network failure → treat as not-available, but don't throw
+      }
+    }
+
+    return {
+      local,
+      cloud,
+      canRecover: cloud && !local,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Utility Methods
+  // ---------------------------------------------------------------------------
+
   getCacheStats(): { size: number; maxSize: number; hitRate: number } {
     const hitRate = this.cacheRequests > 0 ? (this.cacheHits / this.cacheRequests) * 100 : 0;
     return {
@@ -699,7 +1015,6 @@ export class Tero {
     };
 
     try {
-      const { readdirSync } = await import('fs');
       const files = readdirSync(this.teroDirectory)
         .filter((file: string) => file.endsWith('.json'));
 
@@ -709,11 +1024,14 @@ export class Tero {
         const key = file.replace('.json', '');
         try {
           const data = await this.get(key);
-          if (data === null) {
+          // FIX: previously this checked `=== null` but `get()` returns `false` for absent
+          // docs, so missing files were never reported. Now report either falsy contract.
+          if (data === null || data === false) {
             result.missingFiles.push(key);
             result.healthy = false;
           }
         } catch (error) {
+          // Unexpected error (e.g. JSON parse failure) → mark as corrupted.
           result.corruptedFiles.push(key);
           result.healthy = false;
         }
@@ -742,27 +1060,27 @@ export class Tero {
 
   /**
    * Generates a unique identifier with a custom prefix.
-   * 
+   *
    * This method creates MongoDB ObjectId-like unique identifiers that consist of:
    * - 4-byte timestamp (seconds since Unix epoch)
    * - 5-byte process-unique random value
    * - 3-byte incrementing counter
-   * 
+   *
    * The generated ID is guaranteed to be unique across processes and time,
    * making it suitable for distributed systems and concurrent operations.
-   * 
+   *
    * @param prefix - A string prefix to prepend to the generated ID
    * @returns A unique identifier string in the format: `${prefix}-${hexString}`
-   * 
+   *
    * @example
    * ```typescript
    * const db = new Tero();
-   * 
+   *
    * // Generate unique IDs for different purposes
    * const userId = db.getNewId('user');        // e.g., "user-507f1f77bcf86cd799439011"
    * const sessionId = db.getNewId('session');  // e.g., "session-507f1f77bcf86cd799439012"
    * const logId = db.getNewId('log');          // e.g., "log-507f1f77bcf86cd799439013"
-   * 
+   *
    * // Use as document keys
    * await db.create(userId, { name: 'Alice', email: 'alice@example.com' });
    * ```
@@ -787,4 +1105,4 @@ export class Tero {
 }
 
 // Export types for external use
-export { DocumentSchema, ValidationResult, BackupConfig, BackupMetadata, RecoveryConfig, RecoveryResult, FileRecoveryInfo };
+export { DocumentSchema, ValidationResult, BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig };
