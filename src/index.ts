@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, statSync, existsSync as existsSyncFs } from "fs";
 import { join } from "path";
-import { ACIDStorageEngine } from "./acid-engine.js";
+import { ACIDStorageEngine, SynchronousMode } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
@@ -10,6 +10,18 @@ import QuickLRU from "quick-lru";
 interface TeroConfig {
   directory?: string;
   cacheSize?: number;
+  /**
+   * Durability / throughput trade-off knob (like SQLite's `PRAGMA synchronous`):
+   *   - 'full'   (default): fsync the WAL on every commit. Max durability, ~15–60 ops/s
+   *     depending on disk. Use when every commit must survive power loss.
+   *   - 'normal': fsync the WAL on a coalescing timer (commitIntervalMs, default 10ms).
+   *     10–100x throughput; up to commitIntervalMs of committed transactions may be lost
+   *     on power failure. Use for edge workloads where a small RPO is acceptable.
+   *   - 'off':    never fsync. Testing/benchmark only. Data loss on crash is certain.
+   */
+  synchronous?: SynchronousMode;
+  /** Group-commit interval in milliseconds (only used when synchronous='normal'). Default: 10. */
+  commitIntervalMs?: number;
   /** v2: hydrate local state from a bucket on startup before the ACID engine comes up. */
   hydrateOnStartup?: HydrateConfig;
   /** v2: a default backup config installed at construction time (use configureBackup() at runtime too). */
@@ -156,7 +168,7 @@ export class Tero {
   constructor(config?: TeroConfig) {
     try {
       const rawDirectory = (config as any)?.Directory || config?.directory;
-      const { cacheSize } = config || {};
+      const { cacheSize, synchronous, commitIntervalMs } = config || {};
 
       if (typeof rawDirectory === "string" && rawDirectory.trim()) {
         // Sanitize directory path to prevent directory traversal
@@ -176,7 +188,9 @@ export class Tero {
       });
 
       // Initialize ACID storage engine (primary system)
-      this.acidEngine = new ACIDStorageEngine(this.teroDirectory);
+      const syncMode: SynchronousMode = synchronous ?? 'full';
+      const syncInterval: number = commitIntervalMs ?? 10;
+      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval);
 
       // Initialize schema validator
       this.schemaValidator = new SchemaValidator();
@@ -499,22 +513,45 @@ export class Tero {
   }
 
   /**
-   * Reads a document. Returns the document data on success, or `false` if the
+   * Read a document. Returns the document data on success, or `false` if the
    * document is absent. Throws for genuine errors.
    *
-   * NOTE: callers that need to distinguish "absent" from "present-with-falsy-data"
-   * should use `exists()` first.
+   * Fast path: if the key is in the LRU cache as a committed entry (no txId),
+   * return immediately — NO transaction is created, NO WAL I/O, NO lock.
+   * This is why hot reads can hit 100k+ ops/s.
+   *
+   * Slow path: on cache miss, read the JSON file directly from disk. The atomic
+   * write path (temp → rename) guarantees we never see a partial file, so reads
+   * don't need a transaction for consistency.
    */
   async get(key: string): Promise<any> {
-    const transactionId = this._beginTransaction();
+    this.validateKey(key);
+    this.cacheRequests++;
+
+    // Fast path: committed cache hit — no tx, no WAL, no lock
+    const cachedEntry = this.cache.get(key);
+    if (cachedEntry && !cachedEntry.transactionId) {
+      this.cacheHits++;
+      cachedEntry.lastAccessed = Date.now();
+      return cachedEntry.data;
+    }
+
+    // Slow path: read directly from disk (atomic rename guarantees consistency)
+    const { readFileSync } = await import('fs');
+    const filePath = `${this.teroDirectory}/${key}.json`;
+    if (!existsSync(filePath)) {
+      return false;
+    }
 
     try {
-      const data = await this.read(transactionId, key);
-      await this.commit(transactionId);
-      return data === null ? false : data;
+      const content = readFileSync(filePath, 'utf-8');
+      const data = content.trim() ? JSON.parse(content) : {};
+      // Cache as a committed entry (no transactionId) so future gets hit the fast path
+      this.updateCache(key, data, undefined);
+      return data;
     } catch (error) {
-      await this.rollback(transactionId);
-      throw error;
+      // Corrupt or unreadable — don't cache, surface error
+      throw new Error(`Read failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 

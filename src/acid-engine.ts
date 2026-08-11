@@ -997,6 +997,7 @@ export class ACIDStorageEngine {
             operation: 'CHECKPOINT',
             transactionId: 'SYSTEM'
         });
+        this.wal.forceFlush(); // explicit barrier — always fsync regardless of mode
     }
 
     /**
@@ -1022,6 +1023,7 @@ export class ACIDStorageEngine {
         // Clean up memory
         this.activeTransactions.clear();
         this.pendingWrites.clear();
-        this.wal.forceFlush();
+        // WAL destroy stops the group-commit timer and forces a final fsync
+        this.wal.destroy();
     }
 }

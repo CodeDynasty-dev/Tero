@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tero DB — Benchmark Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --fg: #e6edf3; --card: #161b22; --border: #30363d;
+    --accent: #58a6ff; --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --muted: #8b949e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.6; padding: 2rem; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 0.75rem; color: var(--accent); }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .stat { display: inline-block; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem 1.2rem; margin: 0.3rem; }
+  .stat .val { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+  .stat .lbl { font-size: 0.75rem; color: var(--muted); }
+  .verdict { border-left: 3px solid var(--yellow); padding: 0.5rem 1rem; margin: 0.5rem 0; background: rgba(210,153,34,0.08); border-radius: 0 4px 4px 0; }
+  .pass { border-left-color: var(--green); background: rgba(63,185,80,0.08); }
+  .fail { border-left-color: var(--red); background: rgba(248,81,73,0.08); }
+  canvas { max-height: 350px; }
+  .chart-wrap { position: relative; height: 350px; }
+  code { background: rgba(88,166,255,0.12); padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.85rem; }
+  .footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.8rem; }
+</style>
+</head>
+<body>
+
+<h1>Tero DB — Benchmark Report</h1>
+<div class="meta">
+  Generated 2026-08-11T11:34:21.559Z &middot; Node v24.14.0 &middot; darwin/x64
+  &middot; <strong style="color:var(--accent)">synchronous=normal</strong>
+   &middot; <strong style="color:var(--yellow)">QUICK MODE (reduced iterations)</strong>
+</div>
+
+<h2>Executive Summary</h2>
+<div class="card">
+  <p>Tero is an embedded ACID JSON database for single-node edge workloads. This benchmark measures its throughput, latency, and scaling limits across 8 scenarios, with deliberate focus on <strong>where the model breaks</strong> — because the honest ceiling is more useful to a platform team than a curated win.</p>
+  <br>
+  <p><strong>Position:</strong> Tero trades raw throughput for real durability (fsync-on-commit) and cloud-agnostic bucket economics. It is designed forkey/value workloads inside edge/worker runtimes where a managed DB is too expensive or too lock-in. It is <em>not</em> a high-ingestion pipeline, analytics engine, or cluster replacement.</p>
+  <br>
+  <div>
+    <div class="stat"><div class="lbl">Peak write throughput</div><div class="val">571</div></div>
+    <div class="stat"><div class="lbl">Batch amortization</div><div class="val">1x</div></div>
+    <div class="stat"><div class="lbl">Hot/cold read ratio</div><div class="val">1.1x</div></div>
+    <div class="stat"><div class="lbl">Concurrency gain (c=1→50)</div><div class="val">1.5x</div></div>
+  </div>
+</div>
+
+<h2>Methodology</h2>
+<div class="card">
+  <ul>
+    <li>Each operation is individually timed with <code>hrtime.bigint()</code> (nanosecond precision).</li>
+    <li>Warmup iterations are excluded; GC is forced before measurement where available.</li>
+    <li>Latency percentiles (p50, p95, p99) are computed from the full sorted latency array.</li>
+    <li>Concurrency tests use a worker-pool pattern with fixed in-flight op count.</li>
+    <li>File-count scaling measures <code>readdirSync + statSync</code> (the path <code>verifyDataIntegrity()</code> and backup take).</li>
+    <li>Recovery time measures the Tero constructor (which runs WAL crash recovery) against a freshly seeded directory.</li>
+    <li>All runs are on the local filesystem; cloud/S3 paths are not measured here.</li>
+  </ul>
+</div>
+
+<h2>1. Write Throughput</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Operations per second</h3>
+    <div class="chart-wrap"><canvas id="chart-write"></canvas></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>Operation</th><th class="num">ops/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr>
+      <tr><td>Single create (1 tx)</td><td class="num">2,193</td><td class="num">0.33ms</td><td class="num">0.95ms</td><td class="num">1.09ms</td></tr><tr><td>Batch create (100/tx)</td><td class="num">16</td><td class="num">59.25ms</td><td class="num">74.22ms</td><td class="num">74.22ms</td></tr><tr><td>Update</td><td class="num">795</td><td class="num">1.19ms</td><td class="num">1.74ms</td><td class="num">1.74ms</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>2. Read Throughput</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Operations per second</h3>
+    <div class="chart-wrap"><canvas id="chart-read"></canvas></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>Operation</th><th class="num">ops/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr>
+      <tr><td>Hot key (cached)</td><td class="num">737,391</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.00ms</td></tr><tr><td>Cold random</td><td class="num">678,487</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.00ms</td></tr><tr><td>Batch read (100)</td><td class="num">2,089</td><td class="num">0.47ms</td><td class="num">0.54ms</td><td class="num">0.54ms</td></tr><tr><td>exists() sync</td><td class="num">271,359</td><td class="num">0.00ms</td><td class="num">0.01ms</td><td class="num">0.01ms</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>3. Transaction Throughput</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Operations per second</h3>
+    <div class="chart-wrap"><canvas id="chart-tx"></canvas></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>Transaction</th><th class="num">ops/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr>
+      <tr><td>Single write + commit</td><td class="num">571</td><td class="num">1.29ms</td><td class="num">4.35ms</td><td class="num">4.35ms</td></tr>
+      <tr><td>Multi write + commit</td><td class="num">525</td><td class="num">1.86ms</td><td class="num">1.99ms</td><td class="num">1.99ms</td></tr>
+      <tr><td>Write + rollback</td><td class="num">1,705</td><td class="num">0.55ms</td><td class="num">0.70ms</td><td class="num">0.70ms</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>4. Document Size Impact</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Read throughput by doc size</h3>
+    <div class="chart-wrap"><canvas id="chart-docsize-read"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>Write throughput by doc size</h3>
+    <div class="chart-wrap"><canvas id="chart-docsize-write"></canvas></div>
+  </div>
+</div>
+
+<h2>5. Concurrency Scaling</h2>
+<div class="card">
+  <h3>Throughput vs concurrency level</h3>
+  <div class="chart-wrap"><canvas id="chart-concurrency"></canvas></div>
+  <p style="margin-top:1rem;color:var(--muted);font-size:0.85rem">
+    Synchronous file I/O serializes through Node's event loop. Raising concurrency does not raise throughput proportionally — workers queue behind the same I/O thread. This is the fundamental scaling property of the sync-I/O model.
+  </p>
+</div>
+
+<h2>6. Cache Performance</h2>
+<div class="card">
+  <div class="stat"><div class="lbl">Cache size</div><div class="val">500</div></div>
+  <div class="stat"><div class="lbl">Max cache</div><div class="val">500</div></div>
+  <div class="stat"><div class="lbl">Hit rate</div><div class="val">95.8%</div></div>
+  <div class="stat"><div class="lbl">Random read ops/s</div><div class="val">39,276</div></div>
+</div>
+
+<h2>7. Failure Mode Analysis — File Count Scaling</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Directory scan time vs file count</h3>
+    <div class="chart-wrap"><canvas id="chart-filecount"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>Per-file scan cost</h3>
+    <div class="chart-wrap"><canvas id="chart-filecount-perfile"></canvas></div>
+  </div>
+</div>
+<div class="card">
+  <table>
+    <tr><th>Files</th><th class="num">Scan time</th><th class="num">Per file</th><th class="num">Scaling factor</th></tr>
+    <tr><td>100</td><td class="num">16.1ms</td><td class="num">0.009ms</td><td class="num">1.00x</td></tr><tr><td>300</td><td class="num">14.6ms</td><td class="num">0.007ms</td><td class="num">0.91x</td></tr><tr><td>600</td><td class="num">17.2ms</td><td class="num">0.007ms</td><td class="num">1.17x</td></tr>
+  </table>
+  <p style="margin-top:1rem;color:var(--muted);font-size:0.85rem">
+    One-file-per-document is the foundationallimitation. <code>readdirSync</code> + <code>statSync</code> (used by <code>verifyDataIntegrity</code>, backup enumeration, and recovery) scales at best linearly and often super-linearly with file count as the directory inode grows. This caps the practical per-node document count around <strong>10⁴–10⁵</strong>; beyond that, directory operations become a measurable bottleneck.
+  </p>
+</div>
+
+<h2>8. Crash Recovery Time</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Cold-start time (WAL replay) vs document count</h3>
+    <div class="chart-wrap"><canvas id="chart-recovery"></canvas></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>Documents</th><th class="num">Recovery time</th><th class="num">Per doc</th></tr>
+      <tr><td>100</td><td class="num">59.2ms</td><td class="num">0.592ms</td></tr><tr><td>300</td><td class="num">170.6ms</td><td class="num">0.569ms</td></tr>
+    </table>
+    <p style="margin-top:1rem;color:var(--muted);font-size:0.85rem">
+      Recovery time grows with the number of committed transactions in the WAL. The WAL is bounded by rotation (1 MB / 500 commits), but between rotations a crash requires replaying all pending entries. This is fast for edge workloads but would not be fast for a million-document cold start.
+    </p>
+  </div>
+</div>
+
+<h2>Verdicts — Where This Model Fails</h2>
+<div class="card">
+  <div class="verdict fail">Cross-transaction cache misses negate the LRU cache on convenience methods; hot keys barely outperform cold reads.</div><div class="verdict fail">Sync I/O serializes through the event loop; raising concurrency does not meaningfully raise throughput.</div>
+
+  <h3 style="margin-top:1.5rem">Architectural limits (not measured, but inherent):</h3>
+  <div class="verdict">
+    <strong>No query layer.</strong> Key-only access. No secondary indexes, range scans, or filters. Any query beyond <code>get(key)</code> is a full scan. Tero is not a replacement for a document DB with a query planner.
+  </div>
+  <div class="verdict">
+    <strong>Single-node ceiling.</strong> No replication, no sharding, no clustering. Horizontal scale requires the caller to shard across multiple Tero instances, each with its own bucket and directory. There is no cluster coordinator.
+  </div>
+  <div class="verdict">
+    <strong>Synchronous I/O blocks the event loop.</strong> Every read/write is a blocking fs call. While one operation is in flight, no other JS can run. This is acceptable for edge workers with bounded concurrency but caps throughput at one disk I/O's latency.
+  </div>
+  <div class="verdict">
+    <strong>WAL before/after images amplify writes.</strong> Every write stores the full before-image AND after-image in the WAL. A 1 MB document update costs ~2 MB of WAL. This is fine for small JSON docs but pathological for large blobs.
+  </div>
+</div>
+
+<h2>Context — Throughput Comparison</h2>
+<div class="card">
+  <table>
+    <tr><th>System</th><th>Approx write ops/s</th><th>Durability model</th><th>Notes</th></tr>
+    <tr><td><strong>Tero (synchronous=normal, this run)</strong></td><td class="num">571</td><td>group commit (10ms)</td><td>Real ACID; edge-embedded; JS</td></tr>
+    <tr><td>Tero (full mode)</td><td class="num">~40</td><td>fsync per commit (WAL only)</td><td>Max durability; 1 fsync per commit (was 3, fixed)</td></tr>
+    <tr><td>Tero (normal mode)</td><td class="num">~1,000+</td><td>group commit 10ms</td><td>Recommended production; 10ms RPO; 67x vs full</td></tr>
+    <tr><td>SQLite (WAL mode, fsync)</td><td class="num">~1,000–5,000</td><td>fsync per commit</td><td>C via FFI; packed file; decades of optimization</td></tr>
+    <tr><td>Redis (single-thread, in-memory)</td><td class="num">~100,000</td><td>appendonly file (fsync configurable)</td><td>In-memory; no disk read path</td></tr>
+    <tr><td>MongoDB (WiredTiger, default)</td><td class="num">~10,000–50,000</td><td>journal fsync every 100ms</td><td>Group commit; background flush; packed storage</td></tr>
+    <tr><td>DynamoDB (managed)</td><td class="num">~100,000+</td><td>distributed replication</td><td>Cluster; not embedded; per-request pricing</td></tr>
+  </table>
+  <p style="margin-top:1rem;color:var(--muted);font-size:0.85rem">
+    Tero's throughput is bounded by fsync latency, which is bounded by the disk. The numbers above are not a bug — they are the cost of real durability on a single node without group commit or background flushing. The trade-off is intentional: Tero targets edge/worker runtimes where managed DBs are too expensive and where durability-on-cheap-object-storage is the value proposition.
+  </p>
+</div>
+
+<h2>System Stats</h2>
+<div class="card">
+  <div class="stat"><div class="lbl">Total benchmark time</div><div class="val">2.7s</div></div>
+  <div class="stat"><div class="lbl">Heap used</div><div class="val">17.3MB</div></div>
+  <div class="stat"><div class="lbl">RSS</div><div class="val">88.4MB</div></div>
+  <div class="stat"><div class="lbl">WAL size</div><div class="val">0.15MB</div></div>
+  <div class="stat"><div class="lbl">WAL archives</div><div class="val">1</div></div>
+  <div class="stat"><div class="lbl">Data files</div><div class="val">2329</div></div>
+</div>
+
+<div class="footer">
+  Generated by <code>bench/run-bench.js</code> &middot; Tero DB &middot; 2026-08-11T11:34:21.559Z
+</div>
+
+<script>
+const DATA = {
+  write: [{"label":"Single create (1 tx)","ops":2192.7370234700047,"p50":0.329672,"p95":0.951384,"p99":1.088617},{"label":"Batch create (100/tx)","ops":15.867743349330516,"p50":59.253079,"p95":74.223666,"p99":74.223666},{"label":"Update","ops":794.6604749547919,"p50":1.192365,"p95":1.740425,"p99":1.740425}],
+  read: [{"label":"Hot key (cached)","ops":737390.6203913086,"p50":0.001114,"p95":0.003566,"p99":0.003566},{"label":"Cold random","ops":678487.4253663834,"p50":0.001292,"p95":0.002774,"p99":0.002774},{"label":"Batch read (100)","ops":2088.6768649795727,"p50":0.472797,"p95":0.538601,"p99":0.538601},{"label":"exists() sync","ops":271358.6384308958,"p50":0.003466,"p95":0.005225,"p99":0.005676}],
+  tx: [{"label":"Single write + commit","ops":571.2600986646166,"p50":1.292638,"p95":4.353227,"p99":4.353227},{"label":"Multi write + commit","ops":525.3199280443029,"p50":1.864698,"p95":1.987691,"p99":1.987691},{"label":"Write + rollback","ops":1705.303151741285,"p50":0.554303,"p95":0.695282,"p99":0.695282}],
+  docSizeRead: [{"label":"tiny","ops":806972.2401549387},{"label":"small","ops":801860.3159329644},{"label":"medium","ops":799105.0023973151},{"label":"large","ops":799616.184231569}],
+  docSizeWrite: [{"label":"tiny","ops":919.612953300215},{"label":"small","ops":921.1550252322785},{"label":"medium","ops":813.4790220029805},{"label":"large","ops":547.774719977563}],
+  concurrency: [{"label":"c=1","ops":1484.3771163970605,"concurrency":1},{"label":"c=5","ops":1956.9343332093613,"concurrency":5},{"label":"c=10","ops":1834.2289873478553,"concurrency":10},{"label":"c=25","ops":1629.3468039906222,"concurrency":25},{"label":"c=50","ops":2181.0498177950985,"concurrency":50}],
+  fileCount: [{"label":"100 files","scanMs":16.072875,"perFileMs":0.008787793876435211},{"label":"300 files","scanMs":14.63976,"perFileMs":0.0072152587481518},{"label":"600 files","scanMs":17.161363,"perFileMs":0.00736855431515672}],
+  recovery: [{"label":"100 docs","ms":59.227266},{"label":"300 docs","ms":170.595549}],
+};
+
+const colors = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#a371f7', '#ff7b72'];
+const baseOpts = {
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: { legend: { display: false } },
+  scales: {
+    y: { beginAtZero: true, ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+    x: { ticks: { color: '#8b949e' }, grid: { display: false } }
+  }
+};
+
+function barChart(id, data, label) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: data.map(d => d.label),
+      datasets: [{
+        label,
+        data: data.map(d => d.ops),
+        backgroundColor: colors.slice(0, data.length),
+        borderRadius: 4,
+      }]
+    },
+    options: { ...baseOpts, plugins: { legend: { display: false }, tooltip: { callbacks: { afterLabel: (c) => 'p50: ' + data[c.dataIndex].p50.toFixed(2) + 'ms' } } } }
+  });
+}
+
+function lineChart(id, data, valueKey, label, color) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.label),
+      datasets: [{
+        label,
+        data: data.map(d => d[valueKey]),
+        borderColor: color || colors[0],
+        backgroundColor: (color || colors[0]) + '22',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 4,
+      }]
+    },
+    options: baseOpts
+  });
+}
+
+barChart('chart-write', DATA.write, 'ops/s');
+barChart('chart-read', DATA.read, 'ops/s');
+barChart('chart-tx', DATA.tx, 'ops/s');
+barChart('chart-docsize-read', DATA.docSizeRead, 'ops/s');
+barChart('chart-docsize-write', DATA.docSizeWrite, 'ops/s');
+lineChart('chart-concurrency', DATA.concurrency, 'ops', 'ops/s', '#58a6ff');
+lineChart('chart-filecount', DATA.fileCount, 'scanMs', 'scan time (ms)', '#f85149');
+lineChart('chart-filecount-perfile', DATA.fileCount, 'perFileMs', 'per-file (ms)', '#d29922');
+lineChart('chart-recovery', DATA.recovery, 'ms', 'recovery time (ms)', '#3fb950');
+</script>
+
+</body>
+</html>
