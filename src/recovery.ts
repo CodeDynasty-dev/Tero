@@ -9,6 +9,8 @@ export interface RecoveryConfig {
     localPath: string;
     autoRecover?: boolean; // Automatically recover missing files
     recoveryTimeout?: number; // Timeout for recovery operations (default: 30000ms)
+    mode?: 'all' | 'missing' | 'none'; // 'all' = overwrite local, 'missing' = only pull files not present locally
+    continueOnError?: boolean; // Keep going when a real (non-404) error occurs for one file
 }
 
 export interface RecoveryResult {
@@ -64,6 +66,15 @@ export class DataRecovery {
         return `${prefix}/${dbName}/${filename}`;
     }
 
+    private isNotFound(error: any): boolean {
+        return (
+            error?.name === 'NotFound' ||
+            error?.name === 'NoSuchKey' ||
+            error?.$metadata?.httpStatusCode === 404 ||
+            (error?.Code && (error.Code === 'NotFound' || error.Code === 'NoSuchKey'))
+        );
+    }
+
     async checkFileInCloud(key: string): Promise<FileRecoveryInfo> {
         try {
             const cloudKey = this.getCloudKey(`${key}.json`);
@@ -82,13 +93,12 @@ export class DataRecovery {
                 lastModified: response.LastModified
             };
         } catch (error: any) {
-            if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
-                return {
-                    key,
-                    exists: false
-                };
+            if (this.isNotFound(error)) {
+                return { key, exists: false };
             }
-            throw new Error(`Failed to check file in cloud: ${error.message}`);
+            // Re-surface real errors (auth/network/permission) so callers can distinguish
+            // "not in cloud" from "couldn't reach cloud".
+            throw new Error(`Failed to check file in cloud: ${error?.message || 'Unknown error'}`);
         }
     }
 
@@ -120,10 +130,11 @@ export class DataRecovery {
 
             return true;
         } catch (error: any) {
-            if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
+            if (this.isNotFound(error)) {
                 return false;
             }
-            return false;
+            // Re-surface real errors so callers don't mistake them for "not in cloud".
+            throw new Error(`Failed to recover file from cloud: ${error?.message || 'Unknown error'}`);
         }
     }
 
@@ -197,12 +208,18 @@ export class DataRecovery {
                 }
             }
 
-            // Recover each file
+            // Recover each file. We catch real (non-404) errors here so a single
+            // auth/network hiccup doesn't abort the whole batch — they go into `failed`
+            // and the caller can decide whether to retry.
             for (const key of keys) {
-                const success = await this.recoverSingleFile(key);
-                if (success) {
-                    recovered.push(key);
-                } else {
+                try {
+                    const success = await this.recoverSingleFile(key);
+                    if (success) {
+                        recovered.push(key);
+                    } else {
+                        failed.push(key);
+                    }
+                } catch (error) {
                     failed.push(key);
                 }
             }
@@ -316,8 +333,11 @@ export class DataRecovery {
             await pipeline(response.Body as any, writeStream);
 
             return true;
-        } catch (error) {
-            return false;
+        } catch (error: any) {
+            if (this.isNotFound(error)) {
+                return false;
+            }
+            throw new Error(`Failed to download file from cloud: ${error?.message || 'Unknown error'}`);
         }
     }
 

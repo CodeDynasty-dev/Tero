@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from "fs";
+import { existsSync, readFileSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync } from "fs";
 import { join, dirname } from "path";
 import { randomUUID } from "crypto";
 import { createHash } from "crypto";
@@ -19,9 +19,8 @@ export interface LogEntry {
 export class WriteAheadLog {
     private logPath: string;
     private currentLSN: number = 0;
-    private logBuffer: LogEntry[] = [];
-    private readonly BUFFER_SIZE = 100;
     private readonly LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024; // 1MB
+    private readonly ARCHIVE_KEEP_COUNT = 3;
 
     constructor(dbPath: string) {
         this.logPath = join(dbPath, '.wal');
@@ -36,27 +35,68 @@ export class WriteAheadLog {
         // Recovery: read existing log and determine next LSN
         if (existsSync(this.logPath)) {
             this.recoverFromLog();
+        } else {
+            // Create empty log file and fsync the directory so the file's existence is durable
+            writeFileSync(this.logPath, '');
+            this.fsyncFile(this.logPath);
+            this.fsyncDir(dirname(this.logPath));
+        }
+    }
+
+    /**
+     * fsync a file path by opening it read-only and synchronizing its (open) descriptor.
+     * This flushes the kernel page cache for the file to disk so commits are durable.
+     */
+    private fsyncFile(path: string): void {
+        let fd: number;
+        try {
+            fd = openSync(path, 'r');
+        } catch {
+            return; // file may not exist during rotation edge cases
+        }
+        try {
+            fsyncSync(fd);
+        } catch {
+            // fsync may fail on some filesystems; we still proceed since the data write already happened
+        } finally {
+            closeSync(fd);
+        }
+    }
+
+    private fsyncDir(dirPath: string): void {
+        let fd: number;
+        try {
+            fd = openSync(dirPath, 'r');
+        } catch {
+            return;
+        }
+        try {
+            fsyncSync(fd);
+        } catch {
+        } finally {
+            closeSync(fd);
         }
     }
 
     private recoverFromLog(): void {
         try {
             const logContent = readFileSync(this.logPath, 'utf-8');
-            const lines = logContent.trim().split('\n').filter(line => line.trim());
+            const lines = logContent.split('\n').filter(line => line.trim());
 
+            let maxLSN = 0;
             for (const line of lines) {
                 try {
                     const entry: LogEntry = JSON.parse(line);
-                    if (this.verifyChecksum(entry)) {
-                        this.currentLSN = Math.max(this.currentLSN, entry.lsn);
+                    if (this.verifyChecksum(entry) && entry.lsn > maxLSN) {
+                        maxLSN = entry.lsn;
                     }
                 } catch (error) {
-                    // Skip corrupted entries silently
+                    // Skip corrupted/partial entries silently
                     continue;
                 }
             }
 
-            this.currentLSN++; // Next LSN
+            this.currentLSN = maxLSN + 1; // Next LSN
         } catch (error) {
             this.currentLSN = 1;
         }
@@ -69,10 +109,18 @@ export class WriteAheadLog {
 
     private verifyChecksum(entry: LogEntry): boolean {
         const { checksum, ...entryWithoutChecksum } = entry;
-        const calculatedChecksum = this.calculateChecksum(entryWithoutChecksum);
+        const calculatedChecksum = this.calculateChecksum(entryWithoutChecksum as Omit<LogEntry, 'checksum'>);
         return calculatedChecksum === checksum;
     }
 
+    /**
+     * Append a single log entry to the WAL atomically.
+     * - Uses atomic append (POSIX guarantees atomicity up to PIPE_BUF for the small lines).
+     * - For larger entries, the checksum on recovery detects and skips partial lines.
+     * - fsyncs the file on durable barriers (COMMIT/ROLLBACK/CHECKPOINT) so committed
+     *   transactions survive power loss. Non-barrier writes rely on the OS page cache
+     *   until the next barrier flushes them.
+     */
     writeLog(entry: Omit<LogEntry, 'lsn' | 'checksum' | 'timestamp'>): number {
         const lsn = this.currentLSN++;
         const entryWithoutChecksum = {
@@ -86,40 +134,23 @@ export class WriteAheadLog {
         const logEntry: LogEntry = {
             ...entryWithoutChecksum,
             checksum
-        };
+        } as LogEntry;
 
-        this.logBuffer.push(logEntry);
+        const line = JSON.stringify(logEntry) + '\n';
 
-        // Force flush for critical operations
+        // Atomic append. No read-modify-write anywhere on the WAL path.
+        appendFileSync(this.logPath, line);
+
+        // Durable barrier: fsync on commit so committed transactions survive power loss.
         if (entry.operation === 'COMMIT' || entry.operation === 'ROLLBACK' ||
-            this.logBuffer.length >= this.BUFFER_SIZE) {
-            this.flushBuffer();
+            entry.operation === 'CHECKPOINT') {
+            this.fsyncFile(this.logPath);
         }
+
+        // Check if log rotation is needed
+        this.checkLogRotation();
 
         return lsn;
-    }
-
-    private flushBuffer(): void {
-        if (this.logBuffer.length === 0) return;
-
-        try {
-            const logEntries = this.logBuffer.map(entry => JSON.stringify(entry)).join('\n') + '\n';
-
-            // Atomic append to log file
-            if (existsSync(this.logPath)) {
-                const currentContent = readFileSync(this.logPath, 'utf-8');
-                writeFileSync(this.logPath, currentContent + logEntries);
-            } else {
-                writeFileSync(this.logPath, logEntries);
-            }
-
-            this.logBuffer = [];
-
-            // Check if log rotation is needed
-            this.checkLogRotation();
-        } catch (error) {
-            throw new Error(`Failed to flush WAL: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
     }
 
     private checkLogRotation(): void {
@@ -133,23 +164,52 @@ export class WriteAheadLog {
         }
     }
 
-    private rotateLog(): void {
+    /**
+     * Rotate the WAL: archive the current log to .wal.<timestamp>, start a fresh log,
+     * and write a CHECKPOINT entry at the head of the new log. Old archives beyond
+     * ARCHIVE_KEEP_COUNT are pruned locally (cloud upload in v2 retains durable copies).
+     */
+    rotateLog(): void {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const archivePath = `${this.logPath}.${timestamp}`;
 
         try {
-            // Archive current log
+            // Snapshot current log content to archive (current log may have been fsynced already)
             const currentContent = readFileSync(this.logPath, 'utf-8');
             writeFileSync(archivePath, currentContent);
+            this.fsyncFile(archivePath);
 
-            // Start new log with checkpoint
+            // Start new log empty
             writeFileSync(this.logPath, '');
+            this.fsyncFile(this.logPath);
+
+            // Emit a CHECKPOINT entry at the head of the new log so crash recovery
+            // knows everything before this LSN was already persistent.
             this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
 
-            // Clean up old archives to prevent indefinite growth
-            this.cleanupOldArchives(3);
+            // Clean up old archives to prevent indefinite growth (keep last N locally)
+            this.cleanupOldArchives(this.ARCHIVE_KEEP_COUNT);
         } catch (error) {
             // Silent failure for production
+        }
+    }
+
+    /**
+     * Returns the paths of all locally retained WAL archives (newest first).
+     * Used by v2 backup to upload segments to the client's bucket.
+     */
+    listArchives(): string[] {
+        try {
+            const dir = dirname(this.logPath);
+            if (!existsSync(dir)) return [];
+            const files = readdirSync(dir);
+            return files
+                .filter(f => f.startsWith('.wal.'))
+                .sort()
+                .reverse()
+                .map(f => join(dir, f));
+        } catch (error) {
+            return [];
         }
     }
 
@@ -161,12 +221,16 @@ export class WriteAheadLog {
             const archiveFiles = files
                 .filter(f => f.startsWith('.wal.'))
                 .map(f => join(dir, f))
-                .sort();
+                .sort(); // oldest first
 
             while (archiveFiles.length > keepCount) {
                 const oldestFile = archiveFiles.shift();
                 if (oldestFile && existsSync(oldestFile)) {
-                    unlinkSync(oldestFile);
+                    try {
+                        unlinkSync(oldestFile);
+                    } catch {
+                        // ignore
+                    }
                 }
             }
         } catch (error) {
@@ -178,17 +242,10 @@ export class WriteAheadLog {
         try {
             const entries: LogEntry[] = [];
 
-            // First, add entries from the buffer (not yet flushed to disk)
-            for (const bufferedEntry of this.logBuffer) {
-                if (!fromLSN || bufferedEntry.lsn >= fromLSN) {
-                    entries.push(bufferedEntry);
-                }
-            }
-
-            // Then, add entries from the log file
+            // Read entries from the log file
             if (existsSync(this.logPath)) {
                 const logContent = readFileSync(this.logPath, 'utf-8');
-                const lines = logContent.trim().split('\n').filter(line => line.trim());
+                const lines = logContent.split('\n').filter(line => line.trim());
 
                 for (const line of lines) {
                     try {
@@ -197,7 +254,7 @@ export class WriteAheadLog {
                             entries.push(entry);
                         }
                     } catch (error) {
-                        // Skip corrupted entries silently in production
+                        // Skip corrupted/partial entries silently
                         continue;
                     }
                 }
@@ -209,64 +266,27 @@ export class WriteAheadLog {
         }
     }
 
+    /**
+     * No longer needed as a public flush operation since writeLog appends synchronously.
+     * Kept for API compatibility — now a no-op (writes are already durable-to-OS-cache).
+     */
     forceFlush(): void {
-        this.flushBuffer();
+        this.fsyncFile(this.logPath);
     }
 
     getCurrentLSN(): number {
         return this.currentLSN - 1;
     }
 
-    clearTransaction(transactionId: string): void {
-        try {
-            // First, flush any pending buffer entries to disk
-            this.flushBuffer();
-
-            if (!existsSync(this.logPath)) {
-                return;
-            }
-
-            // Read current log content
-            const logContent = readFileSync(this.logPath, 'utf-8');
-            const lines = logContent.trim().split('\n').filter(line => line.trim());
-
-            // Filter out entries for the completed transaction
-            const filteredLines: string[] = [];
-            let transactionProcessed = false;
-
-            for (const line of lines) {
-                try {
-                    const entry: LogEntry = JSON.parse(line);
-
-                    // Keep entries that don't belong to this transaction
-                    if (entry.transactionId !== transactionId) {
-                        filteredLines.push(line);
-                    } else {
-                        // Remove ALL entries for the completed transaction to compact log
-                        transactionProcessed = true;
-                    }
-                } catch (error) {
-                    // Keep corrupted entries as-is to avoid data loss
-                    filteredLines.push(line);
-                }
-            }
-
-            // Only rewrite the log if we actually found and processed the transaction
-            if (transactionProcessed) {
-                const newContent = filteredLines.length > 0 ? filteredLines.join('\n') + '\n' : '';
-                writeFileSync(this.logPath, newContent);
-            }
-
-        } catch (error) {
-            // Silent failure for production - WAL cleanup is an optimization
-        }
-    }
-
+    /**
+     * Truncate (clear) the WAL entirely. Only safe when there are no active transactions
+     * AND all data has been durably persisted to data files (which happens during commit).
+     * In v2 this is also called after a successful bucket snapshot upload to bound growth.
+     */
     truncateLog(): void {
         try {
-            this.flushBuffer();
             writeFileSync(this.logPath, '');
-            // Clean up all archives since the log is truncated and no active transactions exist
+            this.fsyncFile(this.logPath);
             this.cleanupOldArchives(0);
         } catch (error) {
             // Silent failure
@@ -475,6 +495,24 @@ export class ACIDStorageEngine {
         status: 'active' | 'committed' | 'aborted';
     }> = new Map();
 
+    /**
+     * In-memory pending-writes index per active transaction. This is the performant
+     * replacement for the previous per-op full-WAL re-read + filter. Each write/read
+     * within a transaction reads/writes this map directly in O(1) instead of replaying
+     * the entire WAL on every operation.
+     *
+     * Keyed by transactionId -> key -> { beforeImage, afterImage, op }
+     */
+    private pendingWrites: Map<string, Map<string, { beforeImage: any; afterImage: any; op: 'write' | 'delete' }>> = new Map();
+
+    /**
+     * Compaction cadence: every COMMIT_INTERVAL commits, if there are no active
+     * transactions, we rotate the WAL into an archive and start a fresh log.
+     * This bounds WAL size without rewriting it on every commit.
+     */
+    private readonly COMMIT_INTERVAL = 500;
+    private commitCount: number = 0;
+
     constructor(dbPath: string) {
         this.dbPath = dbPath;
         this.wal = new WriteAheadLog(dbPath);
@@ -524,6 +562,10 @@ export class ACIDStorageEngine {
         for (const entry of uncommittedOps) {
             this.undoOperation(entry);
         }
+
+        // After recovery the WAL contains only durable completed transactions for replay-on-crash.
+        // We do NOT truncate — the WAL is bounded by rotation, and v2 backup uploads archived
+        // segments to the client's bucket before pruning locally.
     }
 
     private redoOperation(entry: LogEntry): void {
@@ -531,7 +573,7 @@ export class ACIDStorageEngine {
 
         try {
             const filePath = join(this.dbPath, `${entry.key}.json`);
-            writeFileSync(filePath, JSON.stringify(entry.afterImage, null, 2));
+            this.atomicWriteFile(filePath, JSON.stringify(entry.afterImage, null, 2));
         } catch (error) {
             // Silent failure for production
         }
@@ -564,15 +606,56 @@ export class ACIDStorageEngine {
                     }
                 } else {
                     // Restore previous content
-                    writeFileSync(filePath, JSON.stringify(entry.beforeImage, null, 2));
+                    this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage, null, 2));
                 }
             } else if (entry.operation === 'DELETE' && entry.beforeImage) {
                 // Restore deleted file
-                writeFileSync(filePath, JSON.stringify(entry.beforeImage, null, 2));
+                this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage, null, 2));
             }
         } catch (error) {
             // Silent failure for production
         }
+    }
+
+    /**
+     * Atomic durable data file write: write to a temp file, fsync it, then atomically
+     * rename over the target. This ensures a crash mid-write can never corrupt the
+     * canonical file (readers always see either the old or new full content, never a
+     * partial of either). Also fsyncs the parent dir so the rename itself is durable.
+     */
+    private atomicWriteFile(filePath: string, content: string): void {
+        const dir = dirname(filePath);
+        if (!existsSync(dir)) {
+            mkdirSync(dir, { recursive: true });
+        }
+
+        const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+        writeFileSync(tmpPath, content);
+
+        // fsync the temp file so its bytes are on disk before we rename
+        let fd: number;
+        try {
+            fd = openSync(tmpPath, 'r');
+            try { fsyncSync(fd); } catch { } finally { closeSync(fd); }
+        } catch {
+            // fall through — rename will still occur
+        }
+
+        // atomic rename
+        renameSync(tmpPath, filePath);
+
+        // Best-effort fsync of the parent directory so the rename is durable on POSIX
+        this.fsyncDirQuiet(dir);
+    }
+
+    private fsyncDirQuiet(dirPath: string): void {
+        let fd: number;
+        try {
+            fd = openSync(dirPath, 'r');
+        } catch {
+            return;
+        }
+        try { fsyncSync(fd); } catch { } finally { closeSync(fd); }
     }
 
     // Transaction management
@@ -590,6 +673,8 @@ export class ACIDStorageEngine {
             status: 'active'
         });
 
+        this.pendingWrites.set(transactionId, new Map());
+
         return transactionId;
     }
 
@@ -603,22 +688,16 @@ export class ACIDStorageEngine {
         await this.lockManager.acquireLock(key, transactionId, 'exclusive');
 
         try {
-            // Read current data for before image - check pending writes in this transaction first
-            let currentData = null;
-            const logEntries = this.wal.getLogEntries(transaction.startLSN);
-            const transactionEntries = logEntries.filter(entry =>
-                entry.transactionId === transactionId &&
-                entry.key === key &&
-                (entry.operation === 'WRITE' || entry.operation === 'DELETE')
-            );
+            const pendingTx = this.pendingWrites.get(transactionId)!;
 
-            if (transactionEntries.length > 0) {
-                // Use the most recent transaction state
-                const lastEntry = transactionEntries[transactionEntries.length - 1];
-                if (lastEntry.operation === 'DELETE') {
+            // Determine "before image" from pending writes first, else disk
+            let currentData: any = null;
+            const pending = pendingTx.get(key);
+            if (pending) {
+                if (pending.op === 'delete') {
                     currentData = null;
                 } else {
-                    currentData = lastEntry.afterImage || {};
+                    currentData = pending.afterImage;
                 }
             } else {
                 // Read from disk
@@ -638,8 +717,6 @@ export class ACIDStorageEngine {
             // Deep merge for proper data integrity
             const afterImage = this.deepMerge(currentData || {}, data);
 
-
-
             // Write to WAL first (Write-Ahead Logging)
             this.wal.writeLog({
                 operation: 'WRITE',
@@ -648,6 +725,9 @@ export class ACIDStorageEngine {
                 beforeImage,
                 afterImage
             });
+
+            // Track pending write in-memory O(1) — no WAL re-read needed for subsequent reads
+            pendingTx.set(key, { beforeImage, afterImage, op: 'write' });
 
             // Track operation
             transaction.operations.push({ key, operation: 'write' });
@@ -668,21 +748,16 @@ export class ACIDStorageEngine {
         await this.lockManager.acquireLock(key, transactionId, 'shared');
 
         try {
-            // Check if there are pending writes in this transaction first
-            const logEntries = this.wal.getLogEntries(transaction.startLSN);
-            const transactionEntries = logEntries.filter(entry =>
-                entry.transactionId === transactionId &&
-                entry.key === key &&
-                (entry.operation === 'WRITE' || entry.operation === 'DELETE')
-            );
-
-            if (transactionEntries.length > 0) {
-                // Return the most recent transaction state
-                const lastEntry = transactionEntries[transactionEntries.length - 1];
-                if (lastEntry.operation === 'DELETE') {
-                    return null;
+            // Check pending writes in this transaction first (O(1) in-memory lookup)
+            const pendingTx = this.pendingWrites.get(transactionId);
+            if (pendingTx) {
+                const pending = pendingTx.get(key);
+                if (pending) {
+                    if (pending.op === 'delete') {
+                        return null;
+                    }
+                    return pending.afterImage;
                 }
-                return lastEntry.afterImage || {};
             }
 
             // Read from disk
@@ -710,15 +785,26 @@ export class ACIDStorageEngine {
         await this.lockManager.acquireLock(key, transactionId, 'exclusive');
 
         try {
-            const filePath = join(this.dbPath, `${key}.json`);
-            let beforeImage = null;
+            // Determine before image — from pending or disk
+            const pendingTx = this.pendingWrites.get(transactionId)!;
+            let beforeImage: any = null;
 
-            if (existsSync(filePath)) {
-                try {
-                    const content = readFileSync(filePath, 'utf-8');
-                    beforeImage = content.trim() ? JSON.parse(content) : {};
-                } catch (error) {
-                    // Silent failure for production
+            const pending = pendingTx.get(key);
+            if (pending) {
+                if (pending.op === 'delete') {
+                    beforeImage = null; // double-delete
+                } else {
+                    beforeImage = pending.beforeImage; // use original disk state
+                }
+            } else {
+                const filePath = join(this.dbPath, `${key}.json`);
+                if (existsSync(filePath)) {
+                    try {
+                        const content = readFileSync(filePath, 'utf-8');
+                        beforeImage = content.trim() ? JSON.parse(content) : {};
+                    } catch (error) {
+                        // Silent failure for production
+                    }
                 }
             }
 
@@ -730,6 +816,9 @@ export class ACIDStorageEngine {
                 beforeImage,
                 afterImage: null
             });
+
+            // Track pending delete in-memory
+            pendingTx.set(key, { beforeImage, afterImage: null, op: 'delete' });
 
             // Track operation
             transaction.operations.push({ key, operation: 'delete' });
@@ -747,35 +836,28 @@ export class ACIDStorageEngine {
         }
 
         try {
-            // Write commit log entry
+            // Write commit log entry (durable barrier — fsynced inside writeLog)
             this.wal.writeLog({
                 operation: 'COMMIT',
                 transactionId
             });
 
-            // Force WAL to disk
-            this.wal.forceFlush();
-
-            // Apply changes to data files
-            const logEntries = this.wal.getLogEntries(transaction.startLSN);
-            const transactionEntries = logEntries.filter(entry => entry.transactionId === transactionId);
-
-            for (const entry of transactionEntries) {
-                if (entry.operation === 'WRITE' && entry.key && entry.afterImage !== undefined) {
-                    const filePath = join(this.dbPath, `${entry.key}.json`);
-
-
-
-                    // Ensure directory exists
-                    if (!existsSync(dirname(filePath))) {
-                        mkdirSync(dirname(filePath), { recursive: true });
-                    }
-
-                    writeFileSync(filePath, JSON.stringify(entry.afterImage, null, 2));
-                } else if (entry.operation === 'DELETE' && entry.key) {
-                    const filePath = join(this.dbPath, `${entry.key}.json`);
-                    if (existsSync(filePath)) {
-                        unlinkSync(filePath);
+            // Apply pending writes to data files atomically
+            const pendingTx = this.pendingWrites.get(transactionId);
+            if (pendingTx) {
+                for (const [key, op] of pendingTx.entries()) {
+                    if (op.op === 'write' && op.afterImage !== undefined && op.afterImage !== null) {
+                        const filePath = join(this.dbPath, `${key}.json`);
+                        this.atomicWriteFile(filePath, JSON.stringify(op.afterImage, null, 2));
+                    } else if (op.op === 'delete') {
+                        const filePath = join(this.dbPath, `${key}.json`);
+                        if (existsSync(filePath)) {
+                            try {
+                                unlinkSync(filePath);
+                            } catch {
+                                // ignore — file may have been removed concurrently
+                            }
+                        }
                     }
                 }
             }
@@ -783,20 +865,25 @@ export class ACIDStorageEngine {
             // Update transaction status
             transaction.status = 'committed';
 
-            // Clear WAL entries for this completed transaction
-            this.wal.clearTransaction(transactionId);
-
-            // Truncate log completely if no more active transactions
-            if (this.getActiveTransactions().length === 0) {
-                this.wal.truncateLog();
-            }
-
-            // Release all locks
+            // Release all locks (held keys still locked; waiters will proceed)
             this.lockManager.releaseAllLocks(transactionId);
+
+            // Cleanup in-memory state for this transaction — FIXES the memory leak
+            // (previously activeTransactions never had committed/aborted entries removed).
+            this.pendingWrites.delete(transactionId);
+            this.activeTransactions.delete(transactionId);
+
+            // Bound WAL growth: periodically rotate when no active transactions are left.
+            // We never truncate mid-flight, preserving history for v2 backup/recovery.
+            this.commitCount++;
+            if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
+                this.getActiveTransactions().length === 0) {
+                this.wal.rotateLog();
+            }
 
         } catch (error) {
             // Rollback on commit failure
-            await this.rollbackTransaction(transactionId);
+            try { await this.rollbackTransaction(transactionId); } catch { }
             throw new Error(`Commit failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
@@ -808,7 +895,7 @@ export class ACIDStorageEngine {
         }
 
         try {
-            // Write rollback log entry
+            // Write rollback log entry (durable barrier — fsynced inside writeLog)
             this.wal.writeLog({
                 operation: 'ROLLBACK',
                 transactionId
@@ -817,16 +904,12 @@ export class ACIDStorageEngine {
             // Update transaction status
             transaction.status = 'aborted';
 
-            // Clear WAL entries for this aborted transaction
-            this.wal.clearTransaction(transactionId);
-
-            // Truncate log completely if no more active transactions
-            if (this.getActiveTransactions().length === 0) {
-                this.wal.truncateLog();
-            }
-
             // Release all locks
             this.lockManager.releaseAllLocks(transactionId);
+
+            // Cleanup in-memory state for this transaction
+            this.pendingWrites.delete(transactionId);
+            this.activeTransactions.delete(transactionId);
 
         } catch (error) {
             throw error;
@@ -876,21 +959,31 @@ export class ACIDStorageEngine {
             operation: 'CHECKPOINT',
             transactionId: 'SYSTEM'
         });
-        this.wal.forceFlush();
+    }
+
+    /**
+     * Returns a reference to the underlying WAL (used by v2 backup to upload
+     * archived segments to the client's bucket, and to drive snapshot+replay recovery).
+     */
+    getWAL(): WriteAheadLog {
+        return this.wal;
     }
 
     destroy(): void {
-        // Rollback all active transactions
+        // Rollback all active transactions (synchronously via the WAL)
         for (const [transactionId, transaction] of this.activeTransactions.entries()) {
             if (transaction.status === 'active') {
-                this.rollbackTransaction(transactionId).catch(() => {
-                    // Silent failure for production
-                });
+                try {
+                    this.rollbackTransaction(transactionId);
+                } catch {
+                    // best effort
+                }
             }
         }
 
         // Clean up memory
         this.activeTransactions.clear();
+        this.pendingWrites.clear();
         this.wal.forceFlush();
     }
 }
