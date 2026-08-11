@@ -1,9 +1,9 @@
 # Tero
 
-An embedded ACID JSON database for the edge. Single-node durability via fsync-on-commit; cloud durability via the client's own bucket.
+An embedded ACID JSON database for the edge. Single-node durability via fsync-on-commit; cloud durability via S3/R2/GCS storage.
 
 ```
-[edge Tero node] --WAL+snapshot--> [client-owned S3/R2/GCS bucket]
+[edge Tero node] --WAL+snapshot--> [S3/R2/GCS bucket]
 ```
 
 Tero is a **library**, not a service. You embed it in a worker, container, or edge runtime. There is no clustering, no Raft, no distributed consensus — by design. Durability and scale come from cheap object storage, the same pattern Litestream pioneered for SQLite.
@@ -12,13 +12,13 @@ Tero is a **library**, not a service. You embed it in a worker, container, or ed
 
 - **Embedded JSON document DB** with key/value + batch operations
 - **Real ACID**: WAL with fsync barriers on COMMIT/ROLLBACK, atomic data-file writes (temp → rename → fsync), in-memory pending-writes index so transaction reads never re-scan the WAL
-- **WAL rotation** into archive segments — the durable ledger v2 backs up to the client bucket
+- **WAL rotation** into archive segments — backs up WAL segments and snapshots to object storage
 - **Schema validation** with strict mode (string/number/boolean/object/array/date/any, formats, enums, defaults, custom validators)
 - **Cloud backup** to AWS S3 or Cloudflare R2 (cron-scheduled), archive or individual-file format
 - **Cloud recovery** — full, single-file, or archive restore
-- **v2: hydrate on startup** — pull missing/all files from the client's bucket before the ACID engine initializes, so a fresh node reconstructs state from the durable ledger
+- **v2: hydrate on startup** — pull missing or all files from object storage before the ACID engine initializes to reconstruct node state
 - **v2: bucket backup** — one-shot snapshot of all data files + retained WAL segments + a manifest that hydrate-on-startup can discover
-- **Per-instance client credentials** — every Tero instance holds its own bucket creds directly
+- **Per-instance cloud credentials** — each Tero instance manages its own storage credentials directly
 
 ## What it is not
 
@@ -27,7 +27,7 @@ Tero is a **library**, not a service. You embed it in a worker, container, or ed
 - Not a query engine. Key/value + batch. No SQL, no indexes beyond the in-memory cache.
 - Not horizontally scalable beyond one node's filesystem. One file per document puts a practical ceiling around 10⁵–10⁶ docs per node; the bucket is what scales.
 
-These are deliberate. They keep Tero embeddable inside a 50 ms worker budget and keep the cloud bill on object-storage economics instead of managed-DB pricing.
+These are deliberate design choices to keep Tero lightweight and fast inside edge worker runtimes while using object storage for global durability.
 
 ## Install
 
@@ -109,7 +109,7 @@ await db.batchWrite([
 const products = await db.batchRead(['product1', 'product2', 'product3']);
 ```
 
-## Cloud backup (client-owned credentials)
+## Cloud backup
 
 ```javascript
 db.configureBackup({
@@ -117,9 +117,9 @@ db.configureBackup({
   cloudStorage: {
     provider: 'aws-s3',
     region: 'us-east-1',
-    bucket: 'my-tenant-bucket',
-    accessKeyId: process.env.MY_TENANT_AWS_KEY_ID,       // the client's own keys
-    secretAccessKey: process.env.MY_TENANT_AWS_SECRET,   // stored locally per instance
+    bucket: 'my-backup-bucket',
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
   retention: '30d',
 });
@@ -129,7 +129,7 @@ const scheduleId = db.scheduleBackup({ interval: '6h', retention: '7d' });
 db.cancelScheduledBackup(scheduleId);
 ```
 
-Tero does not broker or centralize bucket access, keeping tenant cloud credentials strictly isolated to each local instance.
+Tero interacts directly with object storage from each instance, keeping credentials local and isolated.
 
 ## Cloud recovery
 
@@ -148,7 +148,7 @@ const info = await db.getRecoveryInfo();               // local vs cloud diff
 
 ## v2: hydrate on startup
 
-`Tero.create()` is the async factory that pulls missing/all files from the client's bucket **before** the ACID engine runs crash recovery — so a fresh node boots with the latest durable state.
+`Tero.create()` is the async factory that pulls missing/all files from object storage **before** the ACID engine runs crash recovery — so a fresh node boots with the latest durable state.
 
 ```javascript
 const db = await Tero.create({
@@ -166,7 +166,7 @@ db.configureDataRecovery({ cloudStorage: cloudConfig, localPath: './mydata' });
 await db.hydrate({ mode: 'missing' });
 ```
 
-Hydration is non-fatal by design: a bad-creds or unreachable bucket never blocks engine startup. The local filesystem remains the source of truth; the bucket is the durable ledger.
+Hydration is non-fatal by design: an unreachable or misconfigured bucket will not block engine startup. The local filesystem remains the source of truth.
 
 ## v2: bucket backup with WAL segments
 
@@ -180,7 +180,7 @@ const result = await db.backupToBucket({ tag: 'hourly-snapshot' });
 await db.checkpointAndBackupToBucket({ tag: 'post-burst' });
 ```
 
-This is the v2 RPO lever: rotate the WAL into a new immutable segment, push it to the bucket, and a rehydrated node can replay from that segment forward.
+This enables point-in-time recovery: rotate the WAL into a new immutable segment, push it to object storage, and a rehydrated node can replay from that segment forward.
 
 ## v2: read with cloud fallback
 
@@ -226,7 +226,7 @@ Tero instance (one per process)
 │   ├── LockManager   ─── per-key shared/exclusive locks with wait queue
 │   └── pendingWrites ─── in-memory per-transaction op index (O(1) reads within a tx)
 ├── SchemaValidator
-├── BackupManager     ─── cron-scheduled snapshot + WAL segment upload to client bucket
+├── BackupManager     ─── cron-scheduled snapshot + WAL segment upload to object storage
 └── DataRecovery      ─── hydrate-on-startup + runtime getWithRecovery
 ```
 
@@ -283,7 +283,7 @@ full mode (fsync per commit — max durability):
 ```
 
 - **synchronous: 'full'** (default) — fsync per commit. Max durability. Use when every commit must survive power loss.
-- **synchronous: 'normal'** — group commit + deferred data flush. WAL is fsynced every 10ms (configurable via `commitIntervalMs`); data files checkpoint every 50ms (configurable via `dataFlushIntervalMs`). 200x+ throughput vs full mode. RPO: up to 10ms of WAL writes. This is the SQLite `PRAGMA synchronous=NORMAL` equivalent.
+- **synchronous: 'normal'** — group commit + deferred data flush. WAL is fsynced every 10ms (configurable via `commitIntervalMs`); data files checkpoint every 50ms (configurable via `dataFlushIntervalMs`). 200x+ throughput vs full mode. WAL sync window is up to 10ms of writes. This is the SQLite `PRAGMA synchronous=NORMAL` equivalent.
 - **synchronous: 'off'** — never fsync. Testing/benchmark only.
 
 Architecture:
@@ -318,4 +318,4 @@ MIT — see [LICENSE](./LICENSE).
 
 ---
 
-**Tero** — embedded ACID JSON for the edge. The bucket is the ledger.
+**Tero** — embedded ACID JSON for the edge.
