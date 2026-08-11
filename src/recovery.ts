@@ -310,6 +310,57 @@ export class DataRecovery {
         }
     }
 
+    /**
+     * List files that exist in the cloud bucket but are missing from the local directory.
+     * This is the v2 fast path used during hydrate-on-startup with mode='missing'.
+     */
+    async listMissingLocally(): Promise<string[]> {
+        try {
+            const cloudFiles = await this.listAvailableFiles();
+            const missing: string[] = [];
+            for (const key of cloudFiles) {
+                const localPath = join(this.config.localPath, `${key}.json`);
+                if (!existsSync(localPath)) {
+                    missing.push(key);
+                }
+            }
+            return missing;
+        } catch (error) {
+            return [];
+        }
+    }
+
+    /**
+     * Recover only files that exist in the cloud but are missing locally.
+     * Returns the standard RecoveryResult. Used by v2 hydrate-on-startup (mode='missing').
+     */
+    async recoverMissingFiles(): Promise<RecoveryResult> {
+        const startTime = Date.now();
+        try {
+            const missing = await this.listMissingLocally();
+            if (missing.length === 0) {
+                return {
+                    success: true,
+                    recovered: [],
+                    failed: [],
+                    totalFiles: 0,
+                    duration: Date.now() - startTime,
+                };
+            }
+            const result = await this.recoverIndividualFiles(missing);
+            result.duration = Date.now() - startTime;
+            return result;
+        } catch (error) {
+            return {
+                success: false,
+                recovered: [],
+                failed: [],
+                totalFiles: 0,
+                duration: Date.now() - startTime,
+            };
+        }
+    }
+
     private async downloadFile(cloudKey: string, localPath: string): Promise<boolean> {
         try {
             const getCommand = new GetObjectCommand({
