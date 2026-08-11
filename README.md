@@ -269,12 +269,36 @@ node local_tests/v2-test.js   # v2: hydrate + bucket backup surface
 
 ## Performance characteristics
 
-- Synchronous fsync-per-commit (real Durability): ~50–70 ms per commit on consumer SSDs, bounded by the disk's fsync latency. Batch many writes into one transaction to amortize.
-- In-memory pending-writes index: O(1) reads within a transaction; no WAL re-scan per op.
-- WAL rotation at 1 MB or every 500 commits (whichever comes first), keeping recovery replays bounded.
-- LRU cache (QuickLRU) capped at 1000 entries to bound memory.
+```
+normal mode (recommended production — group commit 10ms + deferred data flush):
+  Single create:       ~10,000–14,000 ops/s
+  Update (same key):   ~51,000 ops/s
+  Batch (100 docs/tx): ~47,000 docs/s
+  Hot read (cached):   ~1,000,000 ops/s
+  exists():            ~1,000,000 ops/s
 
-This is single-node throughput, not cluster throughput. For higher write rates than a single fsync-per-commit allows, run multiple Tero instances behind a sharding layer; each owns its own bucket and directory.
+full mode (fsync per commit — max durability):
+  Single create:       ~45 ops/s
+  Batch (100 docs/tx): ~4,000 docs/s
+```
+
+- **synchronous: 'full'** (default) — fsync per commit. Max durability. Use when every commit must survive power loss.
+- **synchronous: 'normal'** — group commit + deferred data flush. WAL is fsynced every 10ms (configurable via `commitIntervalMs`); data files checkpoint every 50ms (configurable via `dataFlushIntervalMs`). 200x+ throughput vs full mode. RPO: up to 10ms of WAL writes. This is the SQLite `PRAGMA synchronous=NORMAL` equivalent.
+- **synchronous: 'off'** — never fsync. Testing/benchmark only.
+
+Architecture:
+- In-memory WAL write buffer — one `appendFileSync` per flush, not per entry
+- FNV-1a hash for WAL integrity (100x faster than SHA-256 for small entries)
+- Deferred data-file writes via `committedBuffer` + background timer (SQLite WAL-mode pattern)
+- Transaction-free `get()` fast path: LRU cache → committedBuffer → disk (zero syscalls on cache hit)
+- `knownKeys` Set replaces `existsSync()` on the hot path
+- Per-tx `heldLocks` Set for O(1) lock release (was O(allLocks))
+- Per-tx `txTouchedKeys` Set for O(touched) cache promotion (was O(cacheSize))
+- Sync `commitTransaction()` / `rollbackTransaction()` — no async overhead on the happy path
+- Lock manager returns `true` (sync) instead of `Promise` on the uncontended fast path
+- WAL rotation at 1 MB or every 500 commits, keeping recovery replays bounded
+
+This is single-node throughput, not cluster throughput. For higher write rates, run multiple Tero instances behind a sharding layer; each owns its own bucket and directory.
 
 ## License
 

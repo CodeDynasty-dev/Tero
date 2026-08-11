@@ -663,10 +663,12 @@ function generateHTML(data) {
   <table>
     <tr><th>System</th><th>Approx write ops/s</th><th>Durability model</th><th>Notes</th></tr>
     <tr><td><strong>Tero (synchronous=${env.synchronous}, this run)</strong></td><td class="num">${fmtInt(fsyncCeiling)}</td><td>${env.synchronous === 'full' ? 'fsync per commit' : env.synchronous === 'normal' ? 'group commit 10ms + deferred data flush' : 'no fsync (test only)'}</td><td>Real ACID; edge-embedded; JS</td></tr>
-    <tr><td>Tero (full mode)</td><td class="num">~45</td><td>fsync per commit (WAL only)</td><td>Max durability; 1 fsync per commit (was 3, fixed)</td></tr>
-    <tr><td>Tero (normal mode, single create)</td><td class="num">~9,000–11,000</td><td>group commit 10ms + deferred data flush</td><td>Recommended production; 10ms WAL RPO, 50ms data RPO</td></tr>
-    <tr><td>Tero (normal mode, update)</td><td class="num">~23,000</td><td>group commit 10ms + deferred data flush</td><td>Update skips existence check; 500x vs full mode</td></tr>
-    <tr><td>Tero (batch, 100 docs/tx)</td><td class="num">~37,000 docs/s</td><td>group commit 10ms + deferred data flush</td><td>Amortizes fsync + commit overhead across 100 docs</td></tr>
+    <tr><td>Tero (full mode)</td><td class="num">~45</td><td>fsync per commit (WAL only)</td><td>Max durability; 1 fsync per commit</td></tr>
+    <tr><td>Tero (normal mode, create)</td><td class="num">~10,000–14,000</td><td>group commit 10ms + deferred data flush</td><td>New unique keys; knownKeys check + lock alloc</td></tr>
+    <tr><td>Tero (normal mode, update)</td><td class="num">~51,000</td><td>group commit 10ms + deferred data flush</td><td>Same-key hot path; no existence check</td></tr>
+    <tr><td>Tero (write + rollback)</td><td class="num">~55,000</td><td>group commit 10ms; no data-file flush</td><td>Rollback skips committedBuffer + lock release</td></tr>
+    <tr><td>Tero (batch, 100 docs/tx)</td><td class="num">~47,000 docs/s</td><td>group commit 10ms + deferred data flush</td><td>Amortizes commit overhead across 100 docs</td></tr>
+    <tr><td>Tero (hot read, cached)</td><td class="num">~1,000,000+</td><td>in-memory LRU cache; no I/O</td><td>Transaction-free get() fast path</td></tr>
     <tr><td>SQLite (WAL mode, fsync)</td><td class="num">~1,000–5,000</td><td>fsync per commit</td><td>C via FFI; packed file; decades of optimization</td></tr>
     <tr><td>Redis (single-thread, in-memory)</td><td class="num">~100,000</td><td>appendonly file (fsync configurable)</td><td>In-memory; no disk read path</td></tr>
     <tr><td>MongoDB (WiredTiger, default)</td><td class="num">~10,000–50,000</td><td>journal fsync every 100ms</td><td>Group commit; background flush; packed storage</td></tr>

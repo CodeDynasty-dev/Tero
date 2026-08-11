@@ -393,7 +393,9 @@ export class Tero {
         data = validationResult.data || data;
       }
 
-      await this.acidEngine.write(txId, key, data);
+      // Engine write — returns void (sync fast path) or Promise (contended lock)
+      const writeResult = this.acidEngine.write(txId, key, data);
+      if (writeResult !== undefined) await writeResult;
 
       // Update cache with transaction context
       this.updateCache(key, data, txId);
@@ -420,10 +422,11 @@ export class Tero {
         return cachedEntry.data;
       }
 
-      // Read from ACID engine
-      const data = await this.acidEngine.read(txId, key);
+      // Read from ACID engine — returns data (sync fast path) or Promise (contended lock)
+      const readResult = this.acidEngine.read(txId, key);
+      const data = (readResult !== undefined && readResult instanceof Promise) ? await readResult : readResult;
 
-      if (data !== null) {
+      if (data !== null && data !== undefined) {
         this.updateCache(key, data, txId);
       }
 
@@ -436,17 +439,16 @@ export class Tero {
   async commit(transactionId: string | Transaction): Promise<void> {
     try {
       const txId = this._txId(transactionId);
-      // Get affected keys before commit
-      const transaction = this.acidEngine.getActiveTransactions().includes(txId);
-      if (!transaction) {
+      // O(1) active check — was O(N) via getActiveTransactions().includes()
+      if (!this.acidEngine.isTransactionActive(txId)) {
         throw new Error(`Transaction ${txId} not found or not active`);
       }
 
-      await this.acidEngine.commitTransaction(txId);
+      // Sync call — commitTransaction is now synchronous (no awaits on happy path)
+      this.acidEngine.commitTransaction(txId);
 
-      // PROMOTE cache entries tagged with this transaction to "committed" state by
-      // clearing their transactionId, instead of deleting them. Use the touched-keys
-      // set (O(touched)) instead of scanning the full LRU cache (O(cacheSize)).
+      // PROMOTE cache entries tagged with this transaction to "committed" state.
+      // O(touched) via the tracked set.
       const touched = this.txTouchedKeys.get(txId);
       if (touched) {
         for (const key of touched) {
@@ -466,10 +468,10 @@ export class Tero {
   async rollback(transactionId: string | Transaction): Promise<void> {
     try {
       const txId = this._txId(transactionId);
-      await this.acidEngine.rollbackTransaction(txId);
+      // Sync call — rollbackTransaction is now synchronous
+      this.acidEngine.rollbackTransaction(txId);
 
       // Remove cache entries for this transaction using the touched-keys set
-      // (O(touched) instead of scanning the full LRU cache).
       const touched = this.txTouchedKeys.get(txId);
       if (touched) {
         for (const key of touched) {
@@ -704,7 +706,8 @@ export class Tero {
 
   // Internal raw methods for Transaction class
   async _writeRaw(transactionId: string, key: string, data: any): Promise<void> {
-    await this.acidEngine.write(transactionId, key, data);
+    const result = this.acidEngine.write(transactionId, key, data);
+    if (result !== undefined) await result;
     this.updateCache(key, data, transactionId);
   }
 
@@ -716,21 +719,23 @@ export class Tero {
       cachedEntry.lastAccessed = Date.now();
       return cachedEntry.data;
     }
-    const data = await this.acidEngine.read(transactionId, key);
-    if (data !== null) {
+    const result = this.acidEngine.read(transactionId, key);
+    const data = (result !== undefined && result instanceof Promise) ? await result : result;
+    if (data !== null && data !== undefined) {
       this.updateCache(key, data, transactionId);
     }
     return data;
   }
 
   async _deleteRaw(transactionId: string, key: string): Promise<void> {
-    await this.acidEngine.delete(transactionId, key);
+    const result = this.acidEngine.delete(transactionId, key);
+    if (result !== undefined) await result;
     this.cache.delete(key);
     this.knownKeys.delete(key);
   }
 
   async _rollbackRaw(transactionId: string): Promise<void> {
-    await this.acidEngine.rollbackTransaction(transactionId);
+    this.acidEngine.rollbackTransaction(transactionId);
     this.rolledBackCount++;
   }
 

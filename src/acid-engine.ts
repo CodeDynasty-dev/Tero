@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync } from "fs";
 import { join, dirname } from "path";
-import { randomUUID } from "crypto";
 
 // ACID-compliant transaction log entry
 export interface LogEntry {
@@ -185,14 +184,14 @@ export class WriteAheadLog {
             timestamp: Date.now()
         };
 
-        const checksum = this.calculateChecksum(entryWithoutChecksum);
+        // Single JSON.stringify — compute the checksum from the same string we
+        // push to the buffer, then append the checksum field by string concat.
+        // This halves the JSON.stringify calls vs the previous spread+stringify
+        // on both the checksum input and the final LogEntry.
+        const jsonNoChecksum = JSON.stringify(entryWithoutChecksum);
+        const checksum = fnv1a(jsonNoChecksum);
+        const line = jsonNoChecksum.slice(0, -1) + ',"checksum":' + checksum + '}';
 
-        const logEntry: LogEntry = {
-            ...entryWithoutChecksum,
-            checksum
-        } as LogEntry;
-
-        const line = JSON.stringify(logEntry);
         this.writeBuffer.push(line);
         this.writeBufferSize += line.length + 1; // +1 for newline
 
@@ -202,11 +201,10 @@ export class WriteAheadLog {
         }
 
         // On durability barriers:
-        //   'full'   — flush + fsync every commit (max durability, ~40 ops/s)
+        //   'full'   — flush + fsync every commit (max durability, ~45 ops/s)
         //   'normal' — mark dirty; background timer flushes + fsyncs every commitIntervalMs
         //   'off'    — just buffer in memory. Auto-flushes only when buffer exceeds
-        //              FLUSH_THRESHOLD (4MB) or on explicit forceFlush/destroy. This is
-        //              the testing/top-speed mode — no syscalls on the commit path.
+        //              FLUSH_THRESHOLD (4MB) or on explicit forceFlush/destroy.
         if (entry.operation === 'COMMIT' || entry.operation === 'ROLLBACK' ||
             entry.operation === 'CHECKPOINT') {
             if (this.synchronous === 'full') {
@@ -215,7 +213,6 @@ export class WriteAheadLog {
             } else if (this.synchronous === 'normal') {
                 this.dirty = true;
             }
-            // 'off' → do nothing — buffer until threshold or explicit flush
         }
 
         return lsn;
@@ -425,57 +422,55 @@ export class LockManager {
 
     private readonly DEADLOCK_TIMEOUT = 30000; // 30 seconds
 
-    async acquireLock(key: string, transactionId: string, lockType: 'shared' | 'exclusive'): Promise<void> {
+    /**
+     * Acquire a lock. Returns `true` synchronously when the lock is granted
+     * immediately (uncontended fast path — zero Promise allocation). Returns a
+     * `Promise<void>` only when the lock is contended and the caller must wait.
+     * Callers should check: `if (result !== true) await result;`
+     */
+    acquireLock(key: string, transactionId: string, lockType: 'shared' | 'exclusive'): true | Promise<void> {
+        const lockInfo = this.locks.get(key);
+
+        // Fast path 1: no existing lock — grant immediately, no Promise allocation
+        if (!lockInfo) {
+            this.locks.set(key, {
+                type: lockType,
+                holders: new Set([transactionId]),
+                waitQueue: []
+            });
+            return true;
+        }
+
+        // Fast path 2: lock is grantable right now (shared/shared, or sole holder)
+        if (this.canGrantLock(lockInfo, lockType, transactionId)) {
+            if (lockType === 'shared' && lockInfo.type === 'shared') {
+                lockInfo.holders.add(transactionId);
+            } else {
+                lockInfo.type = lockType;
+                lockInfo.holders.clear();
+                lockInfo.holders.add(transactionId);
+            }
+            return true;
+        }
+
+        // Fast path 3: shared→exclusive upgrade when this tx is one of multiple shared holders
+        if (lockInfo.holders.has(transactionId) && lockInfo.type === 'shared' && lockType === 'exclusive' && lockInfo.holders.size > 1) {
+            lockInfo.holders.delete(transactionId);
+            if (this.canGrantLock(lockInfo, lockType, transactionId)) {
+                lockInfo.type = lockType;
+                lockInfo.holders.clear();
+                lockInfo.holders.add(transactionId);
+                return true;
+            }
+        }
+
+        // Slow path: lock is contended — allocate Promise + timer and wait in queue
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.removeLockRequest(key, transactionId);
                 reject(new Error(`Lock acquisition timeout for key '${key}' in transaction '${transactionId}'`));
             }, this.DEADLOCK_TIMEOUT);
 
-            const lockInfo = this.locks.get(key);
-
-            if (!lockInfo) {
-                // No existing lock, grant immediately
-                this.locks.set(key, {
-                    type: lockType,
-                    holders: new Set([transactionId]),
-                    waitQueue: []
-                });
-                clearTimeout(timeout);
-                resolve();
-                return;
-            }
-
-            // Check if lock can be granted immediately
-            if (this.canGrantLock(lockInfo, lockType, transactionId)) {
-                if (lockType === 'shared' && lockInfo.type === 'shared') {
-                    lockInfo.holders.add(transactionId);
-                } else {
-                    lockInfo.type = lockType;
-                    lockInfo.holders.clear();
-                    lockInfo.holders.add(transactionId);
-                }
-                clearTimeout(timeout);
-                resolve();
-                return;
-            }
-
-            // Handle shared-to-exclusive upgrade: release shared lock and retry
-            // This prevents deadlock when multiple shared holders attempt to upgrade
-            if (lockInfo.holders.has(transactionId) && lockInfo.type === 'shared' && lockType === 'exclusive' && lockInfo.holders.size > 1) {
-                lockInfo.holders.delete(transactionId);
-                // Retry grant after releasing shared hold
-                if (this.canGrantLock(lockInfo, lockType, transactionId)) {
-                    lockInfo.type = lockType;
-                    lockInfo.holders.clear();
-                    lockInfo.holders.add(transactionId);
-                    clearTimeout(timeout);
-                    resolve();
-                    return;
-                }
-            }
-
-            // Add to wait queue
             lockInfo.waitQueue.push({
                 transactionId,
                 type: lockType,
@@ -659,6 +654,16 @@ export class ACIDStorageEngine {
     private commitCount: number = 0;
 
     /**
+     * Monotonic transaction counter + PID. Replaces randomUUID() in the hot path —
+     * a counter increment is ~10x faster than a crypto-random 128-bit UUID generation.
+     * Transaction IDs only need to be unique within a single process lifetime; on
+     * crash recovery the WAL is replayed and old txIds are resolved, so a fresh
+     * counter starting at 0 cannot collide with stale entries.
+     */
+    private txCounter: number = 0;
+    private readonly pid: number = process.pid;
+
+    /**
      * Deferred data-file write buffer. On commit, committed data moves here instead
      * of being written to data files immediately. A background timer flushes this
      * to disk every `dataFlushIntervalMs` (default 50ms). This is the SQLite WAL-mode
@@ -803,7 +808,7 @@ export class ACIDStorageEngine {
 
     // Transaction management
     beginTransaction(): string {
-        const transactionId = randomUUID();
+        const transactionId = 't' + this.pid + '_' + (this.txCounter++);
         const startLSN = this.wal.writeLog({
             operation: 'BEGIN',
             transactionId
@@ -822,22 +827,43 @@ export class ACIDStorageEngine {
         return transactionId;
     }
 
-    async write(transactionId: string, key: string, data: any): Promise<void> {
+    /**
+     * Write data for a transaction. Returns `void` synchronously when the lock is
+     * uncontended (the common case — fast path, zero Promise allocation). Returns
+     * `Promise<void>` only when the lock is contended and we must wait in queue.
+     * Callers should check: `if (result !== undefined) await result;`
+     */
+    write(transactionId: string, key: string, data: any): void | Promise<void> {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction || transaction.status !== 'active') {
             throw new Error(`Invalid transaction: ${transactionId}`);
         }
 
-        // Acquire exclusive lock
-        await this.lockManager.acquireLock(key, transactionId, 'exclusive');
-        transaction.heldLocks.add(key);
+        // Acquire exclusive lock — returns true (sync) or Promise (contended)
+        const lockResult = this.lockManager.acquireLock(key, transactionId, 'exclusive');
+        if (lockResult !== true) {
+            // Slow path: lock is contended — return a Promise
+            return lockResult.then(() => {
+                transaction.heldLocks.add(key);
+                this.doWriteSync(transactionId, key, data, transaction);
+            });
+        }
 
+        // Fast path: lock granted synchronously — do the write work sync, return void
+        transaction.heldLocks.add(key);
+        this.doWriteSync(transactionId, key, data, transaction);
+    }
+
+    /**
+     * Synchronous write work — called from write() after the lock is acquired.
+     * Pure in-memory + buffer operations: before-image lookup, deepMerge, WAL buffer,
+     * pendingWrites tracking. No syscalls, no Promises.
+     */
+    private doWriteSync(transactionId: string, key: string, data: any, transaction: any): void {
         try {
             const pendingTx = this.pendingWrites.get(transactionId)!;
 
-            // Determine "before image" — check pending writes, then committedBuffer,
-            // then disk. This avoids a disk read when the key was recently committed
-            // but not yet flushed to the data file.
+            // Determine "before image" — check pending writes, then committedBuffer, then disk
             let currentData: any = null;
             const pending = pendingTx.get(key);
             if (pending) {
@@ -847,11 +873,9 @@ export class ACIDStorageEngine {
                     currentData = pending.afterImage;
                 }
             } else if (this.committedBuffer.has(key)) {
-                // Use committed-but-unflushed data as the before image
                 const committed = this.committedBuffer.get(key)!;
                 currentData = committed.op === 'write' ? committed.data : null;
             } else {
-                // Read from disk (may return null if file doesn't exist)
                 const filePath = join(this.dbPath, `${key}.json`);
                 if (existsSync(filePath)) {
                     try {
@@ -864,11 +888,8 @@ export class ACIDStorageEngine {
             }
 
             const beforeImage = currentData;
-
-            // Deep merge for proper data integrity
             const afterImage = this.deepMerge(currentData || {}, data);
 
-            // Write to WAL first (Write-Ahead Logging)
             this.wal.writeLog({
                 operation: 'WRITE',
                 transactionId,
@@ -877,10 +898,7 @@ export class ACIDStorageEngine {
                 afterImage
             });
 
-            // Track pending write in-memory O(1) — no WAL re-read needed for subsequent reads
             pendingTx.set(key, { beforeImage, afterImage, op: 'write' });
-
-            // Track operation
             transaction.operations.push({ key, operation: 'write' });
 
         } catch (error) {
@@ -889,18 +907,33 @@ export class ACIDStorageEngine {
         }
     }
 
-    async read(transactionId: string, key: string): Promise<any> {
+    /**
+     * Read data for a transaction. Same pattern as write: returns the data
+     * synchronously when the lock is uncontended, returns a Promise only when
+     * contended.
+     */
+    read(transactionId: string, key: string): any | Promise<any> {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction || transaction.status !== 'active') {
             throw new Error(`Invalid transaction: ${transactionId}`);
         }
 
-        // Acquire shared lock for consistent read
-        await this.lockManager.acquireLock(key, transactionId, 'shared');
-        transaction.heldLocks.add(key);
+        const lockResult = this.lockManager.acquireLock(key, transactionId, 'shared');
+        if (lockResult !== true) {
+            // Slow path: lock is contended
+            return lockResult.then(() => {
+                transaction.heldLocks.add(key);
+                return this.doReadSync(transactionId, key);
+            });
+        }
 
+        // Fast path: lock granted synchronously
+        transaction.heldLocks.add(key);
+        return this.doReadSync(transactionId, key);
+    }
+
+    private doReadSync(transactionId: string, key: string): any {
         try {
-            // Check pending writes in this transaction first (O(1) in-memory lookup)
             const pendingTx = this.pendingWrites.get(transactionId);
             if (pendingTx) {
                 const pending = pendingTx.get(key);
@@ -912,19 +945,15 @@ export class ACIDStorageEngine {
                 }
             }
 
-            // Check committedBuffer (committed but not yet flushed to data files)
             if (this.committedBuffer.has(key)) {
                 const committed = this.committedBuffer.get(key)!;
                 return committed.op === 'write' ? committed.data : null;
             }
 
-            // Read from disk
             const filePath = join(this.dbPath, `${key}.json`);
-
             if (!existsSync(filePath)) {
                 return null;
             }
-
             const content = readFileSync(filePath, 'utf-8');
             return content.trim() ? JSON.parse(content) : {};
         } catch (error) {
@@ -933,30 +962,40 @@ export class ACIDStorageEngine {
         }
     }
 
-    async delete(transactionId: string, key: string): Promise<void> {
+    /**
+     * Delete a key in a transaction. Same sync fast-path pattern as write().
+     */
+    delete(transactionId: string, key: string): void | Promise<void> {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction || transaction.status !== 'active') {
             throw new Error(`Invalid transaction: ${transactionId}`);
         }
 
-        // Acquire exclusive lock
-        await this.lockManager.acquireLock(key, transactionId, 'exclusive');
-        transaction.heldLocks.add(key);
+        const lockResult = this.lockManager.acquireLock(key, transactionId, 'exclusive');
+        if (lockResult !== true) {
+            return lockResult.then(() => {
+                transaction.heldLocks.add(key);
+                this.doDeleteSync(transactionId, key, transaction);
+            });
+        }
 
+        transaction.heldLocks.add(key);
+        this.doDeleteSync(transactionId, key, transaction);
+    }
+
+    private doDeleteSync(transactionId: string, key: string, transaction: any): void {
         try {
-            // Determine before image — from pending, committedBuffer, or disk
             const pendingTx = this.pendingWrites.get(transactionId)!;
             let beforeImage: any = null;
 
             const pending = pendingTx.get(key);
             if (pending) {
                 if (pending.op === 'delete') {
-                    beforeImage = null; // double-delete
+                    beforeImage = null;
                 } else {
-                    beforeImage = pending.beforeImage; // use original disk state
+                    beforeImage = pending.beforeImage;
                 }
             } else if (this.committedBuffer.has(key)) {
-                // Use committed-but-unflushed data as the before image
                 const committed = this.committedBuffer.get(key)!;
                 beforeImage = committed.op === 'write' ? committed.data : null;
             } else {
@@ -971,7 +1010,6 @@ export class ACIDStorageEngine {
                 }
             }
 
-            // Write to WAL
             this.wal.writeLog({
                 operation: 'DELETE',
                 transactionId,
@@ -980,10 +1018,7 @@ export class ACIDStorageEngine {
                 afterImage: null
             });
 
-            // Track pending delete in-memory
             pendingTx.set(key, { beforeImage, afterImage: null, op: 'delete' });
-
-            // Track operation
             transaction.operations.push({ key, operation: 'delete' });
 
         } catch (error) {
@@ -992,23 +1027,26 @@ export class ACIDStorageEngine {
         }
     }
 
-    async commitTransaction(transactionId: string): Promise<void> {
+    /**
+     * Commit a transaction. SYNCHRONOUS — the happy path has no awaits (WAL is
+     * buffered, data-file writes are deferred, locks are released sync). Making
+     * this sync eliminates 1-2 microtask ticks per commit (~5-10μs), which is
+     * significant when commit is the hot path of every create/update/delete.
+     */
+    commitTransaction(transactionId: string): void {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction || transaction.status !== 'active') {
             throw new Error(`Invalid transaction: ${transactionId}`);
         }
 
         try {
-            // Write commit log entry (durable barrier — fsynced inside writeLog)
+            // Write commit log entry
             this.wal.writeLog({
                 operation: 'COMMIT',
                 transactionId
             });
 
-            // DEFERRED data-file writes: move committed data to committedBuffer instead
-            // of writing data files immediately. The background timer flushes them to
-            // disk every DATA_FLUSH_INTERVAL_MS. The WAL is the durable copy; data
-            // files are rebuilt via redo on crash recovery.
+            // DEFERRED data-file writes: move committed data to committedBuffer
             const pendingTx = this.pendingWrites.get(transactionId);
             if (pendingTx) {
                 for (const [key, op] of pendingTx.entries()) {
@@ -1026,13 +1064,11 @@ export class ACIDStorageEngine {
             // Release only the locks this tx held — O(heldKeys) instead of O(allLocks)
             this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks);
 
-            // Cleanup in-memory state for this transaction — FIXES the memory leak
-            // (previously activeTransactions never had committed/aborted entries removed).
+            // Cleanup in-memory state
             this.pendingWrites.delete(transactionId);
             this.activeTransactions.delete(transactionId);
 
             // Bound WAL growth: periodically rotate when no active transactions are left.
-            // We never truncate mid-flight, preserving history for v2 backup/recovery.
             this.commitCount++;
             if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
                 this.getActiveTransactions().length === 0) {
@@ -1040,38 +1076,37 @@ export class ACIDStorageEngine {
             }
 
         } catch (error) {
-            // Rollback on commit failure
-            try { await this.rollbackTransaction(transactionId); } catch { }
+            // Sync rollback on commit failure
+            try { this.rollbackTransaction(transactionId); } catch { }
             throw new Error(`Commit failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
 
-    async rollbackTransaction(transactionId: string): Promise<void> {
+    /**
+     * Rollback a transaction. SYNCHRONOUS — matches commitTransaction. No async
+     * work on the happy path.
+     */
+    rollbackTransaction(transactionId: string): void {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction) {
             throw new Error(`Transaction not found: ${transactionId}`);
         }
 
-        try {
-            // Write rollback log entry (durable barrier — fsynced inside writeLog)
-            this.wal.writeLog({
-                operation: 'ROLLBACK',
-                transactionId
-            });
+        // Write rollback log entry
+        this.wal.writeLog({
+            operation: 'ROLLBACK',
+            transactionId
+        });
 
-            // Update transaction status
-            transaction.status = 'aborted';
+        // Update transaction status
+        transaction.status = 'aborted';
 
-            // Release only the locks this tx held — O(heldKeys) instead of O(allLocks)
-            this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks);
+        // Release only the locks this tx held
+        this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks);
 
-            // Cleanup in-memory state for this transaction
-            this.pendingWrites.delete(transactionId);
-            this.activeTransactions.delete(transactionId);
-
-        } catch (error) {
-            throw error;
-        }
+        // Cleanup in-memory state
+        this.pendingWrites.delete(transactionId);
+        this.activeTransactions.delete(transactionId);
     }
 
     private deepMerge(target: any, source: any): any {
@@ -1104,6 +1139,15 @@ export class ACIDStorageEngine {
         const tx = this.activeTransactions.get(transactionId);
         if (!tx) return 'not_found';
         return tx.status;
+    }
+
+    /**
+     * O(1) check whether a transaction is active. Used by commit() in index.ts
+     * to avoid the O(N) getActiveTransactions().includes() allocation.
+     */
+    isTransactionActive(transactionId: string): boolean {
+        const tx = this.activeTransactions.get(transactionId);
+        return tx !== undefined && tx.status === 'active';
     }
 
     getActiveTransactions(): string[] {
