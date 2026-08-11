@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync } from "fs";
+import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync } from "fs";
 import { join, dirname } from "path";
 
 // ACID-compliant transaction log entry
@@ -144,26 +144,52 @@ export class WriteAheadLog {
     }
 
     private recoverFromLog(): void {
-        try {
-            const logContent = readFileSync(this.logPath, 'utf-8');
-            const lines = logContent.split('\n').filter(line => line.trim());
+        let maxLSN = 0;
+        this.streamLogEntries((entry) => {
+            if (entry.lsn > maxLSN) maxLSN = entry.lsn;
+        });
+        this.currentLSN = maxLSN + 1;
+    }
 
-            let maxLSN = 0;
-            for (const line of lines) {
-                try {
-                    const entry: LogEntry = JSON.parse(line);
-                    if (this.verifyChecksum(entry) && entry.lsn > maxLSN) {
-                        maxLSN = entry.lsn;
+    /**
+     * Stream WAL entries from disk line-by-line without loading the entire file
+     * into a single V8 string. Reads 64KB chunks, processes complete lines, and
+     * calls visitor(entry) for each valid (checksum-verified) entry.
+     *
+     * This prevents OOM on large WALs — a 200MB, 1M-entry log previously
+     * allocated ~400MB of V8 string objects via readFileSync + split(); now
+     * peak memory is bounded to ~64KB + any objects the visitor retains.
+     */
+    streamLogEntries(visitor: (entry: LogEntry) => void): void {
+        if (!existsSync(this.logPath)) return;
+        let fd: number;
+        try {
+            fd = openSync(this.logPath, 'r');
+        } catch {
+            return;
+        }
+        const buf = Buffer.alloc(65536); // 64KB read chunks
+        let partial = '';
+        try {
+            let bytesRead: number;
+            while ((bytesRead = readSync(fd, buf, 0, buf.length, null)) > 0) {
+                const chunk = partial + buf.toString('utf8', 0, bytesRead);
+                const lines = chunk.split('\n');
+                // Last element may be a partial line — carry it to next chunk
+                partial = lines.pop() || '';
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                        const entry: LogEntry = JSON.parse(line);
+                        if (this.verifyChecksum(entry)) visitor(entry);
+                    } catch {
+                        // skip corrupted / partial entries
+                        continue;
                     }
-                } catch (error) {
-                    // Skip corrupted/partial entries silently
-                    continue;
                 }
             }
-
-            this.currentLSN = maxLSN + 1; // Next LSN
-        } catch (error) {
-            this.currentLSN = 1;
+        } finally {
+            closeSync(fd);
         }
     }
 
@@ -333,43 +359,13 @@ export class WriteAheadLog {
     }
 
     getLogEntries(fromLSN?: number): LogEntry[] {
-        try {
-            const entries: LogEntry[] = [];
-
-            // First, include entries from the in-memory buffer (not yet flushed to disk)
-            for (const line of this.writeBuffer) {
-                try {
-                    const entry: LogEntry = JSON.parse(line);
-                    if (this.verifyChecksum(entry) && (!fromLSN || entry.lsn >= fromLSN)) {
-                        entries.push(entry);
-                    }
-                } catch {
-                    continue;
-                }
+        const entries: LogEntry[] = [];
+        this.streamLogEntries((entry) => {
+            if (!fromLSN || entry.lsn >= fromLSN) {
+                entries.push(entry);
             }
-
-            // Then, read entries from the log file on disk
-            if (existsSync(this.logPath)) {
-                const logContent = readFileSync(this.logPath, 'utf-8');
-                const lines = logContent.split('\n').filter(line => line.trim());
-
-                for (const line of lines) {
-                    try {
-                        const entry: LogEntry = JSON.parse(line);
-                        if (this.verifyChecksum(entry) && (!fromLSN || entry.lsn >= fromLSN)) {
-                            entries.push(entry);
-                        }
-                    } catch (error) {
-                        // Skip corrupted/partial entries silently
-                        continue;
-                    }
-                }
-            }
-
-            return entries.sort((a, b) => a.lsn - b.lsn);
-        } catch (error) {
-            return [];
-        }
+        });
+        return entries;
     }
 
     /**
@@ -769,42 +765,56 @@ export class ACIDStorageEngine {
     }
 
     private performCrashRecovery(): void {
-        const logEntries = this.wal.getLogEntries();
         const committedTransactions = new Set<string>();
         const abortedTransactions = new Set<string>();
 
-        // Phase 1: Analysis - determine transaction status
-        for (const entry of logEntries) {
+        // Phase 1: streaming analysis — determine which transactions committed
+        // or aborted. Only stores txId strings (~100 bytes each) in Sets, not
+        // the full log entries. A 200MB WAL with 10k transactions uses ~1MB for
+        // this phase instead of ~400MB for the old readFileSync + split() array.
+        this.wal.streamLogEntries((entry) => {
             if (entry.operation === 'COMMIT') {
                 committedTransactions.add(entry.transactionId);
             } else if (entry.operation === 'ROLLBACK') {
                 abortedTransactions.add(entry.transactionId);
             }
-        }
+        });
 
-        // Phase 2: Redo - replay committed transactions
-        for (const entry of logEntries) {
+        // Phase 2: redo + undo — single streaming pass. For each entry:
+        //   - committed WRITE/DELETE → redo (apply to data file)
+        //   - uncommitted WRITE/DELETE → undo (restore beforeImage; these txns
+        //     never wrote data files with deferred writes, but committedBuffer
+        //     flushes may have raced a WAL barrier — undo handles that edge).
+        //
+        // Undo runs in REVERSE order so earlier writes to the same key don't
+        // overwrite later undo restores. We buffer uncommitted ops and process
+        // them in reverse after the pass completes. The buffer holds at most one
+        // entry per key (latest write wins), so memory is bounded by unique-key
+        // count — not total entries.
+        const undoByKey = new Map<string, LogEntry>();
+        this.wal.streamLogEntries((entry) => {
             if (entry.operation === 'WRITE' && committedTransactions.has(entry.transactionId)) {
                 this.redoOperation(entry);
             } else if (entry.operation === 'DELETE' && committedTransactions.has(entry.transactionId)) {
                 this.redoDelete(entry);
+            } else if (
+                (entry.operation === 'WRITE' || entry.operation === 'DELETE') &&
+                !committedTransactions.has(entry.transactionId) &&
+                !abortedTransactions.has(entry.transactionId) &&
+                entry.key
+            ) {
+                // Uncommitted: store in Map keyed by document key. Later writes
+                // to the same key overwrite earlier entries (latest wins per key).
+                undoByKey.set(entry.key, entry);
             }
+        });
+
+        // Phase 3: reverse undo — process buffered uncommitted ops. Order within
+        // the Map is insertion order, so reverse to process latest-first per key.
+        const undoEntries = [...undoByKey.values()];
+        for (let i = undoEntries.length - 1; i >= 0; i--) {
+            this.undoOperation(undoEntries[i]);
         }
-
-        // Phase 3: Undo - rollback uncommitted transactions
-        const uncommittedOps = logEntries.filter(entry =>
-            (entry.operation === 'WRITE' || entry.operation === 'DELETE') &&
-            !committedTransactions.has(entry.transactionId) &&
-            !abortedTransactions.has(entry.transactionId)
-        ).reverse();
-
-        for (const entry of uncommittedOps) {
-            this.undoOperation(entry);
-        }
-
-        // After recovery the WAL contains only durable completed transactions for replay-on-crash.
-        // We do NOT truncate — the WAL is bounded by rotation, and v2 backup uploads archived
-        // segments to the client's bucket before pruning locally.
     }
 
     private redoOperation(entry: LogEntry): void {

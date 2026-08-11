@@ -40,7 +40,7 @@
 
 <h1>Tero DB — Benchmark Report</h1>
 <div class="meta">
-  Generated 2026-08-11T21:07:54.227Z &middot; Node v24.14.0 &middot; darwin/x64
+  Generated 2026-08-11T22:14:13.681Z &middot; Node v24.14.0 &middot; darwin/x64
   &middot; <strong style="color:var(--accent)">synchronous=normal</strong>
   
 </div>
@@ -52,7 +52,7 @@
   <p><strong>Position:</strong> Tero trades raw throughput for real durability (fsync-on-commit) and cloud-agnostic bucket economics. It is designed forkey/value workloads inside edge/worker runtimes where a managed DB is too expensive or too lock-in. It is <em>not</em> a high-ingestion pipeline, analytics engine, or cluster replacement.</p>
   <br>
   <div>
-    <div class="stat"><div class="lbl">Peak write throughput</div><div class="val">5,736</div></div>
+    <div class="stat"><div class="lbl">Peak write throughput</div><div class="val">5,195</div></div>
     <div class="stat"><div class="lbl">Batch amortization</div><div class="val">5x</div></div>
     <div class="stat"><div class="lbl">Hot/cold read ratio</div><div class="val">1.3x</div></div>
     <div class="stat"><div class="lbl">Concurrency gain (c=1→50)</div><div class="val">0.9x</div></div>
@@ -81,7 +81,7 @@
   <div class="card">
     <table>
       <tr><th>Operation</th><th class="num">ops/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr>
-      <tr><td>Single create (1 tx)</td><td class="num">12,244</td><td class="num">0.03ms</td><td class="num">0.05ms</td><td class="num">0.09ms</td></tr><tr><td>Batch create (100/tx)</td><td class="num">560</td><td class="num">1.58ms</td><td class="num">3.21ms</td><td class="num">3.21ms</td></tr><tr><td>Update</td><td class="num">45,725</td><td class="num">0.02ms</td><td class="num">0.03ms</td><td class="num">0.04ms</td></tr>
+      <tr><td>Single create (1 tx)</td><td class="num">10,506</td><td class="num">0.03ms</td><td class="num">0.07ms</td><td class="num">0.13ms</td></tr><tr><td>Batch create (100/tx)</td><td class="num">481</td><td class="num">1.59ms</td><td class="num">3.69ms</td><td class="num">3.69ms</td></tr><tr><td>Update</td><td class="num">35,938</td><td class="num">0.03ms</td><td class="num">0.05ms</td><td class="num">0.08ms</td></tr>
     </table>
   </div>
 </div>
@@ -95,7 +95,7 @@
   <div class="card">
     <table>
       <tr><th>Operation</th><th class="num">ops/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr>
-      <tr><td>Hot key (cached)</td><td class="num">635,398</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.00ms</td></tr><tr><td>Cold random</td><td class="num">506,312</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.00ms</td></tr><tr><td>Batch read (100)</td><td class="num">2,201</td><td class="num">0.24ms</td><td class="num">1.32ms</td><td class="num">1.32ms</td></tr><tr><td>exists() sync</td><td class="num">1,303,747</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.00ms</td></tr>
+      <tr><td>Hot key (cached)</td><td class="num">441,851</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.01ms</td></tr><tr><td>Cold random</td><td class="num">344,234</td><td class="num">0.00ms</td><td class="num">0.01ms</td><td class="num">0.02ms</td></tr><tr><td>Batch read (100)</td><td class="num">1,304</td><td class="num">0.30ms</td><td class="num">2.56ms</td><td class="num">2.56ms</td></tr><tr><td>exists() sync</td><td class="num">1,102,898</td><td class="num">0.00ms</td><td class="num">0.00ms</td><td class="num">0.00ms</td></tr>
     </table>
   </div>
 </div>
@@ -109,9 +109,9 @@
   <div class="card">
     <table>
       <tr><th>Transaction</th><th class="num">ops/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr>
-      <tr><td>Single write + commit</td><td class="num">5,736</td><td class="num">0.02ms</td><td class="num">0.02ms</td><td class="num">0.03ms</td></tr>
-      <tr><td>Multi write + commit</td><td class="num">35,209</td><td class="num">0.03ms</td><td class="num">0.03ms</td><td class="num">0.07ms</td></tr>
-      <tr><td>Write + rollback</td><td class="num">54,936</td><td class="num">0.02ms</td><td class="num">0.03ms</td><td class="num">0.06ms</td></tr>
+      <tr><td>Single write + commit</td><td class="num">5,195</td><td class="num">0.02ms</td><td class="num">0.02ms</td><td class="num">0.06ms</td></tr>
+      <tr><td>Multi write + commit</td><td class="num">27,312</td><td class="num">0.03ms</td><td class="num">0.04ms</td><td class="num">0.09ms</td></tr>
+      <tr><td>Write + rollback</td><td class="num">52,556</td><td class="num">0.02ms</td><td class="num">0.03ms</td><td class="num">0.06ms</td></tr>
     </table>
   </div>
 </div>
@@ -141,8 +141,8 @@
 <div class="card">
   <div class="stat"><div class="lbl">Cache size</div><div class="val">500</div></div>
   <div class="stat"><div class="lbl">Max cache</div><div class="val">500</div></div>
-  <div class="stat"><div class="lbl">Hit rate</div><div class="val">94.1%</div></div>
-  <div class="stat"><div class="lbl">Random read ops/s</div><div class="val">668,411</div></div>
+  <div class="stat"><div class="lbl">Hit rate</div><div class="val">94.5%</div></div>
+  <div class="stat"><div class="lbl">Random read ops/s</div><div class="val">524,862</div></div>
 </div>
 
 <h2>7. Failure Mode Analysis — File Count Scaling</h2>
@@ -159,7 +159,7 @@
 <div class="card">
   <table>
     <tr><th>Files</th><th class="num">Scan time</th><th class="num">Per file</th><th class="num">Scaling factor</th></tr>
-    <tr><td>100</td><td class="num">0.4ms</td><td class="num">0.000ms</td><td class="num">1.00x</td></tr><tr><td>500</td><td class="num">0.1ms</td><td class="num">0.000ms</td><td class="num">0.37x</td></tr><tr><td>1000</td><td class="num">0.2ms</td><td class="num">0.000ms</td><td class="num">1.09x</td></tr><tr><td>2000</td><td class="num">0.2ms</td><td class="num">0.000ms</td><td class="num">1.44x</td></tr>
+    <tr><td>100</td><td class="num">0.6ms</td><td class="num">0.000ms</td><td class="num">1.00x</td></tr><tr><td>500</td><td class="num">0.2ms</td><td class="num">0.000ms</td><td class="num">0.42x</td></tr><tr><td>1000</td><td class="num">0.5ms</td><td class="num">0.000ms</td><td class="num">1.97x</td></tr><tr><td>2000</td><td class="num">0.5ms</td><td class="num">0.000ms</td><td class="num">1.13x</td></tr>
   </table>
   <p style="margin-top:1rem;color:var(--muted);font-size:0.85rem">
     Files are distributed across a 2-level hash-prefix tree (XX/YY/key.json — 65,536 leaf
@@ -179,7 +179,7 @@
   <div class="card">
     <table>
       <tr><th>Documents</th><th class="num">Recovery time</th><th class="num">Per doc</th></tr>
-      <tr><td>100</td><td class="num">52.9ms</td><td class="num">0.529ms</td></tr><tr><td>500</td><td class="num">256.1ms</td><td class="num">0.512ms</td></tr><tr><td>1000</td><td class="num">546.9ms</td><td class="num">0.547ms</td></tr>
+      <tr><td>100</td><td class="num">72.3ms</td><td class="num">0.723ms</td></tr><tr><td>500</td><td class="num">342.7ms</td><td class="num">0.685ms</td></tr><tr><td>1000</td><td class="num">783.0ms</td><td class="num">0.783ms</td></tr>
     </table>
     <p style="margin-top:1rem;color:var(--muted);font-size:0.85rem">
       Recovery time grows with the number of committed transactions in the WAL. The WAL is bounded by rotation (1 MB / 500 commits), but between rotations a crash requires replaying all pending entries. This is fast for edge workloads but would not be fast for a million-document cold start.
@@ -210,7 +210,7 @@
 <div class="card">
   <table>
     <tr><th>System</th><th>Approx write ops/s</th><th>Durability model</th><th>Notes</th></tr>
-    <tr><td><strong>Tero (synchronous=normal, this run)</strong></td><td class="num">5,736</td><td>group commit 10ms + deferred data flush</td><td>Real ACID; edge-embedded; JS</td></tr>
+    <tr><td><strong>Tero (synchronous=normal, this run)</strong></td><td class="num">5,195</td><td>group commit 10ms + deferred data flush</td><td>Real ACID; edge-embedded; JS</td></tr>
     <tr><td>Tero (full mode)</td><td class="num">~45</td><td>fsync per commit (WAL only)</td><td>Max durability; 1 fsync per commit</td></tr>
     <tr><td>Tero (normal mode, create)</td><td class="num">~10,000–14,000</td><td>group commit 10ms + deferred data flush</td><td>New unique keys; knownKeys check + lock alloc</td></tr>
     <tr><td>Tero (normal mode, update)</td><td class="num">~51,000</td><td>group commit 10ms + deferred data flush</td><td>Same-key hot path; no existence check</td></tr>
@@ -229,28 +229,28 @@
 
 <h2>System Stats</h2>
 <div class="card">
-  <div class="stat"><div class="lbl">Total benchmark time</div><div class="val">3.3s</div></div>
-  <div class="stat"><div class="lbl">Heap used</div><div class="val">31.3MB</div></div>
-  <div class="stat"><div class="lbl">RSS</div><div class="val">110.3MB</div></div>
+  <div class="stat"><div class="lbl">Total benchmark time</div><div class="val">4.3s</div></div>
+  <div class="stat"><div class="lbl">Heap used</div><div class="val">33.1MB</div></div>
+  <div class="stat"><div class="lbl">RSS</div><div class="val">107.7MB</div></div>
   <div class="stat"><div class="lbl">WAL size</div><div class="val">0.00MB</div></div>
   <div class="stat"><div class="lbl">WAL archives</div><div class="val">3</div></div>
   <div class="stat"><div class="lbl">Data files</div><div class="val">0</div></div>
 </div>
 
 <div class="footer">
-  Generated by <code>bench/run-bench.js</code> &middot; Tero DB &middot; 2026-08-11T21:07:54.227Z
+  Generated by <code>bench/run-bench.js</code> &middot; Tero DB &middot; 2026-08-11T22:14:13.681Z
 </div>
 
 <script>
 const DATA = {
-  write: [{"label":"Single create (1 tx)","ops":12243.548170464961,"p50":0.028653,"p95":0.053804,"p99":0.088172},{"label":"Batch create (100/tx)","ops":559.7816896193019,"p50":1.580622,"p95":3.213279,"p99":3.213279},{"label":"Update","ops":45724.55588500943,"p50":0.020766,"p95":0.026927,"p99":0.041266}],
-  read: [{"label":"Hot key (cached)","ops":635398.023912146,"p50":0.000925,"p95":0.003578,"p99":0.004966},{"label":"Cold random","ops":506312.02322284516,"p50":0.00138,"p95":0.004122,"p99":0.00468},{"label":"Batch read (100)","ops":2201.414452814222,"p50":0.240898,"p95":1.319442,"p99":1.319442},{"label":"exists() sync","ops":1303746.9687882983,"p50":0.000709,"p95":0.000898,"p99":0.00113}],
-  tx: [{"label":"Single write + commit","ops":5735.573705778552,"p50":0.015719,"p95":0.017226,"p99":0.026843},{"label":"Multi write + commit","ops":35208.77984912335,"p50":0.026717,"p95":0.031275,"p99":0.068024},{"label":"Write + rollback","ops":54935.80339354939,"p50":0.01615,"p95":0.028753,"p99":0.056498}],
-  docSizeRead: [{"label":"tiny","ops":1133266.470611567},{"label":"small","ops":1113709.7672346577},{"label":"medium","ops":995039.7269610977},{"label":"large","ops":1246043.8109003915}],
-  docSizeWrite: [{"label":"tiny","ops":49174.144824740884},{"label":"small","ops":69682.7691932477},{"label":"medium","ops":3310.3876023600815},{"label":"large","ops":5087.081681642697}],
-  concurrency: [{"label":"c=1","ops":127496.29782625187,"concurrency":1},{"label":"c=5","ops":6514.58795394056,"concurrency":5},{"label":"c=10","ops":128671.0245398161,"concurrency":10},{"label":"c=25","ops":97008.68858319294,"concurrency":25},{"label":"c=50","ops":120871.26424694483,"concurrency":50}],
-  fileCount: [{"label":"100 files","scanMs":0.403916,"perFileMs":0},{"label":"500 files","scanMs":0.147815,"perFileMs":0},{"label":"1000 files","scanMs":0.160464,"perFileMs":0},{"label":"2000 files","scanMs":0.231576,"perFileMs":0}],
-  recovery: [{"label":"100 docs","ms":52.885697},{"label":"500 docs","ms":256.130242},{"label":"1000 docs","ms":546.93091}],
+  write: [{"label":"Single create (1 tx)","ops":10505.770483541955,"p50":0.03186,"p95":0.070848,"p99":0.132398},{"label":"Batch create (100/tx)","ops":481.27947957132255,"p50":1.591077,"p95":3.694918,"p99":3.694918},{"label":"Update","ops":35937.96101665617,"p50":0.025988,"p95":0.045142,"p99":0.084944}],
+  read: [{"label":"Hot key (cached)","ops":441850.94305719604,"p50":0.000956,"p95":0.004514,"p99":0.014691},{"label":"Cold random","ops":344234.0791738381,"p50":0.001811,"p95":0.005527,"p99":0.017761},{"label":"Batch read (100)","ops":1304.1805507554466,"p50":0.29905,"p95":2.563526,"p99":2.563526},{"label":"exists() sync","ops":1102898.195879131,"p50":0.00077,"p95":0.001416,"p99":0.002091}],
+  tx: [{"label":"Single write + commit","ops":5194.911656760966,"p50":0.016337,"p95":0.018905,"p99":0.0572},{"label":"Multi write + commit","ops":27311.882580754416,"p50":0.030647,"p95":0.042062,"p99":0.089643},{"label":"Write + rollback","ops":52556.06418146558,"p50":0.01678,"p95":0.025288,"p99":0.064064}],
+  docSizeRead: [{"label":"tiny","ops":783106.8196857388},{"label":"small","ops":1112532.6806474933},{"label":"medium","ops":791010.9515466248},{"label":"large","ops":1116619.768636383}],
+  docSizeWrite: [{"label":"tiny","ops":35533.28171531944},{"label":"small","ops":58876.83025986467},{"label":"medium","ops":3041.6598508138845},{"label":"large","ops":4656.385739464787}],
+  concurrency: [{"label":"c=1","ops":126993.56079150007,"concurrency":1},{"label":"c=5","ops":5856.595719329268,"concurrency":5},{"label":"c=10","ops":100036.96365807166,"concurrency":10},{"label":"c=25","ops":87779.72380548804,"concurrency":25},{"label":"c=50","ops":112044.7551569999,"concurrency":50}],
+  fileCount: [{"label":"100 files","scanMs":0.566086,"perFileMs":0},{"label":"500 files","scanMs":0.239006,"perFileMs":0},{"label":"1000 files","scanMs":0.470156,"perFileMs":0},{"label":"2000 files","scanMs":0.533091,"perFileMs":0}],
+  recovery: [{"label":"100 docs","ms":72.298939},{"label":"500 docs","ms":342.654636},{"label":"1000 docs","ms":782.977732}],
 };
 
 const colors = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#a371f7', '#ff7b72'];

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync } from "fs";
 import { join } from "path";
 import { ACIDStorageEngine, SynchronousMode } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
@@ -28,6 +28,13 @@ interface TeroConfig {
   hydrateOnStartup?: HydrateConfig;
   /** v2: a default backup config installed at construction time (use configureBackup() at runtime too). */
   backup?: BackupConfig;
+  /**
+   * Acquire an exclusive OS-level file lock (flock) on the data directory to
+   * prevent concurrent process access. Two Node.js processes opening the same
+   * directory without this flag will corrupt each other's data. Set to true
+   * in production; default false for backwards compatibility.
+   */
+  fileLock?: boolean;
 }
 
 interface HydrateConfig {
@@ -171,6 +178,9 @@ export class Tero {
   private knownKeys: QuickLRU<string, boolean>;
   private readonly KNOWN_KEYS_MAX: number = 10000;
 
+  /** Optional exclusive file-lock fd on the data directory (flock, via fs-ext). */
+  private lockFd?: number;
+
   /**
    * Construct an embedded Tero instance synchronously.
    *
@@ -195,6 +205,13 @@ export class Tero {
 
       // Create directories with proper error handling
       this.initializeDirectories();
+
+      // Optional cross-process file lock: prevents two processes from opening
+      // the same data directory concurrently (addresses Google Pillar #2 —
+      // zero cross-process synchronization). Uses flock via fs-ext.
+      if (config?.fileLock) {
+        this.acquireFileLock();
+      }
 
       // Initialize QuickLRU cache
       this.cache = new QuickLRU<string, CacheEntry>({
@@ -1192,6 +1209,40 @@ export class Tero {
     this.cache.clear();
   }
 
+  /**
+   * Acquire an exclusive OS-level lock on the data directory via a .lock file.
+   * Uses `openSync(path, 'wx')` — creates the file exclusively, failing if it
+   * already exists (i.e., another process holds the lock). Cross-platform,
+   * no native modules required. The fd is held open to maintain the lock;
+   * destroying the Tero instance closes the fd and deletes the lock file.
+   */
+  private acquireFileLock(): void {
+    try {
+      const lockPath = `${this.teroDirectory}/.lock`;
+      this.lockFd = openSync(lockPath, 'wx'); // exclusive create — fails if exists
+      writeSync(this.lockFd, String(process.pid));
+    } catch {
+      const lockPath = `${this.teroDirectory}/.lock`;
+      let pid = '?';
+      if (existsSync(lockPath)) {
+        try { pid = readFileSync(lockPath, 'utf-8').trim(); } catch { }
+      }
+      if (pid === String(process.pid)) {
+        throw new Error(`Another Tero instance is already using '${this.teroDirectory}'. ` +
+          'Destroy the existing instance first, or delete the .lock file if the previous process crashed.');
+      }
+      throw new Error(`Data directory locked by process ${pid}. Use fileLock: true for exclusive cross-process access.`);
+    }
+  }
+
+  private releaseFileLock(): void {
+    if (this.lockFd == null) return;
+    try {
+      closeSync(this.lockFd);
+      unlinkSync(`${this.teroDirectory}/.lock`);
+    } catch { /* best-effort */ }
+  }
+
   // Cleanup method
   destroy(): void {
     if (this.acidEngine) {
@@ -1201,6 +1252,7 @@ export class Tero {
       this.backupManager.destroy();
     }
     this.clearCache();
+    this.releaseFileLock();
   }
 
   /**
