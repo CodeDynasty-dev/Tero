@@ -1262,6 +1262,23 @@ export class ACIDStorageEngine {
      * in committedBuffer, or `undefined` if not in the buffer (caller should check
      * disk). Used by the get() fast path in index.ts.
      */
+    /**
+     * Return the pending afterImage for a key in an active transaction's pendingWrites.
+     * Used by index.ts write() to cache the MERGED result, not the raw user data.
+     */
+    getPendingAfterImage(transactionId: string, key: string): any | undefined {
+        const pendingTx = this.pendingWrites.get(transactionId);
+        if (!pendingTx) return undefined;
+        const op = pendingTx.get(key);
+        if (!op || op.op === 'delete') return undefined;
+        return op.afterImage;
+    }
+
+    /**
+     * Check if a key has committed-but-unflushed data. Returns the data if present
+     * in committedBuffer, or `undefined` if not in the buffer (caller should check
+     * disk). Used by the get() fast path in index.ts.
+     */
     getCommittedData(key: string): any | undefined {
         if (!this.committedBuffer.has(key)) return undefined;
         const committed = this.committedBuffer.get(key)!;

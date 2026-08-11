@@ -444,8 +444,13 @@ export class Tero {
       const writeResult = this.acidEngine.write(txId, key, data);
       if (writeResult !== undefined) await writeResult;
 
-      // Update cache with transaction context
-      this.updateCache(key, data, txId);
+      // Cache the MERGED afterImage (from pendingWrites), NOT the raw user data.
+      // The engine deep-merges user data with existing state, so the afterImage
+      // has ALL fields, not just the caller's partial update. Caching the raw
+      // input would poison the cache with incomplete documents (sequential
+      // updates to the same key would lose earlier fields).
+      const afterImage = this.acidEngine.getPendingAfterImage(txId, key);
+      this.updateCache(key, afterImage !== undefined ? afterImage : data, txId);
 
       if (options?.validate || options?.schemaName) {
         return { valid: true, errors: [], data };
@@ -679,8 +684,11 @@ export class Tero {
       this.validateKey(key);
       // Fast path: in-memory set
       if (this.knownKeys.has(key)) return true;
-      // Slow path: check disk via partitioned path (covers data created by another
-      // process / hydrated / written to a partition the LRU has evicted)
+      // Check committedBuffer for pending deletes (deferred writes may not have
+      // unlinked the file yet — a committed delete should appear as absent)
+      const committed = this.acidEngine.getCommittedData(key);
+      if (committed !== undefined) return committed !== null;
+      // Slow path: check disk via partitioned path
       if (existsSync(this.keyToPath(key))) {
         this.knownKeys.set(key, true);
         return true;

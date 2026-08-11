@@ -3,8 +3,7 @@ bun.lock
 dist
 BackupFormatTestDB
 MyDatabase
-scheduled-backups
-local_tests
+scheduled-backups 
 tasks.md
 prd.md
 TeroDB/account**.json
