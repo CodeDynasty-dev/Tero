@@ -1,11 +1,9 @@
 # Tero
 
-An embedded ACID JSON database for the edge. Single-node durability via fsync-on-commit; cloud durability via the client's own bucket. The control plane only issues keys and observes — it never holds tenant data or cloud credentials.
+An embedded ACID JSON database for the edge. Single-node durability via fsync-on-commit; cloud durability via the client's own bucket.
 
 ```
 [edge Tero node] --WAL+snapshot--> [client-owned S3/R2/GCS bucket]
-       |
-       +-- heartbeat/metrics --> [control plane: key issuance + observability only]
 ```
 
 Tero is a **library**, not a service. You embed it in a worker, container, or edge runtime. There is no clustering, no Raft, no distributed consensus — by design. Durability and scale come from cheap object storage, the same pattern Litestream pioneered for SQLite.
@@ -20,7 +18,7 @@ Tero is a **library**, not a service. You embed it in a worker, container, or ed
 - **Cloud recovery** — full, single-file, or archive restore
 - **v2: hydrate on startup** — pull missing/all files from the client's bucket before the ACID engine initializes, so a fresh node reconstructs state from the durable ledger
 - **v2: bucket backup** — one-shot snapshot of all data files + retained WAL segments + a manifest that hydrate-on-startup can discover
-- **Per-instance client credentials** — every Tero instance holds its own bucket creds; the control plane has no path to them
+- **Per-instance client credentials** — every Tero instance holds its own bucket creds directly
 
 ## What it is not
 
@@ -121,7 +119,7 @@ db.configureBackup({
     region: 'us-east-1',
     bucket: 'my-tenant-bucket',
     accessKeyId: process.env.MY_TENANT_AWS_KEY_ID,       // the client's own keys
-    secretAccessKey: process.env.MY_TENANT_AWS_SECRET,   // never sent to the control plane
+    secretAccessKey: process.env.MY_TENANT_AWS_SECRET,   // stored locally per instance
   },
   retention: '30d',
 });
@@ -131,7 +129,7 @@ const scheduleId = db.scheduleBackup({ interval: '6h', retention: '7d' });
 db.cancelScheduledBackup(scheduleId);
 ```
 
-The control plane issues API keys and observes instances; it does not broker bucket access, and it never sees a tenant's cloud credentials. This is the security model that makes 5,000 tenants safe to host from one control plane.
+Tero does not broker or centralize bucket access, keeping tenant cloud credentials strictly isolated to each local instance.
 
 ## Cloud recovery
 
@@ -232,12 +230,6 @@ Tero instance (one per process)
 └── DataRecovery      ─── hydrate-on-startup + runtime getWithRecovery
 ```
 
-The control plane (not in this repo) is a separate service that:
-- Issues API keys to tenants
-- Receives heartbeats and metrics from Tero instances
-- Triggers no data movement and holds no bucket credentials
-
-This separation is what keeps tenant data sovereign. A compromised control plane cannot read tenant data and cannot mutate tenant backups.
 
 ## Error handling
 
@@ -299,8 +291,7 @@ MIT — see [LICENSE](./LICENSE).
 ## Support
 
 - GitHub Issues: https://github.com/codedynasty-dev/tero/issues
-- The control-plane binary (key issuance + observability) is a separate repo.
 
 ---
 
-**Tero** — embedded ACID JSON for the edge. The bucket is the ledger; the control plane only watches.
+**Tero** — embedded ACID JSON for the edge. The bucket is the ledger.
