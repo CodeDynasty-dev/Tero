@@ -58,7 +58,7 @@ export class DataRecovery {
 
             this.s3Client = new S3Client(clientConfig);
         } catch (error) {
-            throw new Error(`Failed to initialize cloud storage for recovery: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            throw new Error(`Failed to initialize cloud storage for recovery: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
         }
     }
 
@@ -271,20 +271,28 @@ export class DataRecovery {
         try {
             const prefix = this.getCloudKey('');
 
-            const listCommand = new ListObjectsV2Command({
-                Bucket: this.config.cloudStorage.bucket,
-                Prefix: prefix,
-                MaxKeys: 100
-            });
+            // Paginated listing — a bucket with >1000 objects would otherwise
+            // silently truncate the archive list (hydrate 'snapshot' mode would
+            // miss the newest archive sitting past the first page).
+            const objects: any[] = [];
+            let token: string | undefined;
+            do {
+                const response: any = await this.s3Client.send(new ListObjectsV2Command({
+                    Bucket: this.config.cloudStorage.bucket,
+                    Prefix: prefix,
+                    MaxKeys: 1000,
+                    ContinuationToken: token
+                }));
+                if (response.Contents) objects.push(...response.Contents);
+                token = response.IsTruncated ? response.NextContinuationToken : undefined;
+            } while (token);
 
-            const response = await this.s3Client.send(listCommand);
-
-            if (!response.Contents) {
+            if (objects.length === 0) {
                 return [];
             }
 
             // Filter for archive files and sort by date (newest first)
-            const archives = response.Contents
+            const archives = objects
                 .filter((obj: any) => obj.Key && obj.Key.endsWith('.tar.gz'))
                 .sort((a: any, b: any) => {
                     const dateA = a.LastModified?.getTime() || 0;
@@ -304,20 +312,27 @@ export class DataRecovery {
         try {
             const prefix = this.getCloudKey('');
 
-            const listCommand = new ListObjectsV2Command({
-                Bucket: this.config.cloudStorage.bucket,
-                Prefix: prefix,
-                MaxKeys: 1000
-            });
+            // Paginated listing — restores from buckets with >1000 objects
+            // previously saw a silently truncated file list.
+            const objects: any[] = [];
+            let token: string | undefined;
+            do {
+                const response: any = await this.s3Client.send(new ListObjectsV2Command({
+                    Bucket: this.config.cloudStorage.bucket,
+                    Prefix: prefix,
+                    MaxKeys: 1000,
+                    ContinuationToken: token
+                }));
+                if (response.Contents) objects.push(...response.Contents);
+                token = response.IsTruncated ? response.NextContinuationToken : undefined;
+            } while (token);
 
-            const response = await this.s3Client.send(listCommand);
-
-            if (!response.Contents) {
+            if (objects.length === 0) {
                 return [];
             }
 
             // Filter for JSON files and extract keys
-            const files = response.Contents
+            const files = objects
                 .filter((obj: any) => obj.Key && obj.Key.endsWith('.json'))
                 .map((obj: any) => {
                     const filename = obj.Key!.split('/').pop()!;

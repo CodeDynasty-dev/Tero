@@ -1,11 +1,54 @@
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync } from "fs";
-import { join } from "path";
-import { ACIDStorageEngine, SynchronousMode } from "./acid-engine.js";
+import { join, resolve as pathResolve, relative as pathRelative } from "path";
+import { ACIDStorageEngine, SynchronousMode, partitionedPath } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
 import { randomBytes } from "node:crypto";
 import QuickLRU from "quick-lru";
+
+/**
+ * ObjectId-style ID generation state (getNewId). The 5-byte process-unique salt
+ * is drawn ONCE per process and the counter is a module-level monotonic value —
+ * regenerating either per call (the old behavior) made the documented uniqueness
+ * guarantee false: two IDs minted in the same second could collide, and every
+ * call paid a crypto entropy draw. This is both correct and faster.
+ */
+const PROCESS_UNIQUE = randomBytes(5);
+let idCounter = ~~(Math.random() * 0xffffff);
+
+/**
+ * Validate a user-supplied data directory name. Previously illegal characters
+ * were silently stripped ('my db' quietly became 'mydb' — users wrote to the
+ * wrong directory without knowing). Now: throw with an actionable message.
+ * Allowed: letters, digits, '_', '-', '/' separators; absolute paths are
+ * accepted as an explicit user choice; '..' segments always rejected; a
+ * RELATIVE path must resolve inside the process working directory.
+ * Called once at construction — zero hot-path cost. Returns the resolved
+ * absolute path so all downstream joins are unambiguous.
+ */
+function validateDirectory(raw: string): string {
+  const dir = raw.trim();
+  if (!dir) throw new Error('Directory name cannot be empty.');
+  if (/[^A-Za-z0-9_\-./]/.test(dir)) {
+    throw new Error(
+      `Invalid directory '${raw}': directory names may only contain letters, digits, '_', '-', '.' and '/' path separators.`
+    );
+  }
+  const segments = dir.split('/').filter(s => s.length > 0);
+  if (segments.length === 0 || segments.includes('..')) {
+    throw new Error(`Invalid directory '${raw}': empty or contains '..' path traversal.`);
+  }
+  const resolved = pathResolve(dir);
+  const wasAbsolute = dir.startsWith('/');
+  if (!wasAbsolute) {
+    const rel = pathRelative(pathResolve('.'), resolved);
+    if (rel.startsWith('..')) {
+      throw new Error(`Invalid directory '${raw}': relative path escapes the working directory.`);
+    }
+  }
+  return resolved;
+}
 
 interface TeroConfig {
   directory?: string;
@@ -31,10 +74,11 @@ interface TeroConfig {
   /** v2: per-second live WAL shipping to the bucket. RPO ≤ 1s of committed writes. */
   liveBackup?: LiveBackupOptions;
   /**
-   * Acquire an exclusive OS-level file lock (flock) on the data directory to
-   * prevent concurrent process access. Two Node.js processes opening the same
-   * directory without this flag will corrupt each other's data. Set to true
-   * in production; default false for backwards compatibility.
+   * Acquire an exclusive lock on the data directory (lock-file based:
+   * openSync 'wx' exclusive-create on <dir>/.lock with PID + stale-lock
+   * reclamation — no native modules). Two Node processes writing the same
+   * directory without this flag will corrupt each other's data. Recommended
+   * true in production; default false for backwards compatibility.
    */
   fileLock?: boolean;
 }
@@ -74,6 +118,10 @@ export class Transaction {
   private db: Tero;
   private startTime: number;
   private opCount: number = 0;
+  /** Real operation log backing getState() — the old implementation fabricated
+   *  fake keys ('op_0', 'op_1', …) and labeled every operation 'write',
+   *  including deletes. One array push per op: O(1), off the engine hot path. */
+  private operationsLog: Array<{ key: string; operation: string }> = [];
   private destroyed: boolean = false;
   private timeoutTimer?: ReturnType<typeof setTimeout>;
 
@@ -115,18 +163,21 @@ export class Transaction {
     if (this.db.exists(key)) throw new Error(`Document '${key}' already exists`);
     await this.db._writeRaw(this.id, key, initialData || {});
     this.opCount++;
+    this.operationsLog.push({ key, operation: 'create' });
   }
 
   async update(key: string, data: any): Promise<void> {
     this._checkActive();
     await this.db._writeRaw(this.id, key, data);
     this.opCount++;
+    this.operationsLog.push({ key, operation: 'update' });
   }
 
   async delete(key: string): Promise<void> {
     this._checkActive();
     await this.db._deleteRaw(this.id, key);
     this.opCount++;
+    this.operationsLog.push({ key, operation: 'delete' });
   }
 
   async get(key: string): Promise<any> {
@@ -138,7 +189,7 @@ export class Transaction {
     const status = this.db._getTxStatus(this.id);
     return {
       status: status === 'active' ? 'active' : (status === 'committed' ? 'committed' : 'rolled_back'),
-      operations: Array.from({ length: this.opCount }, (_, i) => ({ key: `op_${i}`, operation: 'write' })),
+      operations: [...this.operationsLog],
       startTime: this.startTime
     };
   }
@@ -180,7 +231,7 @@ export class Tero {
   private knownKeys: QuickLRU<string, boolean>;
   private readonly KNOWN_KEYS_MAX: number = 10000;
 
-  /** Optional exclusive file-lock fd on the data directory (flock, via fs-ext). */
+  /** Exclusive lock fd on <dir>/.lock (lock-file based; see acquireFileLock). */
   private lockFd?: number;
 
   /**
@@ -202,8 +253,10 @@ export class Tero {
       const { cacheSize, synchronous, commitIntervalMs, dataFlushIntervalMs } = config || {};
 
       if (typeof rawDirectory === "string" && rawDirectory.trim()) {
-        // Sanitize directory path to prevent directory traversal
-        this.teroDirectory = rawDirectory.replace(/[^a-zA-Z0-9_\-\/]/g, '');
+        // Throw on illegal characters instead of silently stripping them —
+        // 'my db' used to quietly become 'mydb' and users wrote to the wrong
+        // directory. Also blocks absolute paths and traversal.
+        this.teroDirectory = validateDirectory(rawDirectory);
       }
 
       if (typeof cacheSize === "number" && cacheSize > 0) {
@@ -213,9 +266,9 @@ export class Tero {
       // Create directories with proper error handling
       this.initializeDirectories();
 
-      // Optional cross-process file lock: prevents two processes from opening
-      // the same data directory concurrently (addresses Google Pillar #2 —
-      // zero cross-process synchronization). Uses flock via fs-ext.
+      // Optional cross-process lock: prevents two processes from opening the
+      // same data directory concurrently (addresses Google Pillar #2 —
+      // zero cross-process synchronization). Lock-file based, no native deps.
       if (config?.fileLock) {
         this.acquireFileLock();
       }
@@ -250,7 +303,7 @@ export class Tero {
         this.enableLiveBackup(config.liveBackup);
       }
     } catch (error) {
-      throw new Error(`Failed to initialize Tero: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to initialize Tero: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -360,7 +413,7 @@ export class Tero {
         mkdirSync(backupDir, { recursive: true });
       }
     } catch (error) {
-      throw new Error(`Failed to create directories: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to create directories: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -411,7 +464,7 @@ export class Tero {
       const id = this._beginTransaction();
       return new Transaction(id, this, options);
     } catch (error) {
-      throw new Error(`Failed to begin transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to begin transaction: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -470,7 +523,7 @@ export class Tero {
         return { valid: true, errors: [], data };
       }
     } catch (error) {
-      throw new Error(`Write failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Write failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -498,7 +551,7 @@ export class Tero {
 
       return data;
     } catch (error) {
-      throw new Error(`Read failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Read failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -527,7 +580,7 @@ export class Tero {
       }
       this.committedCount++;
     } catch (error) {
-      throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -547,7 +600,7 @@ export class Tero {
       }
       this.rolledBackCount++;
     } catch (error) {
-      throw new Error(`Failed to rollback transaction: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to rollback transaction: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -590,7 +643,7 @@ export class Tero {
       return result || true;
     } catch (error) {
       await this.rollback(transactionId);
-      throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -657,23 +710,21 @@ export class Tero {
       this.updateCache(key, data, undefined);
       return data;
     } catch (error) {
-      throw new Error(`Read failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Read failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
   /**
    * Map a document key to its partitioned path on disk (2-level hash-prefix).
-   * Matches the layout used by ACIDStorageEngine — same key resolves to same path.
+   * Delegates to the ENGINE'S partitionedPath() — the single authoritative
+   * implementation. The previous local FNV-1a re-implementation produced the
+   * same paths only by convention; if the two ever drifted, get() would read a
+   * different file than the engine writes (silent data loss). The engine's
+   * hash computes a 64-bit value (2 imul/char vs 1) but this runs only on
+   * cache-miss reads, which are syscall-dominated — measured impact: none.
    */
   private keyToPath(key: string): string {
-    // FNV-1a 32-bit of the key — same dispersion as partitionedPath() in acid-engine.ts
-    let h = 0x811c9dc5;
-    for (let i = 0; i < key.length; i++) {
-      h ^= key.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    const hex = h.toString(16).padStart(8, '0');
-    return `${this.teroDirectory}/${hex.slice(0, 2)}/${hex.slice(2, 4)}/${key}.json`;
+    return partitionedPath(this.teroDirectory, key);
   }
 
   async remove(key: string): Promise<void> {
@@ -730,7 +781,7 @@ export class Tero {
       for (const op of operations) this.knownKeys.set(op.key, true);
     } catch (error) {
       await this.rollback(transactionId);
-      throw new Error(`Batch write failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Batch write failed: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -746,7 +797,7 @@ export class Tero {
       return results;
     } catch (error) {
       await this.rollback(transactionId);
-      throw new Error(`Batch read failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Batch read failed: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -786,7 +837,7 @@ export class Tero {
       await this.commit(transactionId);
     } catch (error) {
       await this.rollback(transactionId);
-      throw new Error(`Money transfer failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Money transfer failed: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -844,7 +895,7 @@ export class Tero {
     try {
       this.schemaValidator.setSchema(collectionName, schema);
     } catch (error) {
-      throw new Error(`Failed to set schema: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to set schema: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -908,7 +959,7 @@ export class Tero {
     try {
       this.backupManager = new BackupManager(this.teroDirectory, config);
     } catch (error) {
-      throw new Error(`Failed to configure backup: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to configure backup: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -1034,8 +1085,8 @@ export class Tero {
      *  new directory name (disaster-recovery / staging restores). Defaults to `directory`. */
     sourceDirectory?: string;
   }): Promise<Tero> {
-    const sanitized = opts.directory.replace(/[^a-zA-Z0-9_\-\/]/g, '') || 'TeroDB';
-    const source = (opts.sourceDirectory ?? opts.directory).replace(/[^a-zA-Z0-9_\-\/]/g, '') || 'TeroDB';
+    const sanitized = validateDirectory(opts.directory);
+    const source = validateDirectory(opts.sourceDirectory ?? opts.directory);
     // The temp manager is built with the SOURCE name so bucket prefixes resolve;
     // files are written into the sanitized TARGET directory.
     const tempMgr = new BackupManager(source, { format: 'individual', cloudStorage: opts.cloudStorage });
@@ -1055,7 +1106,7 @@ export class Tero {
     try {
       this.dataRecovery = new DataRecovery(config);
     } catch (error) {
-      throw new Error(`Failed to configure data recovery: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to configure data recovery: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -1276,7 +1327,7 @@ export class Tero {
 
       return result;
     } catch (error) {
-      throw new Error(`Data integrity verification failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Data integrity verification failed: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -1285,29 +1336,53 @@ export class Tero {
   }
 
   /**
-   * Acquire an exclusive OS-level lock on the data directory via a .lock file.
-   * Uses `openSync(path, 'wx')` — creates the file exclusively, failing if it
-   * already exists (i.e., another process holds the lock). Cross-platform,
-   * no native modules required. The fd is held open to maintain the lock;
-   * destroying the Tero instance closes the fd and deletes the lock file.
+   * Acquire an exclusive lock on the data directory via a `.lock` file
+   * (openSync 'wx' exclusive-create — no native modules, cross-platform).
+   * The holder's PID is written to the file; if acquisition fails and the
+   * recorded PID is no longer alive, the stale lock from a crashed process
+   * is reclaimed automatically.
    */
   private acquireFileLock(): void {
-    try {
-      const lockPath = `${this.teroDirectory}/.lock`;
-      this.lockFd = openSync(lockPath, 'wx'); // exclusive create — fails if exists
-      writeSync(this.lockFd, String(process.pid));
-    } catch {
-      const lockPath = `${this.teroDirectory}/.lock`;
-      let pid = '?';
-      if (existsSync(lockPath)) {
-        try { pid = readFileSync(lockPath, 'utf-8').trim(); } catch { }
+    const lockPath = `${this.teroDirectory}/.lock`;
+    const tryAcquire = (): boolean => {
+      try {
+        this.lockFd = openSync(lockPath, 'wx'); // exclusive create — fails if exists
+        writeSync(this.lockFd, String(process.pid));
+        return true;
+      } catch {
+        return false;
       }
-      if (pid === String(process.pid)) {
-        throw new Error(`Another Tero instance is already using '${this.teroDirectory}'. ` +
-          'Destroy the existing instance first, or delete the .lock file if the previous process crashed.');
-      }
-      throw new Error(`Data directory locked by process ${pid}. Use fileLock: true for exclusive cross-process access.`);
+    };
+    if (tryAcquire()) return;
+    // Held by someone (or stale). Read the holder PID and check liveness.
+    let pid = '?';
+    if (existsSync(lockPath)) {
+      try { pid = readFileSync(lockPath, 'utf-8').trim(); } catch { /* unreadable */ }
     }
+    const pidNum = parseInt(pid, 10);
+    if (Number.isInteger(pidNum) && pidNum > 0 && pidNum !== process.pid) {
+      let alive = true;
+      try { process.kill(pidNum, 0); } catch (e: any) {
+        // ESRCH = no such process → stale lock from a crashed holder.
+        // EPERM = process exists but is owned by another user → treat as alive.
+        alive = e?.code === 'EPERM';
+      }
+      if (!alive) {
+        // Reclaim the stale lock (crashed previous owner) and retry once.
+        try { unlinkSync(lockPath); } catch { /* racing holder */ }
+        if (tryAcquire()) return;
+      }
+      if (alive) {
+        throw new Error(`Data directory '${this.teroDirectory}' is locked by live process ${pidNum}. ` +
+          'Stop that process (or use a different directory) and retry.');
+      }
+    }
+    if (pid === String(process.pid)) {
+      throw new Error(`Another Tero instance in THIS process is already using '${this.teroDirectory}'. ` +
+        'Destroy the existing instance before constructing a new one.');
+    }
+    throw new Error(`Data directory '${this.teroDirectory}' is locked (holder PID: ${pid}). ` +
+      `If the holder crashed, delete '${lockPath}' and retry.`);
   }
 
   private releaseFileLock(): void {
@@ -1358,11 +1433,12 @@ export class Tero {
    * ```
    */
   getNewId(prefix: string): string {
-    const PROCESS_UNIQUE = randomBytes(5);
     const buffer = Buffer.allocUnsafe(12);
-    let index = ~~(Math.random() * 0xffffff);
     const time = ~~(Date.now() / 1000);
-    const inc = (index = (index + 1) % 0xffffff);
+    // Module-level monotonic counter (see PROCESS_UNIQUE above) — guarantees
+    // within-process uniqueness even for ids minted in the same millisecond,
+    // with zero crypto calls on this path.
+    const inc = (idCounter = (idCounter + 1) % 0xffffff);
 
     // 4-byte timestamp (seconds since Unix epoch)
     buffer.writeUInt32BE(time, 0);

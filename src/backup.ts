@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync } from "fs";
 import { join, basename, relative, dirname, sep } from "path";
-import tar from "tar";
+import { create as tarCreate } from "tar";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { CronJob } from "cron";
@@ -93,6 +93,15 @@ export interface CloudStorageConfig {
   pathPrefix?: string; // Optional path prefix in bucket
 }
 
+/** Injectable logger for BackupManager. Pass your own to route backup logs into
+ *  your observability stack; pass 'silent' to disable them entirely. Default
+ *  (undefined) keeps console output for backwards compatibility. */
+export type BackupLogger = {
+  info: (...args: any[]) => void;
+  warn: (...args: any[]) => void;
+  error: (...args: any[]) => void;
+};
+
 export interface BackupConfig {
   interval?: string; // '1h', '6h', '1d', '7d'
   retention?: string; // '7d', '30d', '90d', '1y'
@@ -102,6 +111,7 @@ export interface BackupConfig {
   compression?: boolean; // For individual files
   includeMetadata?: boolean; // Include file timestamps, sizes, etc. (optional - adds overhead)
   metadataUse?: 'verification' | 'audit' | 'recovery' | 'none'; // What to use metadata for
+  logger?: 'silent' | BackupLogger; // Injected logger; default = console
 }
 
 export interface BackupMetadata {
@@ -126,10 +136,15 @@ export class BackupManager {
   private scheduledBackups: Map<string, CronJob> = new Map();
   private config: BackupConfig;
   private dbPath: string;
+  /** Injected or default logger (see BackupConfig.logger). */
+  private log: BackupLogger;
 
   constructor(dbPath: string, config: BackupConfig) {
     this.dbPath = dbPath;
     this.config = config;
+    this.log = config.logger === 'silent'
+      ? { info: () => {}, warn: () => {}, error: () => {} }
+      : (config.logger ?? console);
 
     if (config.cloudStorage) {
       this.initializeCloudStorage(config.cloudStorage);
@@ -154,7 +169,7 @@ export class BackupManager {
 
       this.s3Client = new S3Client(clientConfig);
     } catch (error) {
-      throw new Error(`Failed to initialize cloud storage: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to initialize cloud storage: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -264,7 +279,7 @@ export class BackupManager {
 
       return files;
     } catch (error) {
-      throw new Error(`Failed to get JSON files: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to get JSON files: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -292,7 +307,7 @@ export class BackupManager {
       // 2-level hash-prefix partition dirs are preserved in the archive.
       // (was: jsonFiles.map(f => f.name) — broke when files moved to XX/YY/key.json)
       const fileList = jsonFiles.map(f => f.path.slice(this.dbPath.length + 1));
-      await tar.create(
+      await tarCreate(
         {
           file: backupPath,
           cwd: this.dbPath,
@@ -316,7 +331,7 @@ export class BackupManager {
 
       return { filePath: backupPath, metadata };
     } catch (error) {
-      throw new Error(`Failed to create archive backup: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to create archive backup: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -401,7 +416,7 @@ export class BackupManager {
 
       return { files: backedUpFiles, metadata };
     } catch (error) {
-      throw new Error(`Failed to create individual backup: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to create individual backup: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -431,7 +446,7 @@ export class BackupManager {
 
       await upload.done();
     } catch (error) {
-      throw new Error(`Failed to upload to cloud storage: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to upload to cloud storage: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -452,7 +467,7 @@ export class BackupManager {
 
       await Promise.all(uploadPromises);
     } catch (error) {
-      throw new Error(`Failed to upload directory to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to upload directory to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -476,7 +491,7 @@ export class BackupManager {
 
       await Promise.all(uploadPromises);
     } catch (error) {
-      throw new Error(`Failed to upload individual files to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to upload individual files to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -488,7 +503,7 @@ export class BackupManager {
 
   async performBackup(): Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }> {
     try {
-      console.log(`🔄 Starting ${this.config.format} backup for ${this.dbPath}...`);
+      this.log.info(`🔄 Starting ${this.config.format} backup for ${this.dbPath}...`);
 
       let metadata: BackupMetadata;
       let cloudUploaded = false;
@@ -502,10 +517,10 @@ export class BackupManager {
           const cloudKey = this.getCloudKey(basename(filePath));
           await this.uploadToCloud(filePath, cloudKey);
           cloudUploaded = true;
-          console.log(`☁️ Uploaded archive backup to cloud: ${cloudKey}`);
+          this.log.info(`☁️ Uploaded archive backup to cloud: ${cloudKey}`);
         }
 
-        console.log(`✅ Archive backup completed: ${filePath}`);
+        this.log.info(`✅ Archive backup completed: ${filePath}`);
       } else {
         const { files, metadata: backupMetadata } = await this.createIndividualBackup();
         metadata = backupMetadata;
@@ -514,10 +529,10 @@ export class BackupManager {
         if (this.config.cloudStorage && this.s3Client) {
           await this.uploadIndividualFilesToCloud(files[0].split('/').slice(0, -1).join('/'));
           cloudUploaded = true;
-          console.log(`☁️ Uploaded individual backup to cloud using key-based storage`);
+          this.log.info(`☁️ Uploaded individual backup to cloud using key-based storage`);
         }
 
-        console.log(`✅ Individual backup completed: ${files.length} files`);
+        this.log.info(`✅ Individual backup completed: ${files.length} files`);
       }
 
       // Clean up old backups based on retention policy
@@ -527,7 +542,7 @@ export class BackupManager {
 
       return { success: true, metadata, cloudUploaded };
     } catch (error) {
-      console.error(`❌ Backup failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.log.error(`❌ Backup failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       return {
         success: false,
         metadata: {
@@ -552,18 +567,26 @@ export class BackupManager {
       const cutoffDate = new Date(Date.now() - retentionMs);
 
       const prefix = this.getCloudKey('');
-      const listCommand = new ListObjectsV2Command({
-        Bucket: this.config.cloudStorage.bucket,
-        Prefix: prefix
-      });
+      // Paginate ALL pages — a single ListObjectsV2 returns at most 1000 keys,
+      // so with more objects than that, retention silently stopped deleting
+      // everything past the first page (unbounded bucket growth + cost).
+      const oldObjects: any[] = [];
+      let token: string | undefined;
+      do {
+        const response: any = await this.s3Client.send(new ListObjectsV2Command({
+          Bucket: this.config.cloudStorage.bucket,
+          Prefix: prefix,
+          ContinuationToken: token,
+        }));
+        if (response.Contents) {
+          for (const obj of response.Contents) {
+            if (obj.Key && obj.LastModified && obj.LastModified < cutoffDate) oldObjects.push(obj);
+          }
+        }
+        token = response.IsTruncated ? response.NextContinuationToken : undefined;
+      } while (token);
 
-      const response = await this.s3Client.send(listCommand);
-
-      if (response.Contents) {
-        const oldObjects = response.Contents.filter((obj: any) =>
-          obj.LastModified && obj.LastModified < cutoffDate
-        );
-
+      if (oldObjects.length > 0) {
         const deletePromises = oldObjects.map((obj: any) => {
           if (obj.Key) {
             return this.s3Client!.send(new DeleteObjectCommand({
@@ -577,11 +600,11 @@ export class BackupManager {
         await Promise.all(deletePromises);
 
         if (oldObjects.length > 0) {
-          console.log(`🗑️ Cleaned up ${oldObjects.length} old backup(s) from cloud storage`);
+          this.log.info(`🗑️ Cleaned up ${oldObjects.length} old backup(s) from cloud storage`);
         }
       }
     } catch (error) {
-      console.warn(`⚠️ Failed to cleanup old backups: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.log.warn(`⚠️ Failed to cleanup old backups: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -598,7 +621,7 @@ export class BackupManager {
       }
 
       const performScheduledBackup = async () => {
-        console.log(`⏰ Scheduled backup triggered (${config.interval} interval)`);
+        this.log.info(`⏰ Scheduled backup triggered (${config.interval} interval)`);
         await this.performBackup();
       };
 
@@ -613,10 +636,10 @@ export class BackupManager {
 
       this.scheduledBackups.set(scheduleId, cronJob);
 
-      console.log(`📅 Backup scheduled with cron: ${cronExpression} (${config.interval} interval), ${config.retention || this.config.retention} retention`);
+      this.log.info(`📅 Backup scheduled with cron: ${cronExpression} (${config.interval} interval), ${config.retention || this.config.retention} retention`);
       return scheduleId;
     } catch (error) {
-      throw new Error(`Failed to schedule backup: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to schedule backup: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
 
@@ -625,7 +648,7 @@ export class BackupManager {
     if (cronJob) {
       cronJob.stop();
       this.scheduledBackups.delete(scheduleId);
-      console.log(`❌ Cancelled scheduled backup: ${scheduleId}`);
+      this.log.info(`❌ Cancelled scheduled backup: ${scheduleId}`);
       return true;
     }
     return false;
@@ -791,7 +814,7 @@ export class BackupManager {
     // Clear the reference too — the automatic initial-checkpoint retry loop
     // checks it and must stop retrying after destroy.
     if (this.liveShipper) { this.liveShipper.stop(); this.liveShipper = undefined; }
-    console.log('🛑 BackupManager destroyed, all scheduled backups cancelled');
+    this.log.info('🛑 BackupManager destroyed, all scheduled backups cancelled');
   }
 
   private liveCloudPrefix(nodeId: string): string {
@@ -852,7 +875,7 @@ export class BackupManager {
     this.lastCheckpointError = undefined;
     this.liveShipper = new WalShipper({ wal: engine.getWAL(), upload: (k, b) => this.uploadBytes(k, b, 'application/gzip'), prefix, intervalMs });
     this.liveShipper.start();
-    console.log(`🚀 Tero live backup enabled: nodeId=${nodeId} intervalMs=${intervalMs} RPO≤1s`);
+    this.log.info(`🚀 Tero live backup enabled: nodeId=${nodeId} intervalMs=${intervalMs} RPO≤1s`);
     // CRITICAL: take the initial FULL checkpoint automatically. Without it, every
     // document written BEFORE enableLiveBackup() is unrestorable until the first
     // manual liveCheckpointToBucket() — a crash in that window loses all prior data.
@@ -880,7 +903,7 @@ export class BackupManager {
   disableLiveBackup(): void {
     if (!this.liveShipper) return;
     this.liveShipper.stop(); this.liveShipper = undefined;
-    console.log('🛑 Tero live backup disabled');
+    this.log.info('🛑 Tero live backup disabled');
   }
 
   getLiveBackupStatus(): LiveBackupStatus {
@@ -986,7 +1009,7 @@ export class BackupManager {
   async restoreLiveToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number } = {}): Promise<RestoreLiveResult> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
     if (existsSync(targetDir) && readdirSync(targetDir).some(f => !f.startsWith('.'))) {
-      console.warn(`⚠️  restoreLiveToDirectory: target '${targetDir}' is not empty — restored state will be merged over existing files.`);
+      this.log.warn(`⚠️  restoreLiveToDirectory: target '${targetDir}' is not empty — restored state will be merged over existing files.`);
     }
     mkdirSync(targetDir, { recursive: true });
     const pit = opts.pointInTime ?? Infinity;
@@ -1040,7 +1063,7 @@ export class BackupManager {
       const m = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
       const s = parseInt(m[1]), e = parseInt(m[2]);
       if (prevEnd >= 0 && s - prevEnd - 1 > 50) {
-        console.warn(`⚠️  Live-backup WAL gap: ${s - prevEnd - 1} LSNs missing between shipped segments (bucket outage longer than local WAL retention?). Writes in the gap may be unrecoverable.`);
+        this.log.warn(`⚠️  Live-backup WAL gap: ${s - prevEnd - 1} LSNs missing between shipped segments (bucket outage longer than local WAL retention?). Writes in the gap may be unrecoverable.`);
       }
       prevEnd = Math.max(prevEnd, e);
     }
@@ -1075,7 +1098,7 @@ export class BackupManager {
           } else if (e.operation === 'ROLLBACK') { pending.delete(e.transactionId); }
         }
         segmentsReplayed++;
-      } catch (e) { console.warn(`⚠️  Skipping corrupt WAL segment ${wk}: ${e instanceof Error ? e.message : e}`); }
+      } catch (e) { this.log.warn(`⚠️  Skipping corrupt WAL segment ${wk}: ${e instanceof Error ? e.message : e}`); }
     }
     return { nodeId, docsRestored, segmentsReplayed, baseLsn, lastLsn };
   }
