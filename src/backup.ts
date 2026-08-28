@@ -926,6 +926,28 @@ export class BackupManager {
     return keys;
   }
 
+  private async listPrefixWithMeta(prefix: string): Promise<Array<{ key: string; lastModified: Date }>> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    const out: Array<{ key: string; lastModified: Date }> = [];
+    let token: string | undefined;
+    do {
+      const resp = await this.s3Client.send(new ListObjectsV2Command({ Bucket: this.config.cloudStorage.bucket, Prefix: prefix, ContinuationToken: token }));
+      if (resp.Contents) for (const o of resp.Contents) if (o.Key) out.push({ key: o.Key, lastModified: o.LastModified ?? new Date(0) });
+      token = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+    } while (token);
+    return out;
+  }
+
+  private async deleteObject(key: string): Promise<void> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    try {
+      await this.s3Client.send(new DeleteObjectCommand({ Bucket: this.config.cloudStorage.bucket, Key: key }));
+    } catch (e: any) {
+      if (e?.name === 'NoSuchKey' || e?.Code === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) return;
+      throw e;
+    }
+  }
+
   enableLiveBackup(engine: ACIDStorageEngine, opts: LiveBackupOptions): void {
     if (opts.consistency !== 'per-second') throw new Error("Tero live backup only supports consistency: 'per-second' (RPO ≤ 1s). Other levels are not offered.");
     if (this.liveShipper) return;
@@ -1068,6 +1090,10 @@ export class BackupManager {
       if (existsSync(filePath)) {
         await this.uploadBytes(`${dataPrefix}${rel}`, readFileSync(filePath), 'application/json');
         uploaded++;
+        // Delete stale tombstone if this key was previously deleted then recreated
+        // under the same baseTs. Without this, bucket holds both data and
+        // .deleted and the old restore filter would drop the recreated doc.
+        try { await this.deleteObject(`${dataPrefix}${rel}.deleted`); } catch {}
       } else {
         await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
         tombstoned++;
@@ -1108,25 +1134,43 @@ export class BackupManager {
     let baseLsn: number | null = null;
     if (latest) {
       baseLsn = latest.baseLsn ?? null;
-      const dataKeys = await this.listPrefix(`${prefix}checkpoint/${latest.baseTs}/data/`);
-      
-      const tombstoneKeyNames = new Set<string>();
-      const activeDataKeys: string[] = [];
-
-      for (const dk of dataKeys) {
-        if (dk.endsWith('.deleted')) {
-          const keyName = basename(dk).replace(/\.json\.deleted$/, '');
-          tombstoneKeyNames.add(keyName);
-        } else if (dk.endsWith('.json')) {
-          activeDataKeys.push(dk);
+      const dataWithMeta = await this.listPrefixWithMeta(`${prefix}checkpoint/${latest.baseTs}/data/`);
+      const tombstoneMeta = new Map<string, Date>();
+      const activeMeta = new Map<string, { key: string; lastModified: Date }>();
+      for (const { key, lastModified } of dataWithMeta) {
+        if (key.endsWith('.deleted')) {
+          const keyName = basename(key).replace(/\.json\.deleted$/, '');
+          const prev = tombstoneMeta.get(keyName);
+          if (!prev || lastModified > prev) tombstoneMeta.set(keyName, lastModified);
+        } else if (key.endsWith('.json')) {
+          const keyName = basename(key).replace(/\.json$/, '');
+          const prev = activeMeta.get(keyName);
+          if (!prev || lastModified > prev.lastModified) activeMeta.set(keyName, { key, lastModified });
         }
       }
-
-      // Filter out any active key that has a tombstone so it is never downloaded or resurrected
-      const keysToDownload = activeDataKeys.filter(dk => {
-        const keyName = basename(dk).replace(/\.json$/, '');
-        return !tombstoneKeyNames.has(keyName);
-      });
+      // Resolve tombstone vs data by recency: newer wins. This handles
+      // delete→recreate under same baseTs (data newer) vs legit delete
+      // (tombstone newer than the full-checkpoint data), and also heals
+      // legacy buckets that contain both due to the pre-fix bug.
+      const keysToDownload: string[] = [];
+      const finalTombstones = new Set<string>();
+      for (const [keyName, active] of activeMeta) {
+        const tombTime = tombstoneMeta.get(keyName);
+        if (tombTime) {
+          if (active.lastModified > tombTime) {
+            keysToDownload.push(active.key);
+          } else {
+            finalTombstones.add(keyName);
+          }
+        } else {
+          keysToDownload.push(active.key);
+        }
+      }
+      for (const [keyName] of tombstoneMeta) {
+        if (!activeMeta.has(keyName)) finalTombstones.add(keyName);
+      }
+      // Keep compat names for later local-delete loop
+      const tombstoneKeyNames = finalTombstones;
 
       // Pool downloads — sequential GETs make a 50k-doc restore take ~12 minutes.
       await pooledMap(keysToDownload, 16, async (dk) => {
