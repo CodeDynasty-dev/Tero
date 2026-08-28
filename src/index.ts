@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, read
 import { join } from "path";
 import { ACIDStorageEngine, SynchronousMode } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
-import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, RestoreLiveResult } from "./backup.js";
+import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
 import { randomBytes } from "node:crypto";
 import QuickLRU from "quick-lru";
@@ -193,6 +193,11 @@ export class Tero {
    */
   constructor(config?: TeroConfig) {
     try {
+      // Validate live-backup requirements BEFORE creating any resources, so a
+      // misconfiguration can never leak a half-constructed engine or timers.
+      if (config?.liveBackup && !config.backup?.cloudStorage) {
+        throw new Error('config.liveBackup requires config.backup with cloudStorage configured — live backup needs a bucket.');
+      }
       const rawDirectory = (config as any)?.Directory || config?.directory;
       const { cacheSize, synchronous, commitIntervalMs, dataFlushIntervalMs } = config || {};
 
@@ -238,7 +243,10 @@ export class Tero {
         this.configureBackup(config.backup);
       }
       // v2: enable per-second live WAL shipping if configured.
-      if (config?.liveBackup && this.backupManager) {
+      if (config?.liveBackup) {
+        if (!this.backupManager) {
+          throw new Error('config.liveBackup requires config.backup with cloudStorage configured.');
+        }
         this.enableLiveBackup(config.liveBackup);
       }
     } catch (error) {
@@ -1007,10 +1015,12 @@ export class Tero {
     return this.backupManager.getLiveBackupStatus();
   }
 
-  /** Take an incremental checkpoint (uploads only dirty docs). First call = full upload. */
-  async liveCheckpointToBucket(opts?: { tag?: string }): Promise<{ uploadedDocs: number; fullUpload: boolean; duration: number }> {
+  /** Take a checkpoint: FULL on the first call after enable (also taken
+   *  automatically), INCREMENTAL (only dirty docs) on subsequent calls. */
+  async liveCheckpointToBucket(opts?: { tag?: string }): Promise<LiveCheckpointResult> {
     if (!this.backupManager) throw new Error('Backup not configured. Call configureBackup() first.');
-    this.acidEngine.flushCommittedBuffer();
+    // No flush here on purpose: the manager captures the conservative baseLsn
+    // FIRST and flushes after — flushing before capture would be the wrong order.
     return await this.backupManager.liveCheckpointToBucket(opts);
   }
 
@@ -1020,9 +1030,15 @@ export class Tero {
     cloudStorage: CloudStorageConfig;
     nodeId?: string;
     pointInTime?: number;
+    /** Name of the ORIGINAL database directory in the bucket, if restoring to a
+     *  new directory name (disaster-recovery / staging restores). Defaults to `directory`. */
+    sourceDirectory?: string;
   }): Promise<Tero> {
     const sanitized = opts.directory.replace(/[^a-zA-Z0-9_\-\/]/g, '') || 'TeroDB';
-    const tempMgr = new BackupManager(sanitized, { format: 'individual', cloudStorage: opts.cloudStorage });
+    const source = (opts.sourceDirectory ?? opts.directory).replace(/[^a-zA-Z0-9_\-\/]/g, '') || 'TeroDB';
+    // The temp manager is built with the SOURCE name so bucket prefixes resolve;
+    // files are written into the sanitized TARGET directory.
+    const tempMgr = new BackupManager(source, { format: 'individual', cloudStorage: opts.cloudStorage });
     try {
       await tempMgr.restoreLiveToDirectory(sanitized, { nodeId: opts.nodeId, pointInTime: opts.pointInTime });
     } finally {
