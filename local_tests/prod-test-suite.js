@@ -56,8 +56,10 @@ async function suite1() {
 
     await test('get returns document after create', async () => {
         const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        await db.create('user', { name: 'Alice', email: 'a@b.com' });
-        const r = await db.get('user');
+        // Use unique key — suite reuses TEST_DIR, previous test left 'user' on disk.
+        // With correct duplicate detection (existsSync on miss) this must be distinct.
+        await db.create('user_get', { name: 'Alice', email: 'a@b.com' });
+        const r = await db.get('user_get');
         assert(r && r.name === 'Alice' && r.email === 'a@b.com', 'get returned wrong data');
         db.destroy();
     });
@@ -119,15 +121,16 @@ async function suite2() {
 
     await test('sequential updates preserve fields after cache promotion', async () => {
         const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        await db.create('doc', { base: true });
+        // Unique key — previous test in this suite left 'doc' with 50 fields.
+        await db.create('doc2', { base: true });
         // First update writes field0
-        await db.update('doc', { field0: 1 });
+        await db.update('doc2', { field0: 1 });
         // Force a read to populate cache with promoted entry
-        const afterFirst = await db.get('doc');
+        const afterFirst = await db.get('doc2');
         assert(afterFirst.field0 === 1, 'field0 should persist after first read');
         // Second update writes field1 — must NOT lose field0 in cache
-        await db.update('doc', { field1: 2 });
-        const afterSecond = await db.get('doc');
+        await db.update('doc2', { field1: 2 });
+        const afterSecond = await db.get('doc2');
         assert(afterSecond.field0 === 1, 'field0 lost after second update (cache poisoning)');
         assert(afterSecond.field1 === 2, 'field1 should be 2');
         assert(afterSecond.base === true, 'base should still exist');
@@ -200,16 +203,18 @@ async function suite3() {
 
     await test('money transfer with insufficient funds rolls back', async () => {
         const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        await db.create('savings', { balance: 100 });
-        await db.create('checking', { balance: 50 });
+        // Unique keys — previous test left savings=700 checking=800; correct
+        // create() now returns false for duplicate instead of overwriting.
+        await db.create('savings2', { balance: 100 });
+        await db.create('checking2', { balance: 50 });
         try {
-            await db.transferMoney('savings', 'checking', 200);
+            await db.transferMoney('savings2', 'checking2', 200);
             throw new Error('should have thrown');
         } catch (e) {
             assert(e.message.includes('Insufficient'), 'wrong error');
         }
-        assert((await db.get('savings')).balance === 100, 'savings unchanged');
-        assert((await db.get('checking')).balance === 50, 'checking unchanged');
+        assert((await db.get('savings2')).balance === 100, 'savings unchanged');
+        assert((await db.get('checking2')).balance === 50, 'checking unchanged');
         db.destroy();
     });
 
@@ -443,11 +448,12 @@ async function suite8() {
 
     await test('clearCache forces disk re-read', async () => {
         const db = new Tero({ directory: TEST_DIR, cacheSize: 100 });
-        await db.create('doc', { v: 1 });
-        await db.get('doc'); // populate cache
+        // Unique key — suite reuses TEST_DIR, previous test left 'doc' with a/b.
+        await db.create('doc_cache', { v: 1 });
+        await db.get('doc_cache'); // populate cache
         db.forceCheckpoint(); // flush to disk
         db.clearCache();
-        const r = await db.get('doc');
+        const r = await db.get('doc_cache');
         assert(r && r.v === 1, 'after clearCache, data should still be readable from disk');
         db.destroy();
     });
