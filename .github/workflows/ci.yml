@@ -13,6 +13,23 @@ jobs:
       matrix:
         node-version: [18.x, 20.x, 22.x]
 
+    services:
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+          - 9001:9001
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        # data dir is ephemeral; no volume needed in CI
+        args: server /data --console-address ":9001"
+
     steps:
     - uses: actions/checkout@v4
 
@@ -29,3 +46,21 @@ jobs:
 
     - name: Run Test Suites
       run: npm run ci
+
+    - name: Wait for MinIO
+      run: |
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+            echo "MinIO ready"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "MinIO failed to start"
+        exit 1
+
+    - name: Run live-backup tests (MinIO — edge RPO 1s)
+      run: |
+        S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=tero-live-test AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin node local_tests/live-backup-test.js
+        S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=tero-live-backup-test AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin node local_tests/s3-live-backup-test.js
+        echo "live-backup MinIO green"

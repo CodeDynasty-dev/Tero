@@ -54,10 +54,12 @@ const ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const PATH_PREFIX = process.env.S3_PATH_PREFIX || 'tero-backups';
 
-// NOTE: no dots in directory names — Tero.create() sanitizes directory paths
-// and strips characters outside [a-zA-Z0-9_-/]. The restore directory must
-// share the BASENAME of the primary directory because Tero derives its cloud
-// key prefix from basename(directory): <pathPrefix>/<dbName>/...
+// Stable bucket subprefix: getDbName() hashes the full directory path to avoid
+// basename collisions (e.g. /tmp/a/TeroDB vs /tmp/b/TeroDB). A restore to a
+// different local path must therefore pin the bucket prefix via dbName, otherwise
+// PRIMARY_DIR and RESTORE_DIR would hash to different prefixes and hydrate would
+// look in the wrong bucket location. This is the correct edge-restore pattern.
+const DB_NAME = 'primary';
 const ROOT = resolve('tmp_s3_live_test');
 const PRIMARY_DIR = join(ROOT, 'primary');
 const RESTORE_PARENT = join(ROOT, 'restore_node');
@@ -71,6 +73,7 @@ const cloudStorage = {
     secretAccessKey: SECRET_ACCESS_KEY,
     ...(ENDPOINT ? { endpoint: ENDPOINT } : {}),
     pathPrefix: PATH_PREFIX,
+    dbName: DB_NAME,
 };
 
 // Raw S3 client used ONLY for independent verification of what Tero wrote.
@@ -243,7 +246,7 @@ await check('checkpointAndBackupToBucket() rotates WAL + uploads segment', async
 // 4. Independent raw-S3 verification of the bucket layout
 // ---------------------------------------------------------------------------
 
-const dbPrefix = `${PATH_PREFIX}/primary`;
+const dbPrefix = `${PATH_PREFIX}/${DB_NAME}`;
 
 await check('bucket contains data files, WAL segments and MANIFEST.json', async () => {
     const keys = await listBucketKeys(dbPrefix);
@@ -282,16 +285,19 @@ await check('fresh node hydrates full state from bucket (Tero.create mode: all)'
             continueOnError: true,
         },
     });
+    try {
+        // Every document written on the live node must be identical after hydration.
+        for (const [key, data] of expected) {
+            const restored = await db2.get(key);
+            assert.deepEqual(restored, data, `restored document "${key}" differs from live state`);
+        }
 
-    // Every document written on the live node must be identical after hydration.
-    for (const [key, data] of expected) {
-        const restored = await db2.get(key);
-        assert.deepEqual(restored, data, `restored document "${key}" differs from live state`);
+        // Post-backup-1 state must be present too (proves snapshot #2 captured it).
+        assert.equal((await db2.get('user1')).age, 31, 'update made after backup #1 should be in the bucket snapshot');
+        assert.ok(await db2.get('user4'), 'document created after backup #1 should be in the bucket snapshot');
+    } finally {
+        await db2.close();
     }
-
-    // Post-backup-1 state must be present too (proves snapshot #2 captured it).
-    assert.equal((await db2.get('user1')).age, 31, 'update made after backup #1 should be in the bucket snapshot');
-    assert.ok(await db2.get('user4'), 'document created after backup #1 should be in the bucket snapshot');
 })();
 
 // ---------------------------------------------------------------------------
@@ -307,8 +313,12 @@ await check('hydrate mode missing is idempotent on an already-restored node', as
             mode: 'missing',
         },
     });
-    const doc = await db3.get('user2');
-    assert.deepEqual(doc, expected.get('user2'), 'user2 should still be intact after incremental hydration');
+    try {
+        const doc = await db3.get('user2');
+        assert.deepEqual(doc, expected.get('user2'), 'user2 should still be intact after incremental hydration');
+    } finally {
+        await db3.close();
+    }
 })();
 
 // ---------------------------------------------------------------------------
