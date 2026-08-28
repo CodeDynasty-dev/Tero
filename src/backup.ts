@@ -1,9 +1,47 @@
-import { createReadStream, createWriteStream, existsSync, readdirSync, statSync } from "fs";
-import { join, basename } from "path";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync } from "fs";
+import { join, basename, relative, dirname } from "path";
 import tar from "tar";
-import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { CronJob } from "cron";
+import { gzipSync, gunzipSync } from "zlib";
+import { createHash, randomUUID } from "crypto";
+import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions } from "./acid-engine.js";
+
+/** LSN padded to 16 digits so lexicographic object-key sort == numeric LSN sort. */
+function padLsn(lsn: number): string {
+  return lsn.toString().padStart(16, '0');
+}
+
+export interface LiveBackupStatus {
+  state: 'healthy' | 'degraded' | 'stopped';
+  nodeId: string;
+  intervalMs: number;
+  lastShippedLsn: number;
+  lastShipAt: number;
+  secondsSinceLastShip: number;
+  segmentsShipped: number;
+  checkpointsTaken: number;
+  errorCount: number;
+  lastError?: string;
+}
+
+export interface LiveBackupOptions {
+  /** The only consistency level live backup offers: RPO ≤ 1 second of committed writes. */
+  consistency: 'per-second';
+  /** Ship interval in ms. Default 1000. Minimum 250. */
+  intervalMs?: number;
+  /** Stable identity for this node in the bucket. Persisted to <dbPath>/.tero-node-id. */
+  nodeId?: string;
+}
+
+export interface RestoreLiveResult {
+  nodeId: string;
+  docsRestored: number;
+  segmentsReplayed: number;
+  baseLsn: number | null;
+  lastLsn: number;
+}
 
 export interface CloudStorageConfig {
   provider: 'aws-s3' | 'cloudflare-r2';
@@ -697,12 +735,292 @@ export class BackupManager {
     await this.s3Client.send(cmd);
   }
 
+  // ===== Live backup (per-second WAL shipping) — fields =====
+  private liveShipper?: WalShipper;
+  private liveNodeId?: string;
+  private liveEngine?: ACIDStorageEngine;
+  private livePrefix?: string;
+  private liveCheckpoints = 0;
+
   destroy(): void {
-    // Cancel all scheduled backups
-    for (const [id, cronJob] of this.scheduledBackups) {
-      cronJob.stop();
-    }
+    for (const [id, cronJob] of this.scheduledBackups) cronJob.stop();
     this.scheduledBackups.clear();
+    if (this.liveShipper) this.liveShipper.stop();
     console.log('🛑 BackupManager destroyed, all scheduled backups cancelled');
+  }
+
+  private liveCloudPrefix(nodeId: string): string {
+    const base = this.config.cloudStorage?.pathPrefix || 'tero-backups';
+    return `${base}/${basename(this.dbPath)}/nodes/${nodeId}/`;
+  }
+
+  private async uploadBytes(key: string, body: Buffer, contentType = 'application/octet-stream'): Promise<void> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    await this.s3Client.send(new PutObjectCommand({
+      Bucket: this.config.cloudStorage.bucket, Key: key, Body: body, ContentType: contentType,
+      Metadata: { 'backup-timestamp': new Date().toISOString(), 'source-db': basename(this.dbPath) },
+    }));
+  }
+
+  private async downloadBytes(key: string): Promise<Buffer> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    const resp = await this.s3Client.send(new GetObjectCommand({ Bucket: this.config.cloudStorage.bucket, Key: key }));
+    if (!resp.Body) throw new Error(`Empty body for ${key}`);
+    const chunks: Buffer[] = [];
+    for await (const c of resp.Body as any) chunks.push(typeof c === 'string' ? Buffer.from(c) : c);
+    return Buffer.concat(chunks);
+  }
+
+  private async readJsonOrDefault<T>(key: string): Promise<T | null> {
+    try { return JSON.parse((await this.downloadBytes(key)).toString('utf8')) as T; }
+    catch (e) { if (e instanceof Error && (e.name === 'NoSuchKey' || /NoSuchKey|404|not found|does not exist/i.test(e.message))) return null; throw e; }
+  }
+
+  private async listPrefix(prefix: string): Promise<string[]> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    const keys: string[] = [];
+    let token: string | undefined;
+    do {
+      const resp = await this.s3Client.send(new ListObjectsV2Command({ Bucket: this.config.cloudStorage.bucket, Prefix: prefix, ContinuationToken: token }));
+      if (resp.Contents) for (const o of resp.Contents) if (o.Key) keys.push(o.Key);
+      token = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+    } while (token);
+    return keys;
+  }
+
+  enableLiveBackup(engine: ACIDStorageEngine, opts: LiveBackupOptions): void {
+    if (opts.consistency !== 'per-second') throw new Error("Tero live backup only supports consistency: 'per-second' (RPO ≤ 1s). Other levels are not offered.");
+    if (this.liveShipper) return;
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured — call configureBackup() with cloudStorage first.');
+    const intervalMs = Math.max(250, opts.intervalMs ?? 1000);
+    let nodeId = opts.nodeId;
+    const idFile = join(this.dbPath, '.tero-node-id');
+    if (!nodeId) { try { nodeId = readFileSync(idFile, 'utf8').trim(); } catch { nodeId = randomUUID().replace(/-/g, '').slice(0, 16); } }
+    try { writeFileSync(idFile, nodeId, 'utf8'); } catch {}
+    const prefix = this.liveCloudPrefix(nodeId);
+    this.liveNodeId = nodeId; this.liveEngine = engine; this.livePrefix = prefix;
+    this.liveShipper = new WalShipper({ wal: engine.getWAL(), upload: (k, b) => this.uploadBytes(k, b, 'application/gzip'), prefix, intervalMs });
+    this.liveShipper.start();
+    console.log(`🚀 Tero live backup enabled: nodeId=${nodeId} intervalMs=${intervalMs} RPO≤1s`);
+  }
+
+  disableLiveBackup(): void {
+    if (!this.liveShipper) return;
+    this.liveShipper.stop(); this.liveShipper = undefined;
+    console.log('🛑 Tero live backup disabled');
+  }
+
+  getLiveBackupStatus(): LiveBackupStatus {
+    const s = this.liveShipper?.status;
+    return {
+      state: s?.state ?? 'stopped', nodeId: this.liveNodeId ?? 'unknown', intervalMs: this.liveShipper?.intervalMs ?? 0,
+      lastShippedLsn: s?.lastShippedLsn ?? 0, lastShipAt: s?.lastShipAt ?? 0,
+      secondsSinceLastShip: s?.lastShipAt ? Math.round((Date.now() - s.lastShipAt) / 1000) : 0,
+      segmentsShipped: s?.segmentsShipped ?? 0, checkpointsTaken: this.liveCheckpoints,
+      errorCount: s?.errorCount ?? 0, lastError: s?.lastError,
+    };
+  }
+
+  // __TERO_LIVE_PART2__
+
+  async liveCheckpointToBucket(_opts?: { tag?: string }): Promise<{ uploadedDocs: number; fullUpload: boolean; duration: number }> {
+    if (!this.liveEngine || !this.liveNodeId || !this.livePrefix) throw new Error('Live backup not enabled — call enableLiveBackup() first.');
+    const start = Date.now();
+    const ckptPrefix = `${this.livePrefix}checkpoint/`;
+    const latestKey = `${ckptPrefix}latest.json`;
+    const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number }>(latestKey);
+    const wal = this.liveEngine.getWAL();
+    const dirty = this.liveEngine.takeDirtyKeys();
+    if (!latest) {
+      const baseTs = new Date().toISOString().replace(/[:.]/g, '-');
+      const dataPrefix = `${ckptPrefix}${baseTs}/data/`;
+      let count = 0;
+      await walkPartitions(this.dbPath, async (filePath) => {
+        await this.uploadBytes(`${dataPrefix}${relative(this.dbPath, filePath)}`, readFileSync(filePath), 'application/json');
+        count++;
+      });
+      await this.uploadBytes(`${ckptPrefix}${baseTs}/index.json`, Buffer.from(JSON.stringify({ baseTs, baseLsn: wal.getCurrentLSN(), createdAt: new Date().toISOString(), docCount: count }, null, 2)), 'application/json');
+      await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs, baseLsn: wal.getCurrentLSN(), updatedAt: new Date().toISOString() }, null, 2)), 'application/json');
+      this.liveCheckpoints++;
+      return { uploadedDocs: count, fullUpload: true, duration: Date.now() - start };
+    }
+    const dataPrefix = `${ckptPrefix}${latest.baseTs}/data/`;
+    let uploaded = 0;
+    for (const key of dirty) {
+      const filePath = partitionedPath(this.dbPath, key);
+      if (existsSync(filePath)) { await this.uploadBytes(`${dataPrefix}${relative(this.dbPath, filePath)}`, readFileSync(filePath), 'application/json'); uploaded++; }
+    }
+    await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: wal.getCurrentLSN(), updatedAt: new Date().toISOString(), dirtyUploaded: uploaded }, null, 2)), 'application/json');
+    await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify({ nodeId: this.liveNodeId, updatedAt: new Date().toISOString(), lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0, lastCheckpointAt: new Date().toISOString() }, null, 2)), 'application/json');
+    this.liveCheckpoints++;
+    return { uploadedDocs: uploaded, fullUpload: false, duration: Date.now() - start };
+  }
+
+  // __TERO_LIVE_PART3__
+
+  async restoreLiveToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number } = {}): Promise<RestoreLiveResult> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    mkdirSync(targetDir, { recursive: true });
+    const pit = opts.pointInTime ?? Infinity;
+    let nodeId = opts.nodeId;
+    if (!nodeId) {
+      const base = this.config.cloudStorage?.pathPrefix || 'tero-backups';
+      const all = await this.listPrefix(`${base}/${basename(this.dbPath)}/nodes/`);
+      const ids = new Set<string>();
+      for (const k of all) { const m = k.match(/\/nodes\/([^/]+)\//); if (m) ids.add(m[1]); }
+      if (ids.size === 0) throw new Error('No live-backup nodes found in bucket.');
+      if (ids.size > 1) throw new Error(`Multiple nodes found: ${[...ids].join(', ')}. Specify nodeId.`);
+      nodeId = [...ids][0];
+    }
+    const prefix = this.liveCloudPrefix(nodeId);
+    const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number }>(`${prefix}checkpoint/latest.json`);
+    let docsRestored = 0;
+    let baseLsn: number | null = null;
+    if (latest) {
+      baseLsn = latest.baseLsn ?? null;
+      const dataKeys = await this.listPrefix(`${prefix}checkpoint/${latest.baseTs}/data/`);
+      for (const dk of dataKeys) {
+        if (dk.endsWith('.deleted')) continue;
+        const body = await this.downloadBytes(dk);
+        const key = basename(dk).replace(/\.json$/, '');
+        const dest = partitionedPath(targetDir, key);
+        mkdirSync(dirname(dest), { recursive: true });
+        const tmp = `${dest}.tmp.${process.pid}`;
+        writeFileSync(tmp, body); renameSync(tmp, dest);
+        docsRestored++;
+      }
+    }
+    const walKeys = (await this.listPrefix(`${prefix}wal/`))
+      .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) > (baseLsn ?? 0) : false; }).sort();
+    let segmentsReplayed = 0, lastLsn = baseLsn ?? 0;
+    const pending = new Map<string, LogEntry[]>();
+    const apply = (e: LogEntry) => {
+      if (!e.key) return;
+      const dest = partitionedPath(targetDir, e.key);
+      if (e.operation === 'WRITE') {
+        mkdirSync(dirname(dest), { recursive: true });
+        const tmp = `${dest}.tmp.${process.pid}`;
+        writeFileSync(tmp, JSON.stringify(e.afterImage ?? null)); renameSync(tmp, dest);
+      } else if (e.operation === 'DELETE') { try { unlinkSync(dest); } catch {} }
+      lastLsn = Math.max(lastLsn, e.lsn);
+    };
+    for (const wk of walKeys) {
+      try {
+        const entries: LogEntry[] = JSON.parse(gunzipSync(await this.downloadBytes(wk)).toString('utf8'));
+        for (const e of entries) {
+          if (e.timestamp > pit) continue;
+          if (e.lsn <= (baseLsn ?? 0)) continue; // already captured in checkpoint
+          if (e.operation === 'WRITE' || e.operation === 'DELETE') {
+            if (!e.transactionId) { apply(e); continue; }
+            if (!pending.has(e.transactionId)) pending.set(e.transactionId, []);
+            pending.get(e.transactionId)!.push(e);
+          } else if (e.operation === 'COMMIT') {
+            for (const w of pending.get(e.transactionId) ?? []) apply(w);
+            pending.delete(e.transactionId);
+          } else if (e.operation === 'ROLLBACK') { pending.delete(e.transactionId); }
+        }
+        segmentsReplayed++;
+      } catch (e) { console.warn(`⚠️  Skipping corrupt WAL segment ${wk}: ${e instanceof Error ? e.message : e}`); }
+    }
+    return { nodeId, docsRestored, segmentsReplayed, baseLsn, lastLsn };
+  }
+}
+
+interface ShipperStatus {
+  state: 'stopped' | 'healthy' | 'degraded';
+  lastShippedLsn: number;
+  lastShipAt: number;
+  segmentsShipped: number;
+  totalBytesShipped: number;
+  errorCount: number;
+  lastError?: string;
+}
+
+interface WalShipperDeps {
+  wal: { getLogEntries(fromLSN?: number): LogEntry[]; getCurrentLSN(): number; listArchives(): string[] };
+  upload: (key: string, body: Buffer) => Promise<void>;
+  prefix: string;
+  intervalMs: number;
+}
+
+/**
+ * Per-second WAL shipper. Reads new WRITE/DELETE entries from the WAL (current log
+ * + any rotated archives) since the last shipped LSN, gzips them, and PUTs one
+ * segment per active second-with-writes. Idle seconds produce zero PUTs.
+ * In-flight guard: overlapping ticks are skipped. Status flips to 'degraded' on
+ * any upload failure and auto-recovers on the next successful tick.
+ */
+class WalShipper {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private shipping = false;
+  private lastLsn = 0;
+  private initialized = false;
+  private shippedArchives = new Set<string>();
+  readonly status: ShipperStatus;
+  readonly intervalMs: number;
+
+  constructor(private deps: WalShipperDeps) {
+    this.intervalMs = deps.intervalMs;
+    this.status = { state: 'stopped', lastShippedLsn: 0, lastShipAt: 0, segmentsShipped: 0, totalBytesShipped: 0, errorCount: 0 };
+  }
+
+  start(): void {
+    if (this.timer) return;
+    if (!this.initialized) { this.lastLsn = this.deps.wal.getCurrentLSN(); this.initialized = true; }
+    this.status.state = 'healthy';
+    this.timer = setInterval(() => { void this.tick(); }, this.deps.intervalMs);
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    this.status.state = 'stopped';
+  }
+
+  async tick(): Promise<void> {
+    if (this.shipping) return;
+    this.shipping = true;
+    try {
+      await this.shipArchives();
+      const entries = this.deps.wal.getLogEntries(this.lastLsn).filter(e => e.operation === 'WRITE' || e.operation === 'DELETE');
+      if (entries.length === 0) { this.status.state = 'healthy'; return; }
+      const start = entries[0].lsn, end = entries[entries.length - 1].lsn;
+      const body = gzipSync(Buffer.from(JSON.stringify(entries)), { level: 1 });
+      await this.deps.upload(`${this.deps.prefix}wal/seg-${padLsn(start)}-${padLsn(end)}.json.gz`, body);
+      this.lastLsn = end;
+      this.status.lastShippedLsn = end; this.status.lastShipAt = Date.now();
+      this.status.segmentsShipped++; this.status.totalBytesShipped += body.length;
+      this.status.state = 'healthy'; this.status.lastError = undefined;
+    } catch (e) {
+      this.status.state = 'degraded'; this.status.errorCount++;
+      this.status.lastError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.shipping = false;
+    }
+  }
+
+  private async shipArchives(): Promise<void> {
+    const archives = this.deps.wal.listArchives();
+    for (const p of archives) {
+      if (this.shippedArchives.has(p)) continue;
+      try {
+        const lines = readFileSync(p, 'utf8').trim().split('\n');
+        const entries: LogEntry[] = [];
+        for (const line of lines) { try { entries.push(JSON.parse(line)); } catch {} }
+        const fresh = entries.filter(e => (e.operation === 'WRITE' || e.operation === 'DELETE') && e.lsn > this.lastLsn);
+        if (fresh.length > 0) {
+          const s = fresh[0].lsn, en = fresh[fresh.length - 1].lsn;
+          const body = gzipSync(Buffer.from(JSON.stringify(fresh)), { level: 1 });
+          await this.deps.upload(`${this.deps.prefix}wal/seg-${padLsn(s)}-${padLsn(en)}.json.gz`, body);
+          this.lastLsn = en;
+          this.status.lastShippedLsn = en; this.status.lastShipAt = Date.now();
+          this.status.segmentsShipped++; this.status.totalBytesShipped += body.length;
+        }
+        this.shippedArchives.add(p);
+      } catch (e) {
+        this.status.state = 'degraded'; this.status.errorCount++;
+        this.status.lastError = `archive:${e instanceof Error ? e.message : e}`;
+      }
+    }
   }
 }

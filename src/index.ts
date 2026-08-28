@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, read
 import { join } from "path";
 import { ACIDStorageEngine, SynchronousMode } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
-import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult } from "./backup.js";
+import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, RestoreLiveResult } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
 import { randomBytes } from "node:crypto";
 import QuickLRU from "quick-lru";
@@ -28,6 +28,8 @@ interface TeroConfig {
   hydrateOnStartup?: HydrateConfig;
   /** v2: a default backup config installed at construction time (use configureBackup() at runtime too). */
   backup?: BackupConfig;
+  /** v2: per-second live WAL shipping to the bucket. RPO ≤ 1s of committed writes. */
+  liveBackup?: LiveBackupOptions;
   /**
    * Acquire an exclusive OS-level file lock (flock) on the data directory to
    * prevent concurrent process access. Two Node.js processes opening the same
@@ -234,6 +236,10 @@ export class Tero {
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
         this.configureBackup(config.backup);
+      }
+      // v2: enable per-second live WAL shipping if configured.
+      if (config?.liveBackup && this.backupManager) {
+        this.enableLiveBackup(config.liveBackup);
       }
     } catch (error) {
       throw new Error(`Failed to initialize Tero: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -978,6 +984,51 @@ export class Tero {
     this.acidEngine.forceCheckpoint();
     this.acidEngine.getWAL().rotateLog();
     return await this.backupToBucket(options);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live Backup (per-second WAL shipping — RPO ≤ 1s)
+  // ---------------------------------------------------------------------------
+
+  /** Enable per-second live WAL shipping to the bucket. Only consistency: 'per-second'. */
+  enableLiveBackup(opts: LiveBackupOptions): void {
+    if (!this.backupManager) throw new Error('Backup not configured. Call configureBackup() first.');
+    this.backupManager.enableLiveBackup(this.acidEngine, opts);
+  }
+
+  /** Stop live WAL shipping. */
+  disableLiveBackup(): void {
+    this.backupManager?.disableLiveBackup();
+  }
+
+  /** Current live-backup health and counters. */
+  getLiveBackupStatus(): LiveBackupStatus {
+    if (!this.backupManager) return { state: 'stopped', nodeId: 'unknown', intervalMs: 0, lastShippedLsn: 0, lastShipAt: 0, secondsSinceLastShip: 0, segmentsShipped: 0, checkpointsTaken: 0, errorCount: 0 };
+    return this.backupManager.getLiveBackupStatus();
+  }
+
+  /** Take an incremental checkpoint (uploads only dirty docs). First call = full upload. */
+  async liveCheckpointToBucket(opts?: { tag?: string }): Promise<{ uploadedDocs: number; fullUpload: boolean; duration: number }> {
+    if (!this.backupManager) throw new Error('Backup not configured. Call configureBackup() first.');
+    this.acidEngine.flushCommittedBuffer();
+    return await this.backupManager.liveCheckpointToBucket(opts);
+  }
+
+  /** Restore a fresh Tero instance from a live backup in the bucket. */
+  static async restoreFromLiveBackup(opts: {
+    directory: string;
+    cloudStorage: CloudStorageConfig;
+    nodeId?: string;
+    pointInTime?: number;
+  }): Promise<Tero> {
+    const sanitized = opts.directory.replace(/[^a-zA-Z0-9_\-\/]/g, '') || 'TeroDB';
+    const tempMgr = new BackupManager(sanitized, { format: 'individual', cloudStorage: opts.cloudStorage });
+    try {
+      await tempMgr.restoreLiveToDirectory(sanitized, { nodeId: opts.nodeId, pointInTime: opts.pointInTime });
+    } finally {
+      tempMgr.destroy();
+    }
+    return new Tero({ directory: opts.directory });
   }
 
   // ---------------------------------------------------------------------------

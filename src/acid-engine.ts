@@ -744,6 +744,32 @@ export class ACIDStorageEngine {
     private dataFlushTimer?: ReturnType<typeof setInterval>;
     private readonly DATA_FLUSH_INTERVAL_MS: number;
 
+    /**
+     * Dirty-key tracker for incremental cloud checkpoints (roadmap4.md).
+     * Every committed write/delete marks its key here at commit time — O(1) per
+     * committed op, no I/O, no locks on the hot path. The backup layer drains
+     * the set via takeDirtyKeys() to upload ONLY changed documents; the set is
+     * cleared atomically on take. Unbounded growth is bounded by checkpoint
+     * cadence (drained on every live checkpoint), and even with no checkpoints
+     * each entry is just the key string (~50-100 bytes).
+     */
+    private dirtyKeys: Set<string> = new Set();
+
+    /**
+     * Atomically drain the dirty-key set: returns the keys changed since the
+     * last take and clears the set in one swap. Used by incremental checkpoints.
+     */
+    takeDirtyKeys(): Set<string> {
+        const taken = this.dirtyKeys;
+        this.dirtyKeys = new Set();
+        return taken;
+    }
+
+    /** Current dirty-key count (diagnostics/status). */
+    getDirtyKeyCount(): number {
+        return this.dirtyKeys.size;
+    }
+
     constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50) {
         this.dbPath = dbPath;
         this.DATA_FLUSH_INTERVAL_MS = dataFlushIntervalMs;
@@ -1139,6 +1165,8 @@ export class ACIDStorageEngine {
                     } else if (op.op === 'delete') {
                         this.committedBuffer.set(key, { data: null, op: 'delete' });
                     }
+                    // Mark dirty for incremental cloud checkpoints (O(1), no I/O)
+                    this.dirtyKeys.add(key);
                 }
             }
 
