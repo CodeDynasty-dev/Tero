@@ -829,9 +829,16 @@ export class ACIDStorageEngine {
                 !abortedTransactions.has(entry.transactionId) &&
                 entry.key
             ) {
-                // Uncommitted: store in Map keyed by document key. Later writes
-                // to the same key overwrite earlier entries (latest wins per key).
-                undoByKey.set(entry.key, entry);
+                // Uncommitted: keep the FIRST (earliest) entry per key, whose
+                // beforeImage is the ORIGINAL pre-transaction state. The old
+                // code kept the LAST entry — for two uncommitted writes to the
+                // same key (e.g. create {a:1} then update {a:1,b:2}) that
+                // stored {a:1} as the beforeImage and undo resurrected a ghost
+                // document that never existed before the transaction. Undo
+                // must restore the state BEFORE the first uncommitted write.
+                if (!undoByKey.has(entry.key)) {
+                    undoByKey.set(entry.key, entry);
+                }
             }
         });
 

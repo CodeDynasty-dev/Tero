@@ -712,9 +712,12 @@ export class BackupManager {
     }
 
     try {
-      // 1) Snapshot all data JSON files to bucket.
+      // 1) Snapshot all data JSON files to bucket. POOLED — the old sequential
+      //    await-per-file loop made a 50k-doc backup take ~12 minutes at ~15ms
+      //    per PUT; 16 in flight brings it under a minute. Per-item errors are
+      //    collected (not fatal), matching the previous best-effort semantics.
       const jsonFiles = await this.getJsonFiles();
-      for (const file of jsonFiles) {
+      await pooledMap(jsonFiles, 16, async (file) => {
         try {
           const cloudKey = this.getCloudKey(file.name);
           await this.uploadToCloud(file.path, cloudKey);
@@ -722,15 +725,15 @@ export class BackupManager {
         } catch (error) {
           errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
         }
-      }
+      });
 
       // 2) Stream WAL archive segments the caller wants persisted.
       const walPaths = options?.walArchivePaths ?? [];
-      for (const archivePath of walPaths) {
-        if (!existsSync(archivePath)) continue;
+      await pooledMap(walPaths, 16, async (archivePath) => {
+        if (!existsSync(archivePath)) return;
         try {
           const segName = basename(archivePath);
-          const prefix = this.config.cloudStorage.pathPrefix || 'tero-backups';
+          const prefix = this.config.cloudStorage!.pathPrefix || 'tero-backups';
           const dbName = basename(this.dbPath);
           const cloudKey = `${prefix}/${dbName}/wal/${segName}`;
           await this.uploadToCloud(archivePath, cloudKey);
@@ -738,7 +741,7 @@ export class BackupManager {
         } catch (error) {
           errors.push(`wal:${basename(archivePath)}:${error instanceof Error ? error.message : 'Unknown error'}`);
         }
-      }
+      });
 
       // 3) Emit a backup manifest so hydrate-on-startup can discover the latest snapshot.
       try {

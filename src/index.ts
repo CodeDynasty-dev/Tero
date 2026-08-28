@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, read
 import { join, resolve as pathResolve, relative as pathRelative } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath } from "./acid-engine.js";
 import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
-import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult } from "./backup.js";
+import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
 import { randomBytes } from "node:crypto";
 import QuickLRU from "quick-lru";
@@ -319,8 +319,12 @@ export class Tero {
     }
 
     // Ensure directory exists first so DataRecovery can stream into it.
+    // MUST use validateDirectory() — the same validation the constructor
+    // applies. The old strip-regex diverged ('my db' hydrated into 'mydb'
+    // while `new Tero` resolved the real path below), causing split-brain
+    // directories where hydrated data became invisible to the engine.
     const rawDirectory = (config as any)?.Directory || config?.directory || 'TeroDB';
-    const teroDirectory = rawDirectory.replace(/[^a-zA-Z0-9_\-\/]/g, '');
+    const teroDirectory = validateDirectory(rawDirectory);
     if (!existsSync(teroDirectory)) {
       mkdirSync(teroDirectory, { recursive: true });
     }
@@ -335,35 +339,50 @@ export class Tero {
       continueOnError: hydrate.continueOnError ?? true,
     });
 
-    try {
-      const mode = hydrate.mode ?? 'missing';
-      if (mode === 'all') {
-        const r = await recovery.recoverIndividualFiles();
-        if (!r.success && r.failed.length > 0) { /* continue */ }
-      } else if (mode === 'snapshot') {
-        // Snapshot-first: download the most recent tar.gz archive, extract it
-        // locally in bulk (one HTTP GET for potentially thousands of docs), then
-        // fill gaps with individual file recovery for any data written since the
-        // snapshot's checkpoint. This is the Google-recommended hydration pattern:
-        // one bulk download instead of sequential individual S3 GETs.
-        try {
-          const snapshotResult = await recovery.recoverFromArchive();
-          if (!snapshotResult.success) {
-            // Fall back to individual file recovery if no archive exists
+    const hydrateWork = async (): Promise<void> => {
+      try {
+        const mode = hydrate.mode ?? 'missing';
+        if (mode === 'all') {
+          const r = await recovery.recoverIndividualFiles();
+          if (!r.success && r.failed.length > 0) { /* continue */ }
+        } else if (mode === 'snapshot') {
+          // Snapshot-first: download the most recent tar.gz archive, extract it
+          // locally in bulk (one HTTP GET for potentially thousands of docs), then
+          // fill gaps with individual file recovery for any data written since the
+          // snapshot's checkpoint. This is the Google-recommended hydration pattern:
+          // one bulk download instead of sequential individual S3 GETs.
+          try {
+            const snapshotResult = await recovery.recoverFromArchive();
+            if (!snapshotResult.success) {
+              // Fall back to individual file recovery if no archive exists
+              const r = await recovery.recoverMissingFiles();
+              if (!r.success && r.failed.length > 0) { /* continue */ }
+            }
+          } catch {
+            // Archive may not exist or may be corrupted; fall back gracefully
             const r = await recovery.recoverMissingFiles();
             if (!r.success && r.failed.length > 0) { /* continue */ }
           }
-        } catch {
-          // Archive may not exist or may be corrupted; fall back gracefully
+        } else {
           const r = await recovery.recoverMissingFiles();
           if (!r.success && r.failed.length > 0) { /* continue */ }
         }
-      } else {
-        const r = await recovery.recoverMissingFiles();
-        if (!r.success && r.failed.length > 0) { /* continue */ }
+      } catch (error) {
+        // Hydration errors are non-fatal; engine init proceeds with whatever local data exists.
       }
-    } catch (error) {
-      // Hydration errors are non-fatal; engine init proceeds with whatever local data exists.
+    };
+    // HydrateConfig.timeout was declared but never enforced — a hung bucket GET
+    // could block engine construction forever. Race the hydration against the
+    // deadline; on expiry the engine proceeds with whatever local state exists
+    // (same non-fatal contract as a hydration failure).
+    const timeoutMs = hydrate.timeout;
+    if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+      await Promise.race([
+        hydrateWork(),
+        new Promise<void>((resolve) => { const t = setTimeout(resolve, timeoutMs); t.unref?.(); }),
+      ]);
+    } else {
+      await hydrateWork();
     }
 
     // Now construct the engine in the usual way — it sees current local state and
@@ -628,9 +647,18 @@ export class Tero {
   }): Promise<ValidationResult | boolean> {
     this.validateKey(key);
 
-    // Fast existence check via in-memory set — avoids existsSync syscall
+    // Fast existence check via bounded in-memory LRU. But the LRU evicts at
+    // KNOWN_KEYS_MAX (10k) — past that, a `has` miss is NOT proof the key
+    // doesn't exist. Fall back to a partitioned-path stat whenever the LRU
+    // could have evicted (size at capacity), preserving the syscall-free fast
+    // path below capacity while keeping uniqueness correct at scale. Without
+    // this, duplicate create(k) past 10k keys silently overwrote via merge.
     if (this.knownKeys.has(key)) {
       return false; // already exists
+    }
+    if (this.knownKeys.size >= this.KNOWN_KEYS_MAX && existsSync(this.keyToPath(key))) {
+      this.knownKeys.set(key, true); // re-pin; existed all along
+      return false;
     }
 
     const transactionId = this._beginTransaction();
@@ -697,10 +725,8 @@ export class Tero {
     }
 
     // 3. Slow path: read directly from disk (partitioned path; atomic rename = consistent)
-    const { readFileSync, existsSync: existsSyncFs } = await import('fs');
-    const { join } = await import('path');
     const filePath = this.keyToPath(key);
-    if (!existsSyncFs(filePath)) {
+    if (!existsSync(filePath)) {
       return false;
     }
 
@@ -822,16 +848,23 @@ export class Tero {
         throw new Error('Insufficient funds');
       }
 
-      // Update balances
-      await this.write(transactionId, fromKey, {
-        ...fromAccount,
-        balance: fromAccount.balance - amount
-      });
-
-      await this.write(transactionId, toKey, {
-        ...toAccount,
-        balance: toAccount.balance + amount
-      });
+      // Update balances — write keys in GLOBAL SORTED ORDER. Concurrent
+      // opposite-direction transfers (A→B and B→A) would otherwise acquire
+      // exclusive locks in opposite orders and deadlock until the 30s
+      // LockManager timeout. Sorted acquisition guarantees a consistent
+      // global lock order across all transfers. NOTE: the read-check-write
+      // above still races under concurrency (two transfers can both pass the
+      // balance check); correct money movement requires serializable
+      // isolation or app-level idempotency — document accordingly.
+      const [firstKey, secondKey] = [fromKey, toKey].sort();
+      const balances: Record<string, any> = { [fromKey]: fromAccount, [toKey]: toAccount };
+      const deltas: Record<string, number> = { [fromKey]: -amount, [toKey]: +amount };
+      for (const key of [firstKey, secondKey]) {
+        await this.write(transactionId, key, {
+          ...balances[key],
+          balance: balances[key].balance + deltas[key]
+        });
+      }
 
       // Commit the transaction
       await this.commit(transactionId);
@@ -845,7 +878,14 @@ export class Tero {
   async _writeRaw(transactionId: string, key: string, data: any): Promise<void> {
     const result = this.acidEngine.write(transactionId, key, data);
     if (result !== undefined) await result;
-    this.updateCache(key, data, transactionId);
+    // Cache the MERGED afterImage, not the raw caller input. The engine
+    // deep-merges partial updates with existing state, so caching `data`
+    // would poison the cache with incomplete documents — a second tx.update
+    // to the same key would lose fields written by the first update until a
+    // disk re-read. (Tero.write() does this correctly; the Transaction path
+    // goes through this raw method, so it must too.)
+    const afterImage = this.acidEngine.getPendingAfterImage(transactionId, key);
+    this.updateCache(key, afterImage !== undefined ? afterImage : data, transactionId);
   }
 
   async _readRaw(transactionId: string, key: string): Promise<any> {
@@ -873,6 +913,15 @@ export class Tero {
 
   async _rollbackRaw(transactionId: string): Promise<void> {
     this.acidEngine.rollbackTransaction(transactionId);
+    // Invalidate cache entries this transaction touched and drop the tracking
+    // set. Without this, the timeout rollback path (Transaction constructor
+    // timer) leaves stale cache entries tagged with the dead txId, and
+    // txTouchedKeys grows unbounded across timed-out transactions.
+    const touched = this.txTouchedKeys.get(transactionId);
+    if (touched) {
+      for (const k of touched) this.cache.delete(k);
+      this.txTouchedKeys.delete(transactionId);
+    }
     this.rolledBackCount++;
   }
 
@@ -1453,4 +1502,4 @@ export class Tero {
 }
 
 // Export types for external use
-export { DocumentSchema, ValidationResult, BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig };
+export { DocumentSchema, ValidationResult, BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger };
