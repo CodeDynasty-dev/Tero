@@ -18,6 +18,7 @@ const PROCESS_UNIQUE = randomBytes(5);
 let idCounter = ~~(Math.random() * 0xffffff);
 
 const MAX_DOCUMENT_DEPTH = 32;
+const MAX_DOCUMENT_SIZE = 16 * 1024 * 1024; // 16MB max document size limit
 
 /**
  * Clone for cache safety — hot-path optimized.
@@ -404,7 +405,7 @@ export class Tero {
     // applies. The old strip-regex diverged ('my db' hydrated into 'mydb'
     // while `new Tero` resolved the real path below), causing split-brain
     // directories where hydrated data became invisible to the engine.
-    const rawDirectory = (config as any)?.Directory || config?.directory || 'TeroDB';
+    const rawDirectory = config?.directory || 'TeroDB';
     const teroDirectory = validateDirectory(rawDirectory);
     if (!existsSync(teroDirectory)) {
       mkdirSync(teroDirectory, { recursive: true });
@@ -590,6 +591,11 @@ export class Tero {
       }
 
       data = deepClone(data);
+
+      const serializedLen = typeof data === 'string' ? data.length : JSON.stringify(data).length;
+      if (serializedLen > MAX_DOCUMENT_SIZE) {
+        throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB)`);
+      }
 
       // Perform schema validation if requested
       if (options?.validate || options?.schemaName) {

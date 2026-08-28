@@ -150,7 +150,7 @@ class TestRunner {
 
         console.log(`📋 Found ${testFiles.length} test files:`);
         testFiles.forEach(file => {
-            console.log(`  - ${file.replace('./tests/', '')}`);
+            console.log(`  - ${file.replace('./local_tests/', '').replace('local_tests/', '').replace('./tests/', '')}`);
         });
 
         this.totalTests = testFiles.length;

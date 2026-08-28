@@ -94,8 +94,7 @@ export interface CloudStorageConfig {
 }
 
 /** Injectable logger for BackupManager. Pass your own to route backup logs into
- *  your observability stack; pass 'silent' to disable them entirely. Default
- *  (undefined) keeps console output for backwards compatibility. */
+ *  your observability stack, or pass console. Default is silent to prevent log noise. */
 export type BackupLogger = {
   info: (...args: any[]) => void;
   warn: (...args: any[]) => void;
@@ -111,7 +110,7 @@ export interface BackupConfig {
   compression?: boolean; // For individual files
   includeMetadata?: boolean; // Include file timestamps, sizes, etc. (optional - adds overhead)
   metadataUse?: 'verification' | 'audit' | 'recovery' | 'none'; // What to use metadata for
-  logger?: 'silent' | BackupLogger; // Injected logger; default = console
+  logger?: 'silent' | BackupLogger; // Injected logger; default = silent
 }
 
 export interface BackupMetadata {
