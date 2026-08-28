@@ -93,13 +93,12 @@ export class WriteAheadLog {
         let fd: number;
         try {
             fd = openSync(path, 'r');
-        } catch {
-            return; // file may not exist during rotation edge cases
+        } catch (error: any) {
+            if (error?.code === 'ENOENT') return; // file may not exist during rotation edge cases
+            throw error;
         }
         try {
             fsyncSync(fd);
-        } catch {
-            // fsync may fail on some filesystems; we still proceed since the data write already happened
         } finally {
             closeSync(fd);
         }
@@ -109,12 +108,12 @@ export class WriteAheadLog {
         let fd: number;
         try {
             fd = openSync(dirPath, 'r');
-        } catch {
-            return;
+        } catch (error: any) {
+            if (error?.code === 'ENOENT') return;
+            throw error;
         }
         try {
             fsyncSync(fd);
-        } catch {
         } finally {
             closeSync(fd);
         }
