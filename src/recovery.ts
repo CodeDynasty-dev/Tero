@@ -3,6 +3,7 @@ import { createWriteStream, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { pipeline } from "stream/promises";
 import { CloudStorageConfig } from "./backup.js";
+import { partitionedPath } from "./acid-engine.js";
 
 export interface RecoveryConfig {
     cloudStorage: CloudStorageConfig;
@@ -106,7 +107,10 @@ export class DataRecovery {
     async recoverSingleFile(key: string): Promise<boolean> {
         try {
             const cloudKey = this.getCloudKey(`${key}.json`);
-            const localFilePath = join(this.config.localPath, `${key}.json`);
+            // Write into the 2-level hash-partition location the engine reads from —
+            // NOT flat at the db root. The partition is deterministic from the key,
+            // so restored files are immediately visible to engine reads.
+            const localFilePath = partitionedPath(this.config.localPath, key);
 
             // Ensure local directory exists
             const localDir = dirname(localFilePath);
@@ -336,7 +340,7 @@ export class DataRecovery {
             const cloudFiles = await this.listAvailableFiles();
             const missing: string[] = [];
             for (const key of cloudFiles) {
-                const localPath = join(this.config.localPath, `${key}.json`);
+                const localPath = partitionedPath(this.config.localPath, key);
                 if (!existsSync(localPath)) {
                     missing.push(key);
                 }
@@ -452,9 +456,9 @@ export class DataRecovery {
             const cloudFiles = await this.listAvailableFiles();
             const localFiles: string[] = [];
 
-            // Check which files exist locally
+            // Check which files exist locally (in their hash-partition location)
             for (const key of cloudFiles) {
-                const localPath = join(this.config.localPath, `${key}.json`);
+                const localPath = partitionedPath(this.config.localPath, key);
                 if (existsSync(localPath)) {
                     localFiles.push(key);
                 }

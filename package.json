@@ -21,6 +21,7 @@
     "test:production": "node local_tests/production-test.js",
     "test:legacy": "node local_tests/test.js",
     "test:backup": "node local_tests/backup-test.js",
+    "test:s3": "node local_tests/s3-live-backup-test.js",
     "test:schema": "node local_tests/schema-test.js",
     "test:all": "npm run test",
     "test:watch": "npm run test",

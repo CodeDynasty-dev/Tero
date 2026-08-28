@@ -267,6 +267,48 @@ npm run test:legacy     # legacy suite
 node local_tests/v2-test.js   # v2: hydrate + bucket backup surface
 ```
 
+### Testing S3 live backup locally (MinIO)
+
+`npm run test:s3` round-trips the live backup API against a real S3-compatible
+endpoint: live writes → `backupToBucket()` → `checkpointAndBackupToBucket()` →
+raw bucket verification → hydrate-on-startup into a fresh node. Without
+credentials it skips, so plain `npm test` stays green.
+
+The cheapest way to exercise it is MinIO in Docker:
+
+```bash
+# 1. Start a local S3-compatible server
+docker run -d --name tero-minio-test -p 9000:9000 -p 9001:9001 \
+  -v /tmp/tero-minio-data:/data \
+  minio/minio server /data --console-address ":9001"
+
+# 2. Run the round-trip test (bucket is created if missing)
+S3_ENDPOINT=http://127.0.0.1:9000 \
+S3_BUCKET=tero-live-backup-test \
+AWS_ACCESS_KEY_ID=minioadmin \
+AWS_SECRET_ACCESS_KEY=minioadmin \
+npm run test:s3
+
+# 3. Inspect what Tero wrote (console at http://localhost:9001)
+#    s3://tero-live-backup-test/tero-backups/<dbName>/
+#      ├── <key>.json        # data snapshots
+#      ├── wal/.wal.<ts>     # archived WAL segments
+#      └── MANIFEST.json     # hydration entry point
+
+# 4. Clean up
+docker rm -f tero-minio-test && rm -rf /tmp/tero-minio-data
+```
+
+Against real AWS, omit `S3_ENDPOINT` and pass an IAM user with
+`s3:PutObject/GetObject/ListBucket/CreateBucket` on the test bucket:
+
+```bash
+S3_BUCKET=my-test-bucket \
+AWS_ACCESS_KEY_ID=... \
+AWS_SECRET_ACCESS_KEY=... \
+npm run test:s3
+```
+
 ## Performance characteristics
 
 ```

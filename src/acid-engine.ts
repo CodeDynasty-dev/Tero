@@ -637,10 +637,10 @@ export class LockManager {
  * The partition is deterministic from the key, so reads/writes for a given
  * key always resolve to the same partition without an in-memory index.
  *
- * Crash recovery (redoOperation/undoOperation) naturally walks the whole
- * tree via fs.opendir recursion — no readdirSync allocation.
+ * Exported so DataRecovery can write cloud-restored files into the exact
+ * partition the engine reads from (deterministic from the key).
  */
-function partitionedPath(dbPath: string, key: string): string {
+export function partitionedPath(dbPath: string, key: string): string {
     // Fast 32-bit FNV-1a of the key to pick the partition dirs. We only need
     // ~16 bits of dispersion for partitioning (65k buckets), so 32-bit hash
     // is more than sufficient (collision here just means two keys share a
