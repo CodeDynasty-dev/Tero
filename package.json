@@ -33,7 +33,9 @@
     "ci": "npm run verify",
     "bench": "node bench/run-bench.js --synchronous normal",
     "bench:full": "node bench/run-bench.js --synchronous full",
-    "bench:quick": "node bench/run-bench.js --quick --synchronous normal"
+    "bench:quick": "node bench/run-bench.js --quick --synchronous normal",
+    "bench:live": "node bench/run-live-bench.js",
+    "bench:live:quick": "node bench/run-live-bench.js --quick"
   },
   "files": [
     "dist/**/*"

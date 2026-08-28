@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tero DB — Live Bucket Replication Benchmark</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; max-width: 1200px; margin: 0 auto; line-height: 1.5; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #fff; }
+  h2 { font-size: 1.3rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; color: #fff; }
+  h3 { font-size: 1rem; margin-bottom: 0.8rem; color: var(--accent); }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.25rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+  @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .stat { display: inline-block; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; margin: 0.25rem; min-width: 140px; }
+  .stat .val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+  .stat .lbl { font-size: 0.75rem; color: var(--muted); }
+  .verdict { border-left: 3px solid var(--green); padding: 0.6rem 1rem; margin: 0.5rem 0; background: rgba(63,185,80,0.08); border-radius: 0 4px 4px 0; font-size: 0.88rem; }
+  .chart-wrap { position: relative; height: 280px; }
+  code { background: rgba(88,166,255,0.12); padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>Tero DB — Live Bucket Replication Benchmark</h1>
+<div class="meta">
+  Generated 2026-08-28T18:33:49.029Z &middot; Node v24.14.0 &middot; darwin/x64
+  &middot; <strong style="color:var(--accent)">Bucket: tero-live-backup-test</strong>
+  &middot; <strong style="color:var(--purple)">Endpoint: http://127.0.0.1:9000</strong>
+  
+</div>
+
+<h2>Executive Summary</h2>
+<div class="card">
+  <p>Tero implements continuous cloud replication by streaming bounded WAL segment archives directly to S3-compatible object storage under a <strong>1-second Recovery Point Objective (RPO &le; 1s)</strong>, coupled with differential incremental checkpoints for cold disaster hydration.</p>
+  <br>
+  <div>
+    <div class="stat"><div class="lbl">Live Write Speed</div><div class="val">43 ops/s</div></div>
+    <div class="stat"><div class="lbl">Replication Overhead</div><div class="val">3.2%</div></div>
+    <div class="stat"><div class="lbl">Cold Restore Speed</div><div class="val">850 docs/s</div></div>
+    <div class="stat"><div class="lbl">Restored Fidelity</div><div class="val">100.0%</div></div>
+    <div class="stat"><div class="lbl">Cloudflare R2 Est.</div><div class="val">$11.66/mo</div></div>
+  </div>
+</div>
+
+<h2>1. Full Checkpoint Upload Throughput</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Upload Throughput (docs/sec)</h3>
+    <div class="chart-wrap"><canvas id="chart-full-docs"></canvas></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>Doc Count</th><th class="num">Uploaded Files</th><th class="num">Duration</th><th class="num">Throughput</th><th class="num">Bandwidth</th></tr>
+      <tr><td>100 docs</td><td class="num">100</td><td class="num">944.4ms</td><td class="num">106 docs/s</td><td class="num">0.04 MB/s</td></tr><tr><td>500 docs</td><td class="num">500</td><td class="num">4219.5ms</td><td class="num">118 docs/s</td><td class="num">0.05 MB/s</td></tr><tr><td>1000 docs</td><td class="num">1000</td><td class="num">9290.9ms</td><td class="num">108 docs/s</td><td class="num">0.04 MB/s</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>2. Incremental Checkpoint & Tombstone Shipping</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Incremental Upload Latency vs Mutation Volume</h3>
+    <div class="chart-wrap"><canvas id="chart-inc-latency"></canvas></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>Scenario</th><th class="num">Mutations</th><th class="num">Uploaded</th><th class="num">Tombstones</th><th class="num">Duration</th></tr>
+      <tr><td>5% Dirty Updates</td><td class="num">25</td><td class="num">25</td><td class="num">0</td><td class="num">677.3ms</td></tr><tr><td>20% Dirty Updates</td><td class="num">100</td><td class="num">100</td><td class="num">0</td><td class="num">2141.6ms</td></tr><tr><td>10% Updates + 5% Deletes</td><td class="num">75</td><td class="num">50</td><td class="num">25</td><td class="num">1636.4ms</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>3. Live WAL Shipping & Write Overhead</h2>
+<div class="card">
+  <div class="grid">
+    <div>
+      <div class="stat"><div class="lbl">Baseline Throughput (No Cloud)</div><div class="val">44 ops/s</div></div>
+      <div class="stat"><div class="lbl">Live Replicated Throughput</div><div class="val">43 ops/s</div></div>
+      <div class="stat"><div class="lbl">Overhead Penalty</div><div class="val">3.2%</div></div>
+    </div>
+    <div>
+      <p style="color:var(--muted);font-size:0.85rem">
+        Live WAL shipping runs asynchronously on a background interval (default 1000ms).
+        Database transactions write exclusively to local memory buffers and WAL files, so client-facing
+        mutations never block on S3 network round-trips.
+      </p>
+    </div>
+  </div>
+</div>
+
+<h2>4. Cold Disaster Recovery from Bucket</h2>
+<div class="card">
+  <div class="grid">
+    <div>
+      <div class="stat"><div class="lbl">Documents Restored</div><div class="val">400</div></div>
+      <div class="stat"><div class="lbl">Hydration Duration</div><div class="val">470.8ms</div></div>
+      <div class="stat"><div class="lbl">Hydration Speed</div><div class="val">850 docs/s</div></div>
+      <div class="stat"><div class="lbl">Data Integrity Check</div><div class="val" style="color:var(--green)">100.0% Match</div></div>
+    </div>
+    <div>
+      <p style="color:var(--muted);font-size:0.85rem">
+        Hydration downloads the latest full/incremental checkpoint data files and replays any trailing WAL
+        archive segments in sequence to reconstruct the exact point-in-time state without data loss.
+      </p>
+    </div>
+  </div>
+</div>
+
+<h2>5. Cloud Economics & Storage Cost Projection</h2>
+<div class="card">
+  <table>
+    <tr><th>Provider</th><th>Pricing Model</th><th>Billed API Units</th><th>Est. Monthly Cost (24/7 Live Sync)</th></tr>
+    <tr><td><strong>Cloudflare R2</strong></td><td>$0.0045 / 1k Class A &middot; <strong>Zero Egress</strong></td><td>9 PUTs</td><td class="num"><strong>$11.66 / month</strong></td></tr>
+    <tr><td><strong>AWS S3 Standard</strong></td><td>$0.005 / 1k PUT &middot; $0.023 / GB</td><td>9 PUTs</td><td class="num"><strong>$12.96 / month</strong></td></tr>
+  </table>
+</div>
+
+<div class="verdict">
+  <strong>Architecture Takeaway:</strong> Tero achieves RPO &le; 1s live replication by combining asynchronous local group commits with background pooled WAL uploads. S3 latency is decoupled from client request paths.
+</div>
+
+<script>
+const fullData = [{"docs":100,"uploadedFiles":100,"totalMs":944.43724,"docsPerSec":105.88316064283954,"mbPerSec":0.04246228016082807,"errors":0},{"docs":500,"uploadedFiles":500,"totalMs":4219.49159,"docsPerSec":118.49768848573532,"mbPerSec":0.04791796385488364,"errors":0},{"docs":1000,"uploadedFiles":1000,"totalMs":9290.917972,"docsPerSec":107.63199104907565,"mbPerSec":0.04360334778375725,"errors":0}];
+new Chart(document.getElementById('chart-full-docs'), {
+  type: 'bar',
+  data: {
+    labels: fullData.map(d => d.docs + ' docs'),
+    datasets: [{ label: 'Throughput (docs/s)', data: fullData.map(d => d.docsPerSec), backgroundColor: '#58a6ff' }]
+  },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: '#30363d' } } } }
+});
+
+const incData = [{"label":"5% Dirty Updates","totalDocs":500,"mutatedCount":25,"uploadedCount":25,"tombstones":0,"durMs":677.346043,"docsPerSec":36.908756252968914},{"label":"20% Dirty Updates","totalDocs":500,"mutatedCount":100,"uploadedCount":100,"tombstones":0,"durMs":2141.627745,"docsPerSec":46.69345558931392},{"label":"10% Updates + 5% Deletes","totalDocs":500,"mutatedCount":75,"uploadedCount":50,"tombstones":25,"durMs":1636.440899,"docsPerSec":45.83116936629436}];
+new Chart(document.getElementById('chart-inc-latency'), {
+  type: 'bar',
+  data: {
+    labels: incData.map(d => d.label),
+    datasets: [{ label: 'Duration (ms)', data: incData.map(d => d.durMs), backgroundColor: '#3fb950' }]
+  },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: '#30363d' } } } }
+});
+</script>
+
+</body>
+</html>
