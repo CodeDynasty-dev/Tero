@@ -20,3 +20,5 @@ tmp_*/**
 bench-*.html
 debug-concurrent.js
 channels4_profile.jpg
+prd.md
+tasks.md 

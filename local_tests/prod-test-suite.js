@@ -238,12 +238,12 @@ async function suite4() {
         const db = new Tero({ directory: TEST_DIR, cacheSize: 100 });
         await db.create('shared', { counter: 0 });
 
-        // 50 concurrent increments — each reads current counter, increments, writes back
+        // 50 concurrent increments — each acquires exclusive lock on read, increments, writes back
         const promises = [];
         for (let i = 0; i < 50; i++) {
             promises.push((async () => {
                 const tx = db.beginTransaction();
-                const current = await db.read(tx, 'shared');
+                const current = await db.read(tx, 'shared', { lock: 'exclusive' });
                 await db.write(tx, 'shared', { counter: (current.counter || 0) + 1 });
                 await db.commit(tx);
             })());
@@ -251,11 +251,7 @@ async function suite4() {
         await Promise.all(promises);
 
         const final = await db.get('shared');
-        assert(final.counter >= 1, `counter should be >= 1, got ${final.counter}`);
-        // With lock serialization, each operation should increment. But without
-        // lock-based isolation on reads (the read inside a tx holds a shared lock,
-        // then the write upgrades to exclusive), there might be lock contention
-        // causing some to fail. The key assertion: data is not corrupted.
+        assert(final.counter === 50, `counter should be exactly 50 after 50 serialized increments, got ${final.counter}`);
         db.destroy();
     });
 

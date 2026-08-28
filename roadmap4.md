@@ -163,6 +163,20 @@ Storage: ~17 MB/day segments + ~12 MB/day checkpoints ≈ 210 MB for 7-day reten
 - Zero PUTs when idle; zero full-DB uploads after first enable (barring explicit `compactToBucket()`).
 - README, BUCKET_COST_DATA.md, and this file updated at Phase 5.
 
+## 9. 24-Hour Soak & Chaos Testing Protocol
+
+To prove long-term endurance for Tier-1 infrastructure deployment:
+
+1. **Continuous 24-Hour Sustained Load:**
+   - Workload: 1,000 mixed operations/sec (70% reads, 20% updates, 10% inserts/deletes).
+   - Target metrics: Zero RSS memory leakage (<150MB flat memory ceiling), stable file descriptor count (<50 open FDs), zero WAL segment corruption over 86,400 consecutive shipping cycles.
+2. **Periodic Unannounced `SIGKILL` Chaos Cycles:**
+   - Automated hourly `kill -9` process termination while mid-commit and mid-WAL shipping.
+   - Assert: Stale `.lock` PID reclamation succeeds; crash recovery replays 100% of committed transactions without manual intervention.
+3. **Network Partition Injection:**
+   - Simulate 5-minute simulated S3/R2 outages via proxy fault injection.
+   - Assert: Live shipper gracefully degrades to `degraded` state without blocking local transaction commits; auto-heals and flushes pending WAL archives once connectivity resumes.
+
 ## Open questions
 
 - Should `shipIntervalMs` be user-tunable below 1000, or is 1 s a hard product constant? (Tunable risks users re-creating the old cost trap.)
