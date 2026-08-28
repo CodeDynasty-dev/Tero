@@ -449,8 +449,24 @@ export class LockManager {
             return true;
         }
 
-        // Fast path 2: lock is grantable right now (shared/shared, or sole holder)
-        if (this.canGrantLock(lockInfo, lockType, transactionId)) {
+        // Fast path 2: existing holder requesting lock — never downgrade exclusive
+        const isHolder = lockInfo.holders.has(transactionId);
+        if (isHolder) {
+            // Already holding exclusive — strongest lock, never downgrade
+            if (lockInfo.type === 'exclusive') {
+                return true;
+            }
+            // Already holding shared and requesting shared — no-op
+            if (lockType === 'shared') {
+                return true;
+            }
+            // Upgrading from shared to exclusive — grant if sole holder
+            if (lockInfo.holders.size === 1) {
+                lockInfo.type = 'exclusive';
+                return true;
+            }
+            // Multiple shared holders: must wait in queue for upgrade
+        } else if (this.canGrantLock(lockInfo, lockType, transactionId)) {
             if (lockType === 'shared' && lockInfo.type === 'shared') {
                 lockInfo.holders.add(transactionId);
             } else {
@@ -493,11 +509,10 @@ export class LockManager {
         const isHolder = lockInfo.holders.has(transactionId);
 
         if (isHolder) {
-            // Upgrading from shared to exclusive is only allowed if this is the sole holder
+            if (lockInfo.type === 'exclusive') return true;
             if (lockInfo.type === 'shared' && requestedType === 'exclusive') {
                 return lockInfo.holders.size === 1;
             }
-            // Same lock type or downgrade is always allowed for existing holders
             return true;
         }
 

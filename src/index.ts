@@ -225,11 +225,19 @@ export class Transaction {
     this.operationsLog.push({ key, operation: 'delete' });
   }
 
-  async get(key: string): Promise<any> {
+  /**
+   * Read document within this transaction.
+   * @param options.lock - 'shared' (default) or 'exclusive' (SELECT FOR UPDATE)
+   */
+  async get(key: string, options?: { lock?: 'shared' | 'exclusive' }): Promise<any> {
     this._checkActive();
-    return await this.db._readRaw(this.id, key);
+    return await this.db.read(this.id, key, options);
   }
 
+  /**
+   * Alias for get() with explicit locking semantics.
+   * @param options.lock - 'shared' (default) or 'exclusive' (SELECT FOR UPDATE)
+   */
   async read(key: string, options?: { lock?: 'shared' | 'exclusive' }): Promise<any> {
     this._checkActive();
     return await this.db.read(this.id, key, options);
@@ -487,11 +495,11 @@ export class Tero {
   }
 
   private validateKey(key: string): void {
-    if (!key || typeof key !== 'string') {
+    if (!key || typeof key !== 'string' || !key.trim()) {
       throw new Error('Key must be a non-empty string');
     }
-    // Sanitize key to prevent path traversal
-    if (key.includes('..') || key.includes('/') || key.includes('\\')) {
+    // Sanitize key to prevent path traversal, hidden files, and illegal chars
+    if (key.includes('..') || key.includes('/') || key.includes('\\') || key.includes('\0') || key === '.' || key.startsWith('.')) {
       throw new Error('Key contains invalid characters');
     }
   }

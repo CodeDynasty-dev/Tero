@@ -142,9 +142,9 @@ export class BackupManager {
   constructor(dbPath: string, config: BackupConfig) {
     this.dbPath = dbPath;
     this.config = config;
-    this.log = config.logger === 'silent'
-      ? { info: () => {}, warn: () => {}, error: () => {} }
-      : (config.logger ?? console);
+    this.log = config.logger && config.logger !== 'silent'
+      ? config.logger
+      : { info: () => {}, warn: () => {}, error: () => {} };
 
     if (config.cloudStorage) {
       this.initializeCloudStorage(config.cloudStorage);
