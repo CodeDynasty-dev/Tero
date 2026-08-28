@@ -230,6 +230,11 @@ export class Transaction {
     return await this.db._readRaw(this.id, key);
   }
 
+  async read(key: string, options?: { lock?: 'shared' | 'exclusive' }): Promise<any> {
+    this._checkActive();
+    return await this.db.read(this.id, key, options);
+  }
+
   getState(): { status: string; operations: Array<{ key: string; operation: string }>; startTime: number } {
     const status = this.db._getTxStatus(this.id);
     return {
@@ -595,11 +600,16 @@ export class Tero {
     }
   }
 
-  async read(transactionId: string | Transaction, key: string): Promise<any> {
+  async read(transactionId: string | Transaction, key: string, options?: { lock?: 'shared' | 'exclusive' }): Promise<any> {
     try {
       const txId = this._txId(transactionId);
       this.validateKey(key);
       this.cacheRequests++;
+
+      if (options?.lock === 'exclusive') {
+        const lockRes = this.acidEngine.acquireExclusiveLock(txId, key);
+        if (lockRes !== undefined && lockRes instanceof Promise) await lockRes;
+      }
 
       // Check cache first, but only if it's from the same transaction or committed
       const cachedEntry = this.cache.get(key);
@@ -1510,13 +1520,25 @@ export class Tero {
     } catch { /* best-effort */ }
   }
 
-  // Cleanup method
-  destroy(): void {
+  // Cleanup methods
+  async destroyAsync(): Promise<void> {
+    if (this.backupManager) {
+      await this.backupManager.drainInFlight();
+      this.backupManager.destroy();
+    }
     if (this.acidEngine) {
       this.acidEngine.destroy();
     }
+    this.clearCache();
+    this.releaseFileLock();
+  }
+
+  destroy(): void {
     if (this.backupManager) {
       this.backupManager.destroy();
+    }
+    if (this.acidEngine) {
+      this.acidEngine.destroy();
     }
     this.clearCache();
     this.releaseFileLock();

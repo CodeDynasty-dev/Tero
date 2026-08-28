@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync } from "fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync } from "fs";
 import { join, basename, relative, dirname, sep } from "path";
 import { create as tarCreate } from "tar";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
@@ -814,6 +814,16 @@ export class BackupManager {
   private liveCheckpointPromise?: Promise<LiveCheckpointResult>;
   private lastCheckpointError?: string;
 
+  async drainInFlight(): Promise<void> {
+    if (this.liveShipper) {
+      this.liveShipper.stop();
+      this.liveShipper = undefined;
+    }
+    if (this.liveCheckpointPromise) {
+      try { await this.liveCheckpointPromise; } catch {}
+    }
+  }
+
   destroy(): void {
     for (const [id, cronJob] of this.scheduledBackups) cronJob.stop();
     this.scheduledBackups.clear();
@@ -875,7 +885,11 @@ export class BackupManager {
     if (!nodeId) { try { nodeId = readFileSync(idFile, 'utf8').trim(); } catch { nodeId = ''; } }
     if (nodeId) nodeId = nodeId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
     if (!nodeId) nodeId = randomUUID().replace(/-/g, '').slice(0, 16);
-    try { writeFileSync(idFile, nodeId, 'utf8'); } catch {}
+    try {
+      writeFileSync(idFile, nodeId, 'utf8');
+      const fd = openSync(idFile, 'r');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    } catch {}
     const prefix = this.liveCloudPrefix(nodeId);
     this.liveNodeId = nodeId; this.liveEngine = engine; this.livePrefix = prefix;
     this.lastCheckpointError = undefined;

@@ -1,6 +1,6 @@
 import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand } from "@aws-sdk/client-s3";
-import { createWriteStream, existsSync, mkdirSync } from "fs";
-import { join, dirname } from "path";
+import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync } from "fs";
+import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
 import { CloudStorageConfig } from "./backup.js";
 import { partitionedPath } from "./acid-engine.js";
@@ -437,12 +437,24 @@ export class DataRecovery {
     private async extractArchive(archivePath: string): Promise<boolean> {
         try {
             const tar = await import('tar');
+            const targetDir = pathResolve(this.config.localPath);
 
             await tar.extract({
                 file: archivePath,
-                cwd: this.config.localPath,
-                strip: 1 // Remove the top-level directory from the archive
+                cwd: targetDir,
+                strip: 1, // Remove the top-level directory from the archive
+                filter: (path: string) => {
+                    // Prevent path traversal (Zip Slip / Tar Slip)
+                    const resolved = pathResolve(targetDir, path);
+                    return resolved.startsWith(targetDir) && !path.includes('..');
+                }
             });
+
+            // Fsync directory to ensure dentries are durable
+            try {
+                const fd = openSync(targetDir, 'r');
+                try { fsyncSync(fd); } finally { closeSync(fd); }
+            } catch {}
 
             return true;
         } catch (error) {
