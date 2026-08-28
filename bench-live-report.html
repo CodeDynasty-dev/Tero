@@ -35,10 +35,10 @@
 
 <h1>Tero DB — Live Bucket Replication Benchmark</h1>
 <div class="meta">
-  Generated 2026-08-28T19:09:29.144Z &middot; Node v24.14.0 &middot; darwin/x64
+  Generated 2026-08-28T19:59:35.163Z &middot; Node v24.14.0 &middot; darwin/x64
   &middot; <strong style="color:var(--accent)">Bucket: tero-live-backup-test</strong>
   &middot; <strong style="color:var(--purple)">Endpoint: http://127.0.0.1:9000</strong>
-  
+   &middot; <strong style="color:var(--yellow)">QUICK MODE</strong>
 </div>
 
 <h2>Executive Summary</h2>
@@ -47,8 +47,8 @@
   <br>
   <div>
     <div class="stat"><div class="lbl">Live Write Speed</div><div class="val">44 ops/s</div></div>
-    <div class="stat"><div class="lbl">Replication Overhead</div><div class="val">3.8%</div></div>
-    <div class="stat"><div class="lbl">Cold Restore Speed</div><div class="val">1,005 docs/s</div></div>
+    <div class="stat"><div class="lbl">Replication Overhead</div><div class="val">4.9%</div></div>
+    <div class="stat"><div class="lbl">Cold Restore Speed</div><div class="val">258 docs/s</div></div>
     <div class="stat"><div class="lbl">Restored Fidelity</div><div class="val">100.0%</div></div>
     <div class="stat"><div class="lbl">Cloudflare R2 Est.</div><div class="val">$11.66/mo</div></div>
   </div>
@@ -63,7 +63,7 @@
   <div class="card">
     <table>
       <tr><th>Doc Count</th><th class="num">Uploaded Files</th><th class="num">Duration</th><th class="num">Throughput</th><th class="num">Bandwidth</th></tr>
-      <tr><td>100 docs</td><td class="num">100</td><td class="num">1123.5ms</td><td class="num">89 docs/s</td><td class="num">0.04 MB/s</td></tr><tr><td>500 docs</td><td class="num">500</td><td class="num">4593.2ms</td><td class="num">109 docs/s</td><td class="num">0.04 MB/s</td></tr><tr><td>1000 docs</td><td class="num">1000</td><td class="num">7836.5ms</td><td class="num">128 docs/s</td><td class="num">0.05 MB/s</td></tr>
+      <tr><td>50 docs</td><td class="num">50</td><td class="num">517.2ms</td><td class="num">97 docs/s</td><td class="num">0.04 MB/s</td></tr><tr><td>150 docs</td><td class="num">150</td><td class="num">1442.4ms</td><td class="num">104 docs/s</td><td class="num">0.04 MB/s</td></tr>
     </table>
   </div>
 </div>
@@ -77,7 +77,7 @@
   <div class="card">
     <table>
       <tr><th>Scenario</th><th class="num">Mutations</th><th class="num">Uploaded</th><th class="num">Tombstones</th><th class="num">Duration</th></tr>
-      <tr><td>5% Dirty Updates</td><td class="num">25</td><td class="num">25</td><td class="num">0</td><td class="num">521.3ms</td></tr><tr><td>20% Dirty Updates</td><td class="num">100</td><td class="num">100</td><td class="num">0</td><td class="num">2060.7ms</td></tr><tr><td>10% Updates + 5% Deletes</td><td class="num">75</td><td class="num">50</td><td class="num">25</td><td class="num">1265.5ms</td></tr>
+      <tr><td>5% Dirty Updates</td><td class="num">3</td><td class="num">3</td><td class="num">0</td><td class="num">105.1ms</td></tr><tr><td>20% Dirty Updates</td><td class="num">10</td><td class="num">10</td><td class="num">0</td><td class="num">247.2ms</td></tr><tr><td>10% Updates + 5% Deletes</td><td class="num">8</td><td class="num">5</td><td class="num">3</td><td class="num">207.9ms</td></tr>
     </table>
   </div>
 </div>
@@ -88,7 +88,7 @@
     <div>
       <div class="stat"><div class="lbl">Baseline Throughput (No Cloud)</div><div class="val">46 ops/s</div></div>
       <div class="stat"><div class="lbl">Live Replicated Throughput</div><div class="val">44 ops/s</div></div>
-      <div class="stat"><div class="lbl">Overhead Penalty</div><div class="val">3.8%</div></div>
+      <div class="stat"><div class="lbl">Overhead Penalty</div><div class="val">4.9%</div></div>
     </div>
     <div>
       <p style="color:var(--muted);font-size:0.85rem">
@@ -104,9 +104,9 @@
 <div class="card">
   <div class="grid">
     <div>
-      <div class="stat"><div class="lbl">Documents Restored</div><div class="val">400</div></div>
-      <div class="stat"><div class="lbl">Hydration Duration</div><div class="val">398.2ms</div></div>
-      <div class="stat"><div class="lbl">Hydration Speed</div><div class="val">1,005 docs/s</div></div>
+      <div class="stat"><div class="lbl">Documents Restored</div><div class="val">40</div></div>
+      <div class="stat"><div class="lbl">Hydration Duration</div><div class="val">154.8ms</div></div>
+      <div class="stat"><div class="lbl">Hydration Speed</div><div class="val">258 docs/s</div></div>
       <div class="stat"><div class="lbl">Data Integrity Check</div><div class="val" style="color:var(--green)">100.0% Match</div></div>
     </div>
     <div>
@@ -122,8 +122,8 @@
 <div class="card">
   <table>
     <tr><th>Provider</th><th>Pricing Model</th><th>Billed API Units</th><th>Est. Monthly Cost (24/7 Live Sync)</th></tr>
-    <tr><td><strong>Cloudflare R2</strong></td><td>$0.0045 / 1k Class A &middot; <strong>Zero Egress</strong></td><td>9 PUTs</td><td class="num"><strong>$11.66 / month</strong></td></tr>
-    <tr><td><strong>AWS S3 Standard</strong></td><td>$0.005 / 1k PUT &middot; $0.023 / GB</td><td>9 PUTs</td><td class="num"><strong>$12.96 / month</strong></td></tr>
+    <tr><td><strong>Cloudflare R2</strong></td><td>$0.0045 / 1k Class A &middot; <strong>Zero Egress</strong></td><td>4 PUTs</td><td class="num"><strong>$11.66 / month</strong></td></tr>
+    <tr><td><strong>AWS S3 Standard</strong></td><td>$0.005 / 1k PUT &middot; $0.023 / GB</td><td>4 PUTs</td><td class="num"><strong>$12.96 / month</strong></td></tr>
   </table>
 </div>
 
@@ -132,7 +132,7 @@
 </div>
 
 <script>
-const fullData = [{"docs":100,"uploadedFiles":100,"totalMs":1123.541215,"docsPerSec":89.00430056764763,"mbPerSec":0.035693357879354,"errors":0},{"docs":500,"uploadedFiles":500,"totalMs":4593.217522,"docsPerSec":108.8561553214418,"mbPerSec":0.04401913136645164,"errors":0},{"docs":1000,"uploadedFiles":1000,"totalMs":7836.543556,"docsPerSec":127.6072790068724,"mbPerSec":0.05169563911289726,"errors":0}];
+const fullData = [{"docs":50,"uploadedFiles":50,"totalMs":517.184516,"docsPerSec":96.67729495598432,"mbPerSec":0.03873449817362608,"errors":0},{"docs":150,"uploadedFiles":150,"totalMs":1442.3553,"docsPerSec":103.99656728130718,"mbPerSec":0.04185083212939974,"errors":0}];
 new Chart(document.getElementById('chart-full-docs'), {
   type: 'bar',
   data: {
@@ -142,7 +142,7 @@ new Chart(document.getElementById('chart-full-docs'), {
   options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: '#30363d' } } } }
 });
 
-const incData = [{"label":"5% Dirty Updates","totalDocs":500,"mutatedCount":25,"uploadedCount":25,"tombstones":0,"durMs":521.278208,"docsPerSec":47.959035341066865},{"label":"20% Dirty Updates","totalDocs":500,"mutatedCount":100,"uploadedCount":100,"tombstones":0,"durMs":2060.748327,"docsPerSec":48.526061474754755},{"label":"10% Updates + 5% Deletes","totalDocs":500,"mutatedCount":75,"uploadedCount":50,"tombstones":25,"durMs":1265.484069,"docsPerSec":59.265858683836186}];
+const incData = [{"label":"5% Dirty Updates","totalDocs":50,"mutatedCount":3,"uploadedCount":3,"tombstones":0,"durMs":105.094422,"docsPerSec":28.54575859411454},{"label":"20% Dirty Updates","totalDocs":50,"mutatedCount":10,"uploadedCount":10,"tombstones":0,"durMs":247.234297,"docsPerSec":40.44746267545558},{"label":"10% Updates + 5% Deletes","totalDocs":50,"mutatedCount":8,"uploadedCount":5,"tombstones":3,"durMs":207.882808,"docsPerSec":38.48322079620937}];
 new Chart(document.getElementById('chart-inc-latency'), {
   type: 'bar',
   data: {
