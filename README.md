@@ -53,18 +53,18 @@ await db.remove('user1');
 
 ## ACID transactions
 
-Every convenience method (`create`, `get`, `update`, `remove`) is auto-wrapped in a transaction. For multi-step operations, use explicit transactions:
+All mutation methods (`create`, `update`, `remove`) are auto-wrapped in atomic ACID transactions with two-phase locking. `get()` provides a zero-latency point-in-time snapshot read (LRU cache → committed buffer → partitioned disk). For multi-step atomic workflows, use explicit transactions:
 
 ```javascript
 const tx = db.beginTransaction();
 
 try {
-  await db.write(tx, 'account1', { balance: 900 });
-  await db.write(tx, 'account2', { balance: 1100 });
-  const a = await db.read(tx, 'account1');   // reads pending state within the tx
-  await db.commit(tx);
+  await tx.update('account1', { balance: 900 });
+  await tx.update('account2', { balance: 1100 });
+  const a = await tx.read('account1');   // reads pending state within the tx
+  await tx.commit();
 } catch (error) {
-  await db.rollback(tx);
+  await tx.rollback();
   throw error;
 }
 ```
@@ -250,23 +250,25 @@ Keys are validated to prevent path traversal (`..`, `/`, `\` are rejected).
 
 ```javascript
 const db = new Tero({
-  directory: './data',     // default: 'TeroDB'
-  cacheSize: 1000,        // default: 100, capped at 1000
-  backup: { ... },        // optional: install a BackupConfig at construction
-  hydrateOnStartup: { ... }, // optional: v2 hydration before engine init
+  directory: './data',       // default: 'TeroDB'
+  cacheSize: 1000,          // default: 100, configurable LRU capacity
+  synchronous: 'full',      // 'full' (default, fsync per commit), 'normal' (coalesced timer), or 'off'
+  fileLock: true,           // default: true, cross-process .lock directory guard
+  backup: { ... },          // optional: install a BackupConfig at construction
+  hydrateOnStartup: { ... },// optional: v2 hydration before engine init
 });
 ```
 
 ## Testing
 
 ```bash
-npm run build           # tsc + full test suite
-npm run test            # full suite (includes the ~60s benchmark)
-npm run test:production # ACID + schema + transactions + perf
-npm run test:backup     # backup + scheduling + retention
-npm run test:schema     # schema validation
-npm run test:legacy     # legacy suite
-node local_tests/v2-test.js   # v2: hydrate + bucket backup surface
+npm run build           # compile TypeScript
+npm run test            # unit test suite
+npm run test:production # comprehensive ACID production test suite (54/54)
+npm run ci              # CI suite (unit tests + production test suite)
+npm run verify          # pre-flight verification
+npm run bench:quick     # quick engine benchmark suite
+npm run bench:live      # live bucket S3 benchmark suite
 ```
 
 ### Testing S3 live backup locally (MinIO)
