@@ -131,6 +131,8 @@ db.cancelScheduledBackup(scheduleId);
 
 Tero interacts directly with object storage from each instance, keeping credentials local and isolated.
 
+📊 **Cost comparison:** see [BUCKET_COST_DATA.md](./BUCKET_COST_DATA.md) for AWS S3 vs Cloudflare R2 pricing (verified 2026-08-28), how backup operations map to billed requests, and monthly cost scenarios.
+
 ## Cloud recovery
 
 ```javascript
