@@ -191,6 +191,7 @@ export class Transaction {
         this.rolledBack = true;
         this.db._rollbackRaw(this.id).catch(() => {});
       }, options.timeout);
+      (this.timeoutTimer as any).unref?.();
     }
   }
 
@@ -233,6 +234,10 @@ export class Transaction {
 
   async create(key: string, initialData?: any): Promise<void> {
     this._checkActive();
+    // Acquire exclusive lock BEFORE existence check to close TOCTOU
+    // (two concurrent create('same') both passed exists() before either held the lock)
+    const lockRes = (this.db as any).acidEngine.acquireExclusiveLock(this.id, key);
+    if (lockRes instanceof Promise) await lockRes;
     if (this.db.exists(key)) throw new Error(`Document '${key}' already exists`);
     await this.db._writeRaw(this.id, key, initialData || {});
     this.opCount++;
@@ -361,8 +366,8 @@ export class Tero {
       if (synchronous && !['full', 'normal', 'off'].includes(synchronous)) {
         throw new Error(`Invalid synchronous mode '${synchronous}'. Expected 'full', 'normal', or 'off'.`);
       }
-      if (synchronous === 'off' && process.env.NODE_ENV === 'production') {
-        throw new Error("synchronous='off' is not allowed in production (NODE_ENV=production) — it disables all fsync and will lose data on crash. Use 'full' or 'normal'.");
+      if (synchronous === 'off' && (process.env.TERO_ALLOW_UNSAFE_OFF !== '1' && process.env.NODE_ENV !== 'test' && process.env.NODE_ENV !== 'development')) {
+        throw new Error("synchronous='off' is not allowed — it disables all fsync and will lose data on crash. Use 'full' or 'normal'. Set TERO_ALLOW_UNSAFE_OFF=1 to force in benchmarks.");
       }
 
       if (typeof rawDirectory === "string" && rawDirectory.trim()) {
@@ -451,47 +456,42 @@ export class Tero {
       continueOnError: hydrate.continueOnError ?? true,
     });
 
+    let hydrateCancelled = false;
     const hydrateWork = async (): Promise<void> => {
       try {
         const mode = hydrate.mode ?? 'missing';
+        if (hydrateCancelled) return;
         if (mode === 'all') {
-          const r = await recovery.recoverIndividualFiles();
+          const r = await recovery.recoverIndividualFiles(undefined, () => hydrateCancelled);
           if (!r.success && r.failed.length > 0) { /* continue */ }
         } else if (mode === 'snapshot') {
-          // Snapshot-first: download the most recent tar.gz archive, extract it
-          // locally in bulk (one HTTP GET for potentially thousands of docs), then
-          // fill gaps with individual file recovery for any data written since the
-          // snapshot's checkpoint. This is the Google-recommended hydration pattern:
-          // one bulk download instead of sequential individual S3 GETs.
+          if (hydrateCancelled) return;
           try {
             const snapshotResult = await recovery.recoverFromArchive();
+            if (hydrateCancelled) return;
             if (!snapshotResult.success) {
-              // Fall back to individual file recovery if no archive exists
-              const r = await recovery.recoverMissingFiles();
+              if (hydrateCancelled) return;
+              const r = await recovery.recoverMissingFiles(() => hydrateCancelled);
               if (!r.success && r.failed.length > 0) { /* continue */ }
             }
           } catch {
-            // Archive may not exist or may be corrupted; fall back gracefully
-            const r = await recovery.recoverMissingFiles();
+            if (hydrateCancelled) return;
+            const r = await recovery.recoverMissingFiles(() => hydrateCancelled);
             if (!r.success && r.failed.length > 0) { /* continue */ }
           }
         } else {
-          const r = await recovery.recoverMissingFiles();
+          const r = await recovery.recoverMissingFiles(() => hydrateCancelled);
           if (!r.success && r.failed.length > 0) { /* continue */ }
         }
       } catch (error) {
         // Hydration errors are non-fatal; engine init proceeds with whatever local data exists.
       }
     };
-    // HydrateConfig.timeout was declared but never enforced — a hung bucket GET
-    // could block engine construction forever. Race the hydration against the
-    // deadline; on expiry the engine proceeds with whatever local state exists
-    // (same non-fatal contract as a hydration failure).
     const timeoutMs = hydrate.timeout;
     if (typeof timeoutMs === 'number' && timeoutMs > 0) {
       await Promise.race([
         hydrateWork(),
-        new Promise<void>((resolve) => { const t = setTimeout(resolve, timeoutMs); t.unref?.(); }),
+        new Promise<void>((resolve) => { const t = setTimeout(() => { hydrateCancelled = true; resolve(); }, timeoutMs); (t as any).unref?.(); }),
       ]);
     } else {
       await hydrateWork();
@@ -520,16 +520,31 @@ export class Tero {
       throw new Error('Data recovery not configured. Call configureDataRecovery() or pass hydrateOnStartup in config.');
     }
     const mode = options?.mode ?? 'missing';
-    if (mode === 'all') {
-      return await recovery.recoverIndividualFiles();
-    } else if (mode === 'snapshot') {
-      try {
-        return await recovery.recoverFromArchive();
-      } catch {
-        return await recovery.recoverMissingFiles();
+    const timeoutMs = options?.timeout;
+    let cancelled = false;
+    let timeoutTimer: any;
+    if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => { cancelled = true; }, timeoutMs);
+      timeoutTimer.unref?.();
+    }
+    try {
+      if (cancelled) throw new Error(`Hydrate timed out after ${timeoutMs}ms`);
+      if (mode === 'all') {
+        return await recovery.recoverIndividualFiles(undefined, () => cancelled);
+      } else if (mode === 'snapshot') {
+        try {
+          const r = await recovery.recoverFromArchive();
+          if (cancelled) throw new Error(`Hydrate timed out after ${timeoutMs}ms`);
+          return r;
+        } catch (e) {
+          if (cancelled) throw e;
+          return await recovery.recoverMissingFiles(() => cancelled);
+        }
+      } else {
+        return await recovery.recoverMissingFiles(() => cancelled);
       }
-    } else {
-      return await recovery.recoverMissingFiles();
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
     }
   }
 

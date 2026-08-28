@@ -213,7 +213,7 @@ export class DataRecovery {
         }
     }
 
-    async recoverIndividualFiles(keys?: string[]): Promise<RecoveryResult> {
+    async recoverIndividualFiles(keys?: string[], isCancelled?: () => boolean): Promise<RecoveryResult> {
         const startTime = Date.now();
         const recovered: string[] = [];
         const failed: string[] = [];
@@ -237,6 +237,7 @@ export class DataRecovery {
             // ~25ms × (50,000 / 10) ≈ 125 seconds (~2 min) and can be tuned higher.
             const concurrency = this.config.concurrency ?? 10;
             for (let i = 0; i < keys.length; i += concurrency) {
+                if (isCancelled?.()) break;
                 const batch = keys.slice(i, i + concurrency);
                 const results = await Promise.allSettled(
                     batch.map(async (key) => {
@@ -390,7 +391,7 @@ export class DataRecovery {
      * Recover only files that exist in the cloud but are missing locally.
      * Returns the standard RecoveryResult. Used by v2 hydrate-on-startup (mode='missing').
      */
-    async recoverMissingFiles(): Promise<RecoveryResult> {
+    async recoverMissingFiles(isCancelled?: () => boolean): Promise<RecoveryResult> {
         const startTime = Date.now();
         try {
             const missing = await this.listMissingLocally();
@@ -403,7 +404,7 @@ export class DataRecovery {
                     duration: Date.now() - startTime,
                 };
             }
-            const result = await this.recoverIndividualFiles(missing);
+            const result = await this.recoverIndividualFiles(missing, isCancelled);
             result.duration = Date.now() - startTime;
             return result;
         } catch (error) {
