@@ -22,3 +22,4 @@ RecoveryTestDB/**
 BenchDB/
 RecoveryBench**
 *.wal.**
+channels4_profile.jpg
