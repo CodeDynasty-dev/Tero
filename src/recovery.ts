@@ -62,10 +62,24 @@ export class DataRecovery {
         }
     }
 
+    private getDbName(): string {
+        const override = (this.config.cloudStorage as any)?.dbName || (this.config as any)?.bucketPrefix;
+        if (typeof override === 'string' && override.trim()) {
+            return override.trim().replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
+        }
+        const raw = this.config.localPath;
+        const base = raw.split('/').pop() || 'database';
+        let h = 0x811c9dc5;
+        for (let i = 0; i < raw.length; i++) { h ^= raw.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+        const suffix = h.toString(16).padStart(8, '0').slice(0, 6);
+        return `${base}-${suffix}`;
+    }
+
     private getCloudKey(filename: string): string {
         const prefix = this.config.cloudStorage.pathPrefix || 'tero-backups';
-        const dbName = this.config.localPath.split('/').pop() || 'database';
-        return `${prefix}/${dbName}/${filename}`;
+        const dbName = this.getDbName();
+        if (!filename) return `${prefix}/${dbName}/`;
+        return `${prefix}/${dbName}/${filename.replace(/^\/+/, '')}`;
     }
 
     private isNotFound(error: any): boolean {
@@ -443,10 +457,21 @@ export class DataRecovery {
                 file: archivePath,
                 cwd: targetDir,
                 strip: 1, // Remove the top-level directory from the archive
-                filter: (path: string) => {
+                // Hardened: block ZipSlip + symlink escape. Tar entries can be symlinks
+                // that point outside targetDir; the filter below rejects any path that
+                // resolves outside, and we additionally reject symlink/hardlink types.
+                filter: (path: string, entry: any) => {
+                    // Reject symlink and hardlink entries entirely — they can escape even if path looks safe
+                    const type = entry?.type?.toLowerCase?.();
+                    if (type === 'symlink' || type === 'symboliclink' || type === 'link') return false;
+                    if (entry?.linkpath) return false;
                     // Prevent path traversal (Zip Slip / Tar Slip)
                     const resolved = pathResolve(targetDir, path);
-                    return (resolved === targetDir || resolved.startsWith(targetDir + '/')) && !path.includes('..');
+                    if (!(resolved === targetDir || resolved.startsWith(targetDir + '/'))) return false;
+                    if (path.includes('..')) return false;
+                    // Also reject entries with absolute paths
+                    if (path.startsWith('/')) return false;
+                    return true;
                 }
             });
 

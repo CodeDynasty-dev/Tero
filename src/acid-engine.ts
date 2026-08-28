@@ -276,8 +276,9 @@ export class WriteAheadLog {
             if (stats.size > this.LOG_FILE_SIZE_LIMIT) {
                 this.rotateLog();
             }
-        } catch (error) {
-            // Silent failure for production
+        } catch (error: any) {
+            // Surface disk-full errors — silent rotation failure masks durability loss
+            if (error?.code === 'ENOSPC') throw error;
         }
     }
 
@@ -314,8 +315,9 @@ export class WriteAheadLog {
 
             // Clean up old archives to prevent indefinite growth (keep last N locally)
             this.cleanupOldArchives(this.ARCHIVE_KEEP_COUNT);
-        } catch (error) {
-            // Silent failure for production
+        } catch (error: any) {
+            if (error?.code === 'ENOSPC') throw error;
+            // Other rotation errors are best-effort; WAL remains usable
         }
     }
 
@@ -403,8 +405,8 @@ export class WriteAheadLog {
             if (this.synchronous === 'full') this.fsyncFile(this.logPath);
             this.dirty = false;
             this.cleanupOldArchives(0);
-        } catch (error) {
-            // Silent failure
+        } catch (error: any) {
+            if (error?.code === 'ENOSPC') throw error;
         }
     }
 
@@ -927,8 +929,8 @@ export class ACIDStorageEngine {
         try {
             const filePath = partitionedPath(this.dbPath, entry.key!);
             this.atomicWriteFile(filePath, JSON.stringify(entry.afterImage, null, 2));
-        } catch (error) {
-            // Silent failure for production
+        } catch (error: any) {
+            if (error?.code === 'ENOSPC') throw error;
         }
     }
 
@@ -940,8 +942,8 @@ export class ACIDStorageEngine {
             if (existsSync(filePath)) {
                 unlinkSync(filePath);
             }
-        } catch (error) {
-            // Silent failure for production
+        } catch (error: any) {
+            if (error?.code === 'ENOSPC') throw error;
         }
     }
 
@@ -965,8 +967,8 @@ export class ACIDStorageEngine {
                 // Restore deleted file
                 this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage, null, 2));
             }
-        } catch (error) {
-            // Silent failure for production
+        } catch (error: any) {
+            if (error?.code === 'ENOSPC') throw error;
         }
     }
 
@@ -999,8 +1001,13 @@ export class ACIDStorageEngine {
         }
     }
 
+    private static readonly MAX_ACTIVE_TXNS = 10000;
+
     // Transaction management
     beginTransaction(): string {
+        if (this.activeTransactions.size >= ACIDStorageEngine.MAX_ACTIVE_TXNS) {
+            throw new Error(`Too many active transactions (${this.activeTransactions.size} >= ${ACIDStorageEngine.MAX_ACTIVE_TXNS}) — commit or rollback before starting more`);
+        }
         const transactionId = `t${this.pid}_${this.txSalt}_${Date.now().toString(36)}_${this.txCounter++}`;
         const startLSN = this.wal.writeLog({
             operation: 'BEGIN',

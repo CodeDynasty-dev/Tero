@@ -91,6 +91,8 @@ export interface CloudStorageConfig {
   secretAccessKey: string;
   endpoint?: string; // For R2 or custom S3-compatible services
   pathPrefix?: string; // Optional path prefix in bucket
+  /** Override the derived bucket subprefix (avoids basename collisions). Defaults to "<basename>-<hash>". */
+  dbName?: string;
 }
 
 /** Injectable logger for BackupManager. Pass your own to route backup logs into
@@ -111,6 +113,8 @@ export interface BackupConfig {
   includeMetadata?: boolean; // Include file timestamps, sizes, etc. (optional - adds overhead)
   metadataUse?: 'verification' | 'audit' | 'recovery' | 'none'; // What to use metadata for
   logger?: 'silent' | BackupLogger; // Injected logger; default = silent
+  /** Override bucket subprefix (takes precedence over cloudStorage.dbName). */
+  bucketPrefix?: string;
 }
 
 export interface BackupMetadata {
@@ -426,6 +430,30 @@ export class BackupManager {
 
     try {
       if (!existsSync(localPath)) return;
+      const stat = statSync(localPath);
+      // Stream large files (>5MB) via multipart Upload to avoid loading entire file into heap (OOM on tar.gz)
+      const isLarge = stat.size > 5 * 1024 * 1024;
+      if (isLarge) {
+        const stream = createReadStream(localPath);
+        const upload = new Upload({
+          client: this.s3Client,
+          params: {
+            Bucket: this.config.cloudStorage.bucket,
+            Key: cloudKey,
+            Body: stream,
+            ContentType: cloudKey.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+            Metadata: {
+              'backup-timestamp': new Date().toISOString(),
+              'source-db': this.getDbName(),
+              'backup-format': this.config.format
+            }
+          },
+          queueSize: 4,
+          partSize: 5 * 1024 * 1024,
+        });
+        await upload.done();
+        return;
+      }
       const fs = await import('fs/promises');
       const body = await fs.readFile(localPath);
 
@@ -436,7 +464,7 @@ export class BackupManager {
         ContentType: cloudKey.endsWith('.json') ? 'application/json' : 'application/octet-stream',
         Metadata: {
           'backup-timestamp': new Date().toISOString(),
-          'source-db': basename(this.dbPath),
+          'source-db': this.getDbName(),
           'backup-format': this.config.format
         }
       });
@@ -490,10 +518,37 @@ export class BackupManager {
     }
   }
 
+  /**
+   * Derive a collision-free bucket key prefix for this DB instance.
+   * The old `basename(dbPath)` implementation made `/tmp/a/TeroDB` and
+   * `/tmp/b/TeroDB` collide on the same prefix (cross-tenant overwrite).
+   * We now use `pathPrefix/<safeDbName>` where `safeDbName` is derived from
+   * the FULL resolved path when a custom `dbName` isn't supplied.
+   * Explicit `cloudStorage.dbName` or `BackupConfig.bucketPrefix` takes
+   * precedence for callers who want stable, human-readable prefixes.
+   */
+  private getDbName(): string {
+    // Allow caller to override — useful for stable bucket layouts
+    const override = (this.config.cloudStorage as any)?.dbName || (this.config as any)?.bucketPrefix;
+    if (typeof override === 'string' && override.trim()) {
+      return override.trim().replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
+    }
+    // Default: hash the full resolved path to avoid collisions, keeping basename for readability
+    const base = basename(this.dbPath) || 'tero';
+    // Use a short hash of the full path so different directories with same basename diverge
+    const full = this.dbPath;
+    let h = 0x811c9dc5;
+    for (let i = 0; i < full.length; i++) { h ^= full.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    const suffix = h.toString(16).padStart(8, '0').slice(0, 6);
+    return `${base}-${suffix}`;
+  }
+
   private getCloudKey(filename: string): string {
     const prefix = this.config.cloudStorage?.pathPrefix || 'tero-backups';
-    const dbName = basename(this.dbPath);
-    return `${prefix}/${dbName}/${filename}`;
+    const dbName = this.getDbName();
+    // filename is already sanitized (key + ".json" or archive name); avoid double slashes
+    if (!filename) return `${prefix}/${dbName}/`;
+    return `${prefix}/${dbName}/${filename.replace(/^\/+/, '')}`;
   }
 
   async performBackup(): Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }> {
@@ -735,10 +790,10 @@ export class BackupManager {
         if (!existsSync(archivePath)) return;
         try {
           const segName = basename(archivePath);
-          const prefix = this.config.cloudStorage!.pathPrefix || 'tero-backups';
-          const dbName = basename(this.dbPath);
-          const cloudKey = `${prefix}/${dbName}/wal/${segName}`;
-          await this.uploadToCloud(archivePath, cloudKey);
+          const cloudKey = `${this.getDbName()}/wal/${segName}`;
+          // getCloudKey already prefixes, but for WAL we need wal/ subprefix
+          const walKey = `${this.config.cloudStorage!.pathPrefix || 'tero-backups'}/${cloudKey}`;
+          await this.uploadToCloud(archivePath, walKey);
           uploadedWALSegments++;
         } catch (error) {
           errors.push(`wal:${basename(archivePath)}:${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -752,9 +807,9 @@ export class BackupManager {
           tag: options?.tag ?? 'manual',
           dataFiles: jsonFiles.map(f => f.name),
           walSegments: walPaths.map(p => basename(p)),
-          dbPath: basename(this.dbPath),
+          dbPath: this.getDbName(),
         };
-        const manifestKey = `${this.config.cloudStorage.pathPrefix || 'tero-backups'}/${basename(this.dbPath)}/MANIFEST.json`;
+        const manifestKey = `${this.config.cloudStorage.pathPrefix || 'tero-backups'}/${this.getDbName()}/MANIFEST.json`;
         await this.uploadBuffer(
           JSON.stringify(manifest, null, 2),
           manifestKey,
@@ -797,7 +852,7 @@ export class BackupManager {
       ContentType: contentType,
       Metadata: {
         'backup-timestamp': new Date().toISOString(),
-        'source-db': basename(this.dbPath),
+        'source-db': this.getDbName(),
       },
     });
     await this.s3Client.send(cmd);
@@ -834,14 +889,14 @@ export class BackupManager {
 
   private liveCloudPrefix(nodeId: string): string {
     const base = this.config.cloudStorage?.pathPrefix || 'tero-backups';
-    return `${base}/${basename(this.dbPath)}/nodes/${nodeId}/`;
+    return `${base}/${this.getDbName()}/nodes/${nodeId}/`;
   }
 
   private async uploadBytes(key: string, body: Buffer, contentType = 'application/octet-stream'): Promise<void> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
     await this.s3Client.send(new PutObjectCommand({
       Bucket: this.config.cloudStorage.bucket, Key: key, Body: body, ContentType: contentType,
-      Metadata: { 'backup-timestamp': new Date().toISOString(), 'source-db': basename(this.dbPath) },
+      Metadata: { 'backup-timestamp': new Date().toISOString(), 'source-db': this.getDbName() },
     }));
   }
 
@@ -1039,7 +1094,7 @@ export class BackupManager {
       // user pathPrefix or database name containing "nodes" and restore from the
       // wrong node (e.g. pathPrefix 'my/nodes/stuff' would capture 'stuff').
       const base = this.config.cloudStorage?.pathPrefix || 'tero-backups';
-      const nodesPrefix = `${base}/${basename(this.dbPath)}/nodes/`;
+      const nodesPrefix = `${base}/${this.getDbName()}/nodes/`;
       const all = await this.listPrefix(nodesPrefix);
       const ids = new Set<string>();
       for (const k of all) { const id = k.slice(nodesPrefix.length).split('/')[0]; if (id) ids.add(id); }

@@ -177,6 +177,8 @@ export class Transaction {
    *  including deletes. One array push per op: O(1), off the engine hot path. */
   private operationsLog: Array<{ key: string; operation: string }> = [];
   private destroyed: boolean = false;
+  private committed: boolean = false;
+  private rolledBack: boolean = false;
   private timeoutTimer?: ReturnType<typeof setTimeout>;
 
   constructor(id: string, db: Tero, options?: TransactionOptions) {
@@ -186,6 +188,7 @@ export class Transaction {
     if (options?.timeout) {
       this.timeoutTimer = setTimeout(() => {
         this.destroyed = true;
+        this.rolledBack = true;
         this.db._rollbackRaw(this.id).catch(() => {});
       }, options.timeout);
     }
@@ -196,20 +199,36 @@ export class Transaction {
   }
 
   isActive(): boolean {
-    if (this.destroyed) return false;
+    if (this.destroyed || this.committed || this.rolledBack) return false;
     return this.db.getActiveTransactions().includes(this.id);
   }
 
   isRolledBack(): boolean {
-    return !this.isActive();
+    if (this.rolledBack) return true;
+    if (this.destroyed) return true;
+    const status = this.db._getTxStatus(this.id);
+    if (status === 'aborted') { this.rolledBack = true; return true; }
+    return false;
+  }
+
+  isCommitted(): boolean {
+    if (this.committed) return true;
+    return this.db._getTxStatus(this.id) === 'committed';
   }
 
   private _checkActive(): void {
     if (this.destroyed) throw new Error('Transaction has been destroyed');
+    if (this.committed) throw new Error('Transaction has already been committed');
+    if (this.rolledBack) throw new Error('Transaction has been rolled back');
     const status = this.db._getTxStatus(this.id);
-    if (status === 'committed') throw new Error('Transaction has already been committed');
-    if (status === 'aborted') throw new Error('Transaction has been rolled back');
-    if (status === 'not_found') throw new Error('Transaction is not active');
+    if (status === 'committed') { this.committed = true; throw new Error('Transaction has already been committed'); }
+    if (status === 'aborted') { this.rolledBack = true; throw new Error('Transaction has been rolled back'); }
+    if (status === 'not_found') {
+      // Engine GC'd the transaction (after commit/rollback). Use local flags to give precise error
+      if (this.committed) throw new Error('Transaction has already been committed');
+      if (this.rolledBack) throw new Error('Transaction has been rolled back');
+      throw new Error('Transaction is not active');
+    }
   }
 
   async create(key: string, initialData?: any): Promise<void> {
@@ -253,6 +272,11 @@ export class Transaction {
   }
 
   getState(): { status: string; operations: Array<{ key: string; operation: string }>; startTime: number } {
+    if (this.committed) return { status: 'committed', operations: [...this.operationsLog], startTime: this.startTime };
+    if (this.rolledBack || this.destroyed) {
+      const s = this.db._getTxStatus(this.id);
+      if (s === 'aborted' || this.rolledBack) return { status: 'rolled_back', operations: [...this.operationsLog], startTime: this.startTime };
+    }
     const status = this.db._getTxStatus(this.id);
     return {
       status: status === 'active' ? 'active' : (status === 'committed' ? 'committed' : 'rolled_back'),
@@ -269,12 +293,14 @@ export class Transaction {
     this._checkActive();
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
     await this.db.commit(this.id);
+    this.committed = true;
   }
 
   async abort(): Promise<void> {
     if (this.destroyed) return;
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
     await this.db._rollbackRaw(this.id);
+    this.rolledBack = true;
   }
 
   async rollback(): Promise<void> {
@@ -283,6 +309,7 @@ export class Transaction {
 
   destroy(): void {
     this.destroyed = true;
+    this.rolledBack = true;
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
     this.db._rollbackRaw(this.id).catch(() => {});
   }
@@ -333,6 +360,9 @@ export class Tero {
 
       if (synchronous && !['full', 'normal', 'off'].includes(synchronous)) {
         throw new Error(`Invalid synchronous mode '${synchronous}'. Expected 'full', 'normal', or 'off'.`);
+      }
+      if (synchronous === 'off' && process.env.NODE_ENV === 'production') {
+        throw new Error("synchronous='off' is not allowed in production (NODE_ENV=production) — it disables all fsync and will lose data on crash. Use 'full' or 'normal'.");
       }
 
       if (typeof rawDirectory === "string" && rawDirectory.trim()) {
@@ -518,9 +548,14 @@ export class Tero {
     }
   }
 
+  private static readonly MAX_KEY_LENGTH = 200;
+
   private validateKey(key: string): void {
     if (!key || typeof key !== 'string' || !key.trim()) {
       throw new Error('Key must be a non-empty string');
+    }
+    if (key.length > Tero.MAX_KEY_LENGTH) {
+      throw new Error(`Key exceeds maximum length of ${Tero.MAX_KEY_LENGTH} characters (got ${key.length})`);
     }
     // Sanitize key to prevent path traversal, hidden files, and illegal chars
     if (key.includes('..') || key.includes('/') || key.includes('\\') || key.includes('\0') || key === '.' || key.startsWith('.')) {
@@ -592,9 +627,11 @@ export class Tero {
 
       data = deepClone(data);
 
-      const serializedLen = typeof data === 'string' ? data.length : JSON.stringify(data).length;
-      if (serializedLen > MAX_DOCUMENT_SIZE) {
-        throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB)`);
+      // Use byte length, not char length — 'é' is 1 char but 2 bytes UTF-8, emoji is 4 bytes
+      const jsonStr = JSON.stringify(data);
+      const byteLen = Buffer.byteLength(jsonStr, 'utf8');
+      if (byteLen > MAX_DOCUMENT_SIZE) {
+        throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB) — got ${(byteLen / (1024*1024)).toFixed(2)}MB`);
       }
 
       // Perform schema validation if requested
@@ -747,39 +784,44 @@ export class Tero {
   }): Promise<ValidationResult | boolean> {
     this.validateKey(key);
 
-    // Fast existence check: LRU hit → known exists. On LRU miss we MUST
-    // verify on disk — a miss means either "new key" OR "evicted / cold-boot
-    // / restarted node". The previous `size >= MAX` guard only checked at
-    // capacity, so a cold boot with 1 existing doc would never hit the
-    // fallback and would silently overwrite via merge.
-    if (this.knownKeys.has(key)) {
-      return false; // already exists
-    }
-    // Check committedBuffer before disk — a just-committed doc may not be
-    // flushed to its data file yet (deferred via committedBuffer, 50ms).
-    const pending = this.acidEngine.getCommittedData(key);
-    if (pending !== undefined) {
-      // committedBuffer says "exists" (write) or "deleted" (null tombstone)
-      if (pending !== null) {
-        this.knownKeys.set(key, true);
-        return false; // duplicate — already committed, not yet flushed
-      }
-      // tombstone → logically absent, fall through to allow re-create
-    } else if (existsSync(this.keyToPath(key))) {
-      this.knownKeys.set(key, true); // re-pin; existed all along
-      return false;
-    }
-
     const transactionId = this._beginTransaction();
 
     try {
+      // Serialize existence check under an exclusive lock — two concurrent
+      // create('sameKey') must not both succeed (TOCTOU). Acquire exclusive
+      // first, then check committed state under that lock.
+      const lockRes = this.acidEngine.acquireExclusiveLock(transactionId, key);
+      if (lockRes instanceof Promise) await lockRes;
+
+      // Check existence while holding the lock (covers knownKeys, committedBuffer, disk)
+      if (this.knownKeys.has(key)) {
+        await this.rollback(transactionId);
+        return false; // already exists
+      }
+      const pending = this.acidEngine.getCommittedData(key);
+      if (pending !== undefined) {
+        if (pending !== null) {
+          this.knownKeys.set(key, true);
+          await this.rollback(transactionId);
+          return false; // duplicate — already committed, not yet flushed
+        }
+        // tombstone → logically absent, fall through to allow re-create
+      } else if (existsSync(this.keyToPath(key))) {
+        this.knownKeys.set(key, true); // re-pin; existed all along
+        await this.rollback(transactionId);
+        return false;
+      }
+      // Also check pendingWrites of other active tx via reading within tx
+      // (write will deepMerge, but for create we need empty). The exclusive
+      // lock guarantees no other tx is writing this key concurrently.
+
       const result = await this.write(transactionId, key, initialData || {}, options);
       await this.commit(transactionId);
       this.knownKeys.set(key, true);
 
       return result || true;
     } catch (error) {
-      await this.rollback(transactionId);
+      try { await this.rollback(transactionId); } catch {}
       throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
@@ -802,8 +844,10 @@ export class Tero {
   }
 
   /**
-   * Read a document. Returns the document data on success, or `false` if the
-   * document is absent. Throws for genuine errors.
+   * Read a document. Returns the document data on success, or `null` if the
+   * document is absent (use `=== null` to check). For backwards-compat, `false`
+   * is still treated as "not found" by callers, but new code should check for null.
+   * Throws for genuine errors (invalid key, corrupt file).
    *
    * Fast path (3 tiers, zero-syscall on hit):
    *   1. LRU cache (committed entries) — pure memory, 900k+ ops/s
@@ -813,7 +857,7 @@ export class Tero {
    *
    * NO transaction is created, NO WAL I/O, NO lock acquired.
    */
-  async get(key: string): Promise<any> {
+  async get(key: string): Promise<any | null> {
     this.validateKey(key);
     this.cacheRequests++;
 
@@ -827,7 +871,7 @@ export class Tero {
     // 2. Check committedBuffer (committed but not yet flushed to data files)
     const committed = this.acidEngine.getCommittedData(key);
     if (committed !== undefined) {
-      if (committed === null) return false;
+      if (committed === null) return null;
       this.updateCache(key, committed, undefined);
       return deepClone(committed);
     }
@@ -835,7 +879,7 @@ export class Tero {
     // 3. Slow path: read directly from disk (partitioned path; atomic rename = consistent)
     const filePath = this.keyToPath(key);
     if (!existsSync(filePath)) {
-      return false;
+      return null;
     }
 
     try {
@@ -879,23 +923,20 @@ export class Tero {
   }
 
   exists(key: string): boolean {
-    try {
-      this.validateKey(key);
-      // Fast path: in-memory set
-      if (this.knownKeys.has(key)) return true;
-      // Check committedBuffer for pending deletes (deferred writes may not have
-      // unlinked the file yet — a committed delete should appear as absent)
-      const committed = this.acidEngine.getCommittedData(key);
-      if (committed !== undefined) return committed !== null;
-      // Slow path: check disk via partitioned path
-      if (existsSync(this.keyToPath(key))) {
-        this.knownKeys.set(key, true);
-        return true;
-      }
-      return false;
-    } catch (error) {
-      return false;
+    // Fail-fast on invalid keys — don't mask programming errors as "not found"
+    this.validateKey(key);
+    // Fast path: in-memory set
+    if (this.knownKeys.has(key)) return true;
+    // Check committedBuffer for pending deletes (deferred writes may not have
+    // unlinked the file yet — a committed delete should appear as absent)
+    const committed = this.acidEngine.getCommittedData(key);
+    if (committed !== undefined) return committed !== null;
+    // Slow path: check disk via partitioned path
+    if (existsSync(this.keyToPath(key))) {
+      this.knownKeys.set(key, true);
+      return true;
     }
+    return false;
   }
 
   // Batch Operations
@@ -1353,15 +1394,15 @@ export class Tero {
 
   /**
    * Read a key locally; if absent locally, transparently recover it from the client's
-   * bucket and cache the result. Returns the data, or `false` if the key genuinely
-   * doesn't exist on either side. Throws for real (auth/network) errors so callers
-   * don't silently mistake them for "not in cloud".
+   * bucket and cache the result. Returns the data, or `null` if the key genuinely
+   * doesn't exist on either side (returns `false` for backwards compat — both mean "not found").
+   * Throws for real (auth/network) errors so callers don't silently mistake them for "not in cloud".
    *
    * Options:
    *   - fallbackToCloud: boolean (default true) — set false to skip cloud fetch
    *   - mode: 'missing' (default) — only fetch if missing locally; 'all' — always overwrite from cloud
    */
-  async getWithRecovery(key: string, options?: { fallbackToCloud?: boolean; mode?: 'missing' | 'all' }): Promise<any> {
+  async getWithRecovery(key: string, options?: { fallbackToCloud?: boolean; mode?: 'missing' | 'all' }): Promise<any | null> {
     try {
       this.validateKey(key);
     } catch (error) {
@@ -1370,17 +1411,17 @@ export class Tero {
 
     const fallbackToCloud = options?.fallbackToCloud ?? true;
 
-    // 1) Try local first.
+    // 1) Try local first. Handle both null (new) and false (legacy) as "not found"
     const localData = await this.get(key);
-    if (localData !== false) {
+    if (localData !== null && (localData as any) !== false) {
       return localData;
     }
 
     // 2) Not local. Optionally fall back to cloud.
-    if (!fallbackToCloud) return false;
+    if (!fallbackToCloud) return null;
     if (!this.dataRecovery) {
-      // No cloud configured — return false to keep "absent" semantics consistent with get().
-      return false;
+      // No cloud configured — return null to keep "absent" semantics consistent with get().
+      return null;
     }
 
     // 3) Best-effort cloud fetch. If it fails for any reason (auth, network, timeout,
@@ -1391,14 +1432,14 @@ export class Tero {
     try {
       const recovered = await this.dataRecovery.recoverSingleFile(key);
       if (!recovered) {
-        return false;
+        return null;
       }
       // Cache + return the freshly hydrated data.
       // Re-run get() so the read goes through the cache + lint path.
       this.cache.delete(key);
       return await this.get(key);
     } catch (error) {
-      return false;
+      return null;
     }
   }
 
@@ -1585,7 +1626,13 @@ export class Tero {
   }
 
   destroy(): void {
+    // Sync destroy cannot drain inflight S3 uploads (that's async) — warn if live backup has in-flight work.
+    // Prefer `await db.destroyAsync()` / `await db.close()` in production when live backup is enabled.
     if (this.backupManager) {
+      const live = (this.backupManager as any).liveCheckpointPromise;
+      if (live) {
+        console.warn('[Tero] destroy() called with inflight live checkpoint — use await destroyAsync() to avoid losing the last checkpoint.');
+      }
       this.backupManager.destroy();
     }
     if (this.acidEngine) {
