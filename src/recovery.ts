@@ -446,7 +446,7 @@ export class DataRecovery {
                 filter: (path: string) => {
                     // Prevent path traversal (Zip Slip / Tar Slip)
                     const resolved = pathResolve(targetDir, path);
-                    return resolved.startsWith(targetDir) && !path.includes('..');
+                    return (resolved === targetDir || resolved.startsWith(targetDir + '/')) && !path.includes('..');
                 }
             });
 

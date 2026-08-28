@@ -17,18 +17,20 @@ import QuickLRU from "quick-lru";
 const PROCESS_UNIQUE = randomBytes(5);
 let idCounter = ~~(Math.random() * 0xffffff);
 
+const MAX_DOCUMENT_DEPTH = 32;
+
 /**
  * Clone for cache safety — hot-path optimized.
  * Flat JSON docs (no nested objects/arrays) are shallow-copied via spread
  * (~0.04µs) vs ~2.7µs for structuredClone — 60× faster. Bench tiny docs
  * are flat, so hot cached `get()` stays near 500k ops/s instead of 85k.
- * Nested docs fall through to structuredClone (preserves Dates, Arrays).
- * Cloning on store *and* on return guarantees `doc = await get(k); doc.x=evil`
- * cannot poison the LRU, and `data = {nested:{a:1}}; create(k,data); data.nested.a=2`
- * cannot poison pendingWrites.
+ * Nested docs are recursively cloned with depth and cycle guards.
  */
-function deepClone<T>(value: T): T {
+function deepClone<T>(value: T, depth = 0, seen = new WeakSet<object>()): T {
   if (value === null || typeof value !== 'object') return value;
+  if (depth > MAX_DOCUMENT_DEPTH) {
+    throw new Error(`Document depth exceeds maximum allowed depth (${MAX_DOCUMENT_DEPTH})`);
+  }
   if (!Array.isArray(value)) {
     let hasNested = false;
     for (const k in value as any) {
@@ -38,13 +40,18 @@ function deepClone<T>(value: T): T {
       }
     }
     if (!hasNested) return { ...(value as any) } as T;
+    if (seen.has(value as object)) {
+      throw new Error('Circular reference detected in document');
+    }
+    seen.add(value as object);
     const copy: any = {};
     for (const k in value as any) {
       if (Object.prototype.hasOwnProperty.call(value, k)) {
         const v = (value as any)[k];
-        copy[k] = (v !== null && typeof v === 'object') ? deepClone(v) : v;
+        copy[k] = (v !== null && typeof v === 'object') ? deepClone(v, depth + 1, seen) : v;
       }
     }
+    seen.delete(value as object);
     return copy as T;
   }
   let hasNested = false;
@@ -54,27 +61,28 @@ function deepClone<T>(value: T): T {
     if (v !== null && typeof v === 'object') { hasNested = true; break; }
   }
   if (!hasNested) return [...(value as any)] as unknown as T;
+  if (seen.has(value as object)) {
+    throw new Error('Circular reference detected in document');
+  }
+  seen.add(value as object);
   const arr = new Array(len);
   for (let i = 0; i < len; i++) {
     const el = (value as any)[i];
-    arr[i] = (el !== null && typeof el === 'object') ? deepClone(el) : el;
+    arr[i] = (el !== null && typeof el === 'object') ? deepClone(el, depth + 1, seen) : el;
   }
+  seen.delete(value as object);
   return arr as unknown as T;
 }
 
 /**
- * Validate a user-supplied data directory name. Previously illegal characters
- * were silently stripped ('my db' quietly became 'mydb' — users wrote to the
- * wrong directory without knowing). Now: throw with an actionable message.
- * Allowed: letters, digits, '_', '-', '/' separators; absolute paths are
- * accepted as an explicit user choice; '..' segments always rejected; a
- * RELATIVE path must resolve inside the process working directory.
- * Called once at construction — zero hot-path cost. Returns the resolved
- * absolute path so all downstream joins are unambiguous.
+ * Validate a user-supplied data directory name.
  */
 function validateDirectory(raw: string): string {
   const dir = raw.trim();
   if (!dir) throw new Error('Directory name cannot be empty.');
+  if (dir === '.' || dir === './') {
+    throw new Error(`Invalid directory '${raw}': cannot use working directory root as database directory. Specify a named directory.`);
+  }
   if (/[^A-Za-z0-9_\-./]/.test(dir)) {
     throw new Error(
       `Invalid directory '${raw}': directory names may only contain letters, digits, '_', '-', '.' and '/' path separators.`
@@ -256,8 +264,20 @@ export class Transaction {
     return this.opCount;
   }
 
-  getDuration(): number {
-    return Date.now() - this.startTime;
+  async commit(): Promise<void> {
+    this._checkActive();
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    await this.db.commit(this.id);
+  }
+
+  async abort(): Promise<void> {
+    if (this.destroyed) return;
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    await this.db._rollbackRaw(this.id);
+  }
+
+  async rollback(): Promise<void> {
+    await this.abort();
   }
 
   destroy(): void {
@@ -307,8 +327,12 @@ export class Tero {
       if (config?.liveBackup && !config.backup?.cloudStorage) {
         throw new Error('config.liveBackup requires config.backup with cloudStorage configured — live backup needs a bucket.');
       }
-      const rawDirectory = (config as any)?.Directory || config?.directory;
+      const rawDirectory = config?.directory;
       const { cacheSize, synchronous, commitIntervalMs, dataFlushIntervalMs } = config || {};
+
+      if (synchronous && !['full', 'normal', 'off'].includes(synchronous)) {
+        throw new Error(`Invalid synchronous mode '${synchronous}'. Expected 'full', 'normal', or 'off'.`);
+      }
 
       if (typeof rawDirectory === "string" && rawDirectory.trim()) {
         // Throw on illegal characters instead of silently stripping them —
@@ -318,16 +342,15 @@ export class Tero {
       }
 
       if (typeof cacheSize === "number" && cacheSize > 0) {
-        this.cacheSize = Math.min(cacheSize, 1000); // Cap at 1k entries
+        this.cacheSize = cacheSize;
       }
 
       // Create directories with proper error handling
       this.initializeDirectories();
 
-      // Optional cross-process lock: prevents two processes from opening the
-      // same data directory concurrently (addresses Google Pillar #2 —
-      // zero cross-process synchronization). Lock-file based, no native deps.
-      if (config?.fileLock) {
+      // Cross-process lock enabled by default — prevents two processes from opening the
+      // same data directory concurrently (Google Pillar #2). Set fileLock: false to disable.
+      if (config?.fileLock !== false) {
         this.acquireFileLock();
       }
 
@@ -566,6 +589,8 @@ export class Tero {
         throw new Error('Data cannot be null or undefined');
       }
 
+      data = deepClone(data);
+
       // Perform schema validation if requested
       if (options?.validate || options?.schemaName) {
         const schemaName = options.schemaName || key;
@@ -616,6 +641,9 @@ export class Tero {
 
       if (options?.lock === 'exclusive') {
         const lockRes = this.acidEngine.acquireExclusiveLock(txId, key);
+        if (lockRes !== undefined && lockRes instanceof Promise) await lockRes;
+      } else {
+        const lockRes = this.acidEngine.acquireSharedLock(txId, key);
         if (lockRes !== undefined && lockRes instanceof Promise) await lockRes;
       }
 
@@ -918,9 +946,9 @@ export class Tero {
       // both the deadlock and the read-check-write overdraft race where
       // two transfers both pass the balance check under shared locks.
       const [firstKey, secondKey] = [fromKey, toKey].sort();
-      const a1 = (this.acidEngine as any).acquireExclusiveLock(transactionId, firstKey);
+      const a1 = this.acidEngine.acquireExclusiveLock(transactionId, firstKey);
       if (a1 !== undefined) await a1;
-      const a2 = (this.acidEngine as any).acquireExclusiveLock(transactionId, secondKey);
+      const a2 = this.acidEngine.acquireExclusiveLock(transactionId, secondKey);
       if (a2 !== undefined) await a2;
 
       // Now reads are performed while already holding exclusive — they
@@ -1489,34 +1517,39 @@ export class Tero {
       }
     };
     if (tryAcquire()) return;
-    // Held by someone (or stale). Read the holder PID and check liveness.
-    let pid = '?';
-    if (existsSync(lockPath)) {
-      try { pid = readFileSync(lockPath, 'utf-8').trim(); } catch { /* unreadable */ }
-    }
-    const pidNum = parseInt(pid, 10);
-    if (Number.isInteger(pidNum) && pidNum > 0 && pidNum !== process.pid) {
-      let alive = true;
-      try { process.kill(pidNum, 0); } catch (e: any) {
-        // ESRCH = no such process → stale lock from a crashed holder.
-        // EPERM = process exists but is owned by another user → treat as alive.
-        alive = e?.code === 'EPERM';
+
+    // Retry loop with bounded attempts for TOCTOU races during stale-lock reclamation
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let pid = '?';
+      if (existsSync(lockPath)) {
+        try { pid = readFileSync(lockPath, 'utf-8').trim(); } catch { /* unreadable */ }
       }
-      if (!alive) {
-        // Reclaim the stale lock (crashed previous owner) and retry once.
-        try { unlinkSync(lockPath); } catch { /* racing holder */ }
-        if (tryAcquire()) return;
+      const pidNum = parseInt(pid, 10);
+      if (Number.isInteger(pidNum) && pidNum > 0 && pidNum !== process.pid) {
+        let alive = true;
+        try { process.kill(pidNum, 0); } catch (e: any) {
+          // ESRCH = no such process → stale lock from a crashed holder.
+          // EPERM = process exists but is owned by another user → treat as alive.
+          alive = e?.code === 'EPERM';
+        }
+        if (!alive) {
+          // Reclaim the stale lock (crashed previous owner) and retry once.
+          try { unlinkSync(lockPath); } catch { /* racing holder */ }
+          if (tryAcquire()) return;
+          continue;
+        }
+        if (alive) {
+          throw new Error(`Data directory '${this.teroDirectory}' is locked by live process ${pidNum}. ` +
+            'Stop that process (or use a different directory) and retry.');
+        }
       }
-      if (alive) {
-        throw new Error(`Data directory '${this.teroDirectory}' is locked by live process ${pidNum}. ` +
-          'Stop that process (or use a different directory) and retry.');
+      if (pid === String(process.pid)) {
+        throw new Error(`Another Tero instance in THIS process is already using '${this.teroDirectory}'. ` +
+          'Destroy the existing instance before constructing a new one.');
       }
+      if (tryAcquire()) return;
     }
-    if (pid === String(process.pid)) {
-      throw new Error(`Another Tero instance in THIS process is already using '${this.teroDirectory}'. ` +
-        'Destroy the existing instance before constructing a new one.');
-    }
-    throw new Error(`Data directory '${this.teroDirectory}' is locked (holder PID: ${pid}). ` +
+    throw new Error(`Data directory '${this.teroDirectory}' is locked. ` +
       `If the holder crashed, delete '${lockPath}' and retry.`);
   }
 
@@ -1539,6 +1572,10 @@ export class Tero {
     }
     this.clearCache();
     this.releaseFileLock();
+  }
+
+  async close(): Promise<void> {
+    await this.destroyAsync();
   }
 
   destroy(): void {

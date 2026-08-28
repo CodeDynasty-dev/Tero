@@ -552,9 +552,15 @@ export class LockManager {
 
         lockInfo.holders.delete(transactionId);
 
-        // Process wait queue if no more holders
-        if (lockInfo.holders.size === 0 && lockInfo.waitQueue.length > 0) {
-            this.processWaitQueue(key, lockInfo);
+        // Process wait queue if:
+        // 1. All holders drained (holders.size === 0)
+        // 2. OR sole remaining holder is waiting for an exclusive upgrade!
+        if (lockInfo.waitQueue.length > 0) {
+            if (lockInfo.holders.size === 0) {
+                this.processWaitQueue(key, lockInfo);
+            } else if (lockInfo.holders.size === 1 && lockInfo.waitQueue[0].type === 'exclusive' && lockInfo.holders.has(lockInfo.waitQueue[0].transactionId)) {
+                this.processWaitQueue(key, lockInfo);
+            }
         }
 
         // Clean up empty lock
@@ -584,6 +590,7 @@ export class LockManager {
             // Grant single exclusive lock
             const request = lockInfo.waitQueue.shift()!;
             lockInfo.type = 'exclusive';
+            lockInfo.holders.clear();
             lockInfo.holders.add(request.transactionId);
             request.resolve();
         }
@@ -597,20 +604,14 @@ export class LockManager {
     }
 
     /**
-     * Release only the locks the given transaction actually holds. O(heldKeys) instead
-     * of O(allLocks) — the previous releaseAllLocks iterated every lock in the system
-     * on every commit, which dominated commit latency at scale.
+     * Release locks and remove pending wait-queue requests for a transaction.
      */
-    releaseLocksForTx(transactionId: string, heldKeys: Set<string>): void {
+    releaseLocksForTx(transactionId: string, heldKeys: Set<string>, waitingKeys?: Set<string>): void {
         for (const key of heldKeys) {
             this.releaseLock(key, transactionId);
         }
-        // Also remove any wait-queue entries this tx has (e.g. a tx that was waiting
-        // on a lock when it got aborted). This is rare but must be handled for
-        // correctness — we scan only the keys this tx was waiting on, which we can
-        // approximate by checking the locks it held (close enough for the common case
-        // where a tx never waits).
-        for (const key of heldKeys) {
+        const keysToClean = waitingKeys ? new Set([...heldKeys, ...waitingKeys]) : heldKeys;
+        for (const key of keysToClean) {
             const lockInfo = this.locks.get(key);
             if (lockInfo) {
                 lockInfo.waitQueue = lockInfo.waitQueue.filter(req => {
@@ -620,6 +621,9 @@ export class LockManager {
                     }
                     return true;
                 });
+                if (lockInfo.holders.size === 0 && lockInfo.waitQueue.length === 0) {
+                    this.locks.delete(key);
+                }
             }
         }
     }
@@ -733,6 +737,7 @@ export class ACIDStorageEngine {
         operations: Array<{ key: string; operation: 'write' | 'delete' }>;
         status: 'active' | 'committed' | 'aborted';
         heldLocks: Set<string>; // keys this tx holds locks on — for O(1) release
+        waitingLocks: Set<string>; // keys this tx is queued waiting on
     }> = new Map();
 
     /**
@@ -803,8 +808,11 @@ export class ACIDStorageEngine {
         return this.dirtyKeys.size;
     }
 
+    private synchronous: SynchronousMode;
+
     constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50) {
         this.dbPath = dbPath;
+        this.synchronous = synchronous;
         this.DATA_FLUSH_INTERVAL_MS = dataFlushIntervalMs;
         this.wal = new WriteAheadLog(dbPath, synchronous, commitIntervalMs);
         this.lockManager = new LockManager();
@@ -812,6 +820,36 @@ export class ACIDStorageEngine {
         // Background data-file checkpoint timer — flushes committedBuffer to disk
         this.dataFlushTimer = setInterval(() => this.flushCommittedBuffer(), this.DATA_FLUSH_INTERVAL_MS);
         if (this.dataFlushTimer.unref) this.dataFlushTimer.unref();
+    }
+
+    private fsyncFile(path: string): void {
+        let fd: number;
+        try {
+            fd = openSync(path, 'r');
+        } catch (error: any) {
+            if (error?.code === 'ENOENT') return;
+            throw error;
+        }
+        try {
+            fsyncSync(fd);
+        } finally {
+            closeSync(fd);
+        }
+    }
+
+    private fsyncDir(dirPath: string): void {
+        let fd: number;
+        try {
+            fd = openSync(dirPath, 'r');
+        } catch (error: any) {
+            if (error?.code === 'ENOENT') return;
+            throw error;
+        }
+        try {
+            fsyncSync(fd);
+        } finally {
+            closeSync(fd);
+        }
     }
 
     private initializeStorage(): void {
@@ -940,7 +978,7 @@ export class ACIDStorageEngine {
      * phase rebuilds data files from the WAL. This eliminates 2 of the 3 fsyncs
      * per commit, leaving only the WAL fsync as the single durability barrier.
      */
-    private atomicWriteFile(filePath: string, content: string): void {
+    private atomicWriteFile(filePath: string, content: string, forceFsync = false): void {
         const dir = dirname(filePath);
         if (!existsSync(dir)) {
             mkdirSync(dir, { recursive: true });
@@ -949,11 +987,16 @@ export class ACIDStorageEngine {
         const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
         writeFileSync(tmpPath, content);
 
+        if (forceFsync || this.synchronous === 'full') {
+            this.fsyncFile(tmpPath);
+        }
+
         // atomic rename — readers see old or new, never partial
         renameSync(tmpPath, filePath);
 
-        // intentionally NO fsync of the data file or parent dir — the WAL fsync
-        // on commit is the only durability barrier; redo recovery handles the rest.
+        if (forceFsync || this.synchronous === 'full') {
+            this.fsyncDir(dir);
+        }
     }
 
     // Transaction management
@@ -970,6 +1013,7 @@ export class ACIDStorageEngine {
             operations: [],
             status: 'active',
             heldLocks: new Set(),
+            waitingLocks: new Set(),
         });
 
         this.pendingWrites.set(transactionId, new Map());
@@ -993,9 +1037,14 @@ export class ACIDStorageEngine {
         const lockResult = this.lockManager.acquireLock(key, transactionId, 'exclusive');
         if (lockResult !== true) {
             // Slow path: lock is contended — return a Promise
+            transaction.waitingLocks.add(key);
             return lockResult.then(() => {
+                transaction.waitingLocks.delete(key);
                 transaction.heldLocks.add(key);
                 this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage);
+            }).catch((err) => {
+                transaction.waitingLocks.delete(key);
+                throw err;
             });
         }
 
@@ -1072,8 +1121,35 @@ export class ACIDStorageEngine {
         }
         const lockResult = this.lockManager.acquireLock(key, transactionId, 'exclusive');
         if (lockResult !== true) {
+            transaction.waitingLocks.add(key);
             return lockResult.then(() => {
+                transaction.waitingLocks.delete(key);
                 transaction.heldLocks.add(key);
+            }).catch((err) => {
+                transaction.waitingLocks.delete(key);
+                throw err;
+            });
+        }
+        transaction.heldLocks.add(key);
+    }
+
+    /**
+     * Acquire a shared lock for a transaction.
+     */
+    acquireSharedLock(transactionId: string, key: string): void | Promise<void> {
+        const transaction = this.activeTransactions.get(transactionId);
+        if (!transaction || transaction.status !== 'active') {
+            throw new Error(`Invalid transaction: ${transactionId}`);
+        }
+        const lockResult = this.lockManager.acquireLock(key, transactionId, 'shared');
+        if (lockResult !== true) {
+            transaction.waitingLocks.add(key);
+            return lockResult.then(() => {
+                transaction.waitingLocks.delete(key);
+                transaction.heldLocks.add(key);
+            }).catch((err) => {
+                transaction.waitingLocks.delete(key);
+                throw err;
             });
         }
         transaction.heldLocks.add(key);
@@ -1093,9 +1169,14 @@ export class ACIDStorageEngine {
         const lockResult = this.lockManager.acquireLock(key, transactionId, 'shared');
         if (lockResult !== true) {
             // Slow path: lock is contended
+            transaction.waitingLocks.add(key);
             return lockResult.then(() => {
+                transaction.waitingLocks.delete(key);
                 transaction.heldLocks.add(key);
                 return this.doReadSync(transactionId, key);
+            }).catch((err) => {
+                transaction.waitingLocks.delete(key);
+                throw err;
             });
         }
 
@@ -1145,9 +1226,14 @@ export class ACIDStorageEngine {
 
         const lockResult = this.lockManager.acquireLock(key, transactionId, 'exclusive');
         if (lockResult !== true) {
+            transaction.waitingLocks.add(key);
             return lockResult.then(() => {
+                transaction.waitingLocks.delete(key);
                 transaction.heldLocks.add(key);
                 this.doDeleteSync(transactionId, key, transaction);
+            }).catch((err) => {
+                transaction.waitingLocks.delete(key);
+                throw err;
             });
         }
 
@@ -1235,8 +1321,8 @@ export class ACIDStorageEngine {
             // Update transaction status
             transaction.status = 'committed';
 
-            // Release only the locks this tx held — O(heldKeys) instead of O(allLocks)
-            this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks);
+            // Release only the locks this tx held or was waiting on
+            this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks, transaction.waitingLocks);
 
             // Cleanup in-memory state
             this.pendingWrites.delete(transactionId);
@@ -1250,7 +1336,7 @@ export class ACIDStorageEngine {
             this.commitCount++;
             if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
                 this.getActiveTransactions().length === 0) {
-                this.flushCommittedBuffer();
+                this.flushCommittedBuffer(true);
                 this.wal.rotateLog();
             }
 
@@ -1280,8 +1366,8 @@ export class ACIDStorageEngine {
         // Update transaction status
         transaction.status = 'aborted';
 
-        // Release only the locks this tx held
-        this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks);
+        // Release only the locks this tx held or was waiting on
+        this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks, transaction.waitingLocks);
 
         // Cleanup in-memory state
         this.pendingWrites.delete(transactionId);
@@ -1340,7 +1426,7 @@ export class ACIDStorageEngine {
     }
 
     forceCheckpoint(): void {
-        this.flushCommittedBuffer();
+        this.flushCommittedBuffer(true);
         this.wal.writeLog({
             operation: 'CHECKPOINT',
             transactionId: 'SYSTEM'
@@ -1356,11 +1442,6 @@ export class ACIDStorageEngine {
         return this.wal;
     }
 
-    /**
-     * Check if a key has committed-but-unflushed data. Returns the data if present
-     * in committedBuffer, or `undefined` if not in the buffer (caller should check
-     * disk). Used by the get() fast path in index.ts.
-     */
     /**
      * Return the pending afterImage for a key in an active transaction's pendingWrites.
      * Used by index.ts write() to cache the MERGED result, not the raw user data.
@@ -1389,14 +1470,18 @@ export class ACIDStorageEngine {
      * and by forceCheckpoint(). Writes each buffered entry to its data file using
      * the atomic temp→rename pattern, then clears the buffer.
      */
-    flushCommittedBuffer(): void {
+    flushCommittedBuffer(forceFsync = false): void {
         if (this.committedBuffer.size === 0) return;
+
+        const syncNeeded = forceFsync || this.synchronous === 'full';
+        const touchedDirs = new Set<string>();
 
         for (const [key, entry] of this.committedBuffer) {
             const filePath = partitionedPath(this.dbPath, key);
+            touchedDirs.add(dirname(filePath));
             if (entry.op === 'write') {
                 try {
-                    this.atomicWriteFile(filePath, JSON.stringify(entry.data, null, 2));
+                    this.atomicWriteFile(filePath, JSON.stringify(entry.data, null, 2), syncNeeded);
                 } catch {
                     // best-effort — WAL redo will handle on crash
                 }
@@ -1406,6 +1491,11 @@ export class ACIDStorageEngine {
                 } catch {
                     // ignore
                 }
+            }
+        }
+        if (syncNeeded) {
+            for (const dir of touchedDirs) {
+                try { this.fsyncDir(dir); } catch {}
             }
         }
         this.committedBuffer.clear();

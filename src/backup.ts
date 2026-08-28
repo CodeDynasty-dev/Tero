@@ -1007,7 +1007,8 @@ export class BackupManager {
     const dataPrefix = `${ckptPrefix}${latest.baseTs}/data/`;
     const dirty = engine.takeDirtyKeys();
     let uploaded = 0, tombstoned = 0;
-    for (const key of dirty) {
+    const dirtyList = Array.from(dirty);
+    await pooledMap(dirtyList, 16, async (key) => {
       const filePath = partitionedPath(this.dbPath, key);
       const rel = posixRel(filePath);
       if (existsSync(filePath)) {
@@ -1017,7 +1018,7 @@ export class BackupManager {
         await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
         tombstoned++;
       }
-    }
+    });
     await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
     await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify({ nodeId: this.liveNodeId, updatedAt: new Date().toISOString(), lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0, lastCheckpointAt: new Date().toISOString() }, null, 2)), 'application/json');
     this.liveCheckpoints++;
