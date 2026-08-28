@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync } from "fs";
 import { join, dirname } from "path";
+import { randomBytes } from "crypto";
 
 // ACID-compliant transaction log entry
 export interface LogEntry {
@@ -724,14 +725,17 @@ export class ACIDStorageEngine {
     private commitCount: number = 0;
 
     /**
-     * Monotonic transaction counter + PID. Replaces randomUUID() in the hot path —
-     * a counter increment is ~10x faster than a crypto-random 128-bit UUID generation.
-     * Transaction IDs only need to be unique within a single process lifetime; on
-     * crash recovery the WAL is replayed and old txIds are resolved, so a fresh
-     * counter starting at 0 cannot collide with stale entries.
+     * Monotonic counter + PID + per-process random salt. The old counter-only
+     * scheme reused IDs after a restart (txCounter resets to 0), so a WAL
+     * containing  t<oldPid>_0  COMMIT  and a new uncommitted  t<newPid>_0  would
+     * collide — recovery treated the new writes as committed (data loss / ghost
+     * docs). Including a per-process 3-byte random + timestamp makes IDs
+     * unique across restarts with zero hot-path cost (one random draw at
+     * construction, then cheap counter).
      */
     private txCounter: number = 0;
     private readonly pid: number = process.pid;
+    private readonly txSalt: string = randomBytes(3).toString('hex');
 
     /**
      * Deferred data-file write buffer. On commit, committed data moves here instead
@@ -925,7 +929,7 @@ export class ACIDStorageEngine {
 
     // Transaction management
     beginTransaction(): string {
-        const transactionId = 't' + this.pid + '_' + (this.txCounter++);
+        const transactionId = `t${this.pid}_${this.txSalt}_${Date.now().toString(36)}_${this.txCounter++}`;
         const startLSN = this.wal.writeLog({
             operation: 'BEGIN',
             transactionId
