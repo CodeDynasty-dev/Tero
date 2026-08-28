@@ -23,3 +23,6 @@ channels4_profile.jpg
 prd.md
 tasks.md 
 P0_InitialRetry
+.lock
+ChaosKillDB
+RecoveryBench**
