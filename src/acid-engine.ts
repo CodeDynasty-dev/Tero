@@ -286,6 +286,11 @@ export class WriteAheadLog {
      * Rotate the WAL: archive the current log to .wal.<timestamp>, start a fresh log,
      * and write a CHECKPOINT entry at the head of the new log. Old archives beyond
      * ARCHIVE_KEEP_COUNT are pruned locally (cloud upload in v2 retains durable copies).
+     *
+     * NOTE: ACIDStorageEngine.flushCommittedBuffer() MUST be called before
+     * rotateLog() — see commitTransaction() — otherwise deferred writes still
+     * in memory would be lost on crash after truncation. rotateLog() itself
+     * only guarantees WAL durability (forceFlush before archiving).
      */
     rotateLog(): void {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -457,16 +462,11 @@ export class LockManager {
             return true;
         }
 
-        // Fast path 3: shared→exclusive upgrade when this tx is one of multiple shared holders
-        if (lockInfo.holders.has(transactionId) && lockInfo.type === 'shared' && lockType === 'exclusive' && lockInfo.holders.size > 1) {
-            lockInfo.holders.delete(transactionId);
-            if (this.canGrantLock(lockInfo, lockType, transactionId)) {
-                lockInfo.type = lockType;
-                lockInfo.holders.clear();
-                lockInfo.holders.add(transactionId);
-                return true;
-            }
-        }
+        // Shared→exclusive upgrade is handled via the wait queue. The
+        // previous fast path deleted the holder before re-checking
+        // canGrantLock and lost the shared lock when the upgrade blocked.
+        // Keep the shared lock held while waiting — processWaitQueue will
+        // promote atomically when holders drain.
 
         // Slow path: lock is contended — allocate Promise + timer and wait in queue
         return new Promise((resolve, reject) => {
@@ -500,6 +500,21 @@ export class LockManager {
             }
             // Same lock type or downgrade is always allowed for existing holders
             return true;
+        }
+
+        // Writer-starvation fairness: if an exclusive waiter is queued,
+        // new shared requests must wait behind it. Otherwise continuous
+        // readers can starve a writer indefinitely (holders drain → new
+        // reader immediately re-acquires before the waiter is dequeued).
+        if (requestedType === 'shared' && lockInfo.waitQueue.length > 0) {
+            const hasExclusiveWaiter = lockInfo.waitQueue.some((w: any) => w.type === 'exclusive');
+            if (hasExclusiveWaiter) return false;
+        }
+
+        // FIFO for exclusive: if anyone is queued, a new exclusive must
+        // wait behind the existing queue (even if holders just drained).
+        if (requestedType === 'exclusive' && lockInfo.waitQueue.length > 0) {
+            return false;
         }
 
         // If no current holders
@@ -954,7 +969,7 @@ export class ACIDStorageEngine {
      * `Promise<void>` only when the lock is contended and we must wait in queue.
      * Callers should check: `if (result !== undefined) await result;`
      */
-    write(transactionId: string, key: string, data: any): void | Promise<void> {
+    write(transactionId: string, key: string, data: any, cachedBeforeImage?: any): void | Promise<void> {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction || transaction.status !== 'active') {
             throw new Error(`Invalid transaction: ${transactionId}`);
@@ -966,13 +981,13 @@ export class ACIDStorageEngine {
             // Slow path: lock is contended — return a Promise
             return lockResult.then(() => {
                 transaction.heldLocks.add(key);
-                this.doWriteSync(transactionId, key, data, transaction);
+                this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage);
             });
         }
 
         // Fast path: lock granted synchronously — do the write work sync, return void
         transaction.heldLocks.add(key);
-        this.doWriteSync(transactionId, key, data, transaction);
+        this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage);
     }
 
     /**
@@ -980,11 +995,11 @@ export class ACIDStorageEngine {
      * Pure in-memory + buffer operations: before-image lookup, deepMerge, WAL buffer,
      * pendingWrites tracking. No syscalls, no Promises.
      */
-    private doWriteSync(transactionId: string, key: string, data: any, transaction: any): void {
+    private doWriteSync(transactionId: string, key: string, data: any, transaction: any, cachedBeforeImage?: any): void {
         try {
             const pendingTx = this.pendingWrites.get(transactionId)!;
 
-            // Determine "before image" — check pending writes, then committedBuffer, then disk
+            // Determine "before image" — check pending writes, then committedBuffer, then cached, then disk
             let currentData: any = null;
             const pending = pendingTx.get(key);
             if (pending) {
@@ -996,6 +1011,8 @@ export class ACIDStorageEngine {
             } else if (this.committedBuffer.has(key)) {
                 const committed = this.committedBuffer.get(key)!;
                 currentData = committed.op === 'write' ? committed.data : null;
+            } else if (cachedBeforeImage !== undefined) {
+                currentData = cachedBeforeImage;
             } else {
                 const filePath = partitionedPath(this.dbPath, key);
                 if (existsSync(filePath)) {
@@ -1026,6 +1043,26 @@ export class ACIDStorageEngine {
             this.lockManager.releaseLock(key, transactionId);
             throw error;
         }
+    }
+
+    /**
+     * Acquire an exclusive lock without writing. Used for SELECT FOR UPDATE
+     * / transferMoney: acquire locks in global sorted order BEFORE reading
+     * so reads are serializable and the read→write upgrade never deadlocks.
+     * Same sync fast-path pattern as write/read — returns void or Promise.
+     */
+    acquireExclusiveLock(transactionId: string, key: string): void | Promise<void> {
+        const transaction = this.activeTransactions.get(transactionId);
+        if (!transaction || transaction.status !== 'active') {
+            throw new Error(`Invalid transaction: ${transactionId}`);
+        }
+        const lockResult = this.lockManager.acquireLock(key, transactionId, 'exclusive');
+        if (lockResult !== true) {
+            return lockResult.then(() => {
+                transaction.heldLocks.add(key);
+            });
+        }
+        transaction.heldLocks.add(key);
     }
 
     /**
@@ -1192,9 +1229,14 @@ export class ACIDStorageEngine {
             this.activeTransactions.delete(transactionId);
 
             // Bound WAL growth: periodically rotate when no active transactions are left.
+            // MUST flush committedBuffer before archiving — otherwise the
+            // archive truncates .wal while deferred writes are still only in
+            // memory; a crash before the 50ms timer would lose them and
+            // recovery (which reads only .wal) would not replay them.
             this.commitCount++;
             if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
                 this.getActiveTransactions().length === 0) {
+                this.flushCommittedBuffer();
                 this.wal.rotateLog();
             }
 
@@ -1244,14 +1286,18 @@ export class ACIDStorageEngine {
         const result = { ...target };
 
         for (const key in source) {
-            if (source.hasOwnProperty(key)) {
-                if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key]) &&
+            // Prototype-pollution guard — attacker-controlled JSON may contain
+            // {"__proto__": ...} or {"constructor": {"prototype": ...}} which
+            // would pollute Object.prototype if merged naively. hasOwnProperty
+            // alone does NOT block __proto__ from JSON.parse.
+            if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+            if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+            if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key]) &&
                     typeof target[key] === 'object' && target[key] !== null && !Array.isArray(target[key])) {
                     result[key] = this.deepMerge(target[key], source[key]);
                 } else {
                     result[key] = source[key];
                 }
-            }
         }
 
         return result;

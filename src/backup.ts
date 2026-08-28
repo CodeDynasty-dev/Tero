@@ -459,13 +459,13 @@ export class BackupManager {
       const fs = await import('fs/promises');
       const files = await fs.readdir(localDir);
 
-      const uploadPromises = files.map(async (file) => {
+      // Bounded concurrency — unbounded Promise.all would open files.length
+      // simultaneous S3 streams and exhaust file descriptors at 20k+ docs.
+      await pooledMap(files, 16, async (file) => {
         const localFilePath = join(localDir, file);
         const cloudKey = `${cloudPrefix}/${file}`;
         await this.uploadToCloud(localFilePath, cloudKey);
       });
-
-      await Promise.all(uploadPromises);
     } catch (error) {
       throw new Error(`Failed to upload directory to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -479,17 +479,15 @@ export class BackupManager {
     try {
       const fs = await import('fs/promises');
       const files = await fs.readdir(localDir);
+      const jsonFiles = files.filter(file => file.endsWith('.json'));
 
-      const uploadPromises = files
-        .filter(file => file.endsWith('.json')) // Only upload JSON files, skip metadata
-        .map(async (file) => {
-          const localFilePath = join(localDir, file);
-          // Use direct key-based cloud storage: each JSON file is stored with its key as the cloud key
-          const cloudKey = this.getCloudKey(file);
-          await this.uploadToCloud(localFilePath, cloudKey);
-        });
-
-      await Promise.all(uploadPromises);
+      // Bounded concurrency — same reason as uploadDirectoryToCloud.
+      await pooledMap(jsonFiles, 16, async (file) => {
+        const localFilePath = join(localDir, file);
+        // Use direct key-based cloud storage: each JSON file is stored with its key as the cloud key
+        const cloudKey = this.getCloudKey(file);
+        await this.uploadToCloud(localFilePath, cloudKey);
+      });
     } catch (error) {
       throw new Error(`Failed to upload individual files to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -527,7 +525,14 @@ export class BackupManager {
 
         // Upload to cloud if configured - use key-based storage for direct recovery
         if (this.config.cloudStorage && this.s3Client) {
-          await this.uploadIndividualFilesToCloud(files[0].split('/').slice(0, -1).join('/'));
+          // Derive the backup directory via path.dirname — the previous
+          // files[0].split('/') was POSIX-only and threw if files was empty.
+          const backupDir = files.length > 0 ? dirname(files[0]) : (this.config.localPath || join(this.dbPath, '.backup'));
+          if (files.length === 0) {
+            this.log.warn('⚠️ No files to upload to cloud — backup produced no data files');
+          } else {
+            await this.uploadIndividualFilesToCloud(backupDir);
+          }
           cloudUploaded = true;
           this.log.info(`☁️ Uploaded individual backup to cloud using key-based storage`);
         }
