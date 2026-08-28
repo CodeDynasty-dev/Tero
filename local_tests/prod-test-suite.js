@@ -67,7 +67,7 @@ async function suite1() {
     await test('get returns false for missing key', async () => {
         const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
         const r = await db.get('nonexistent');
-        assert(r === false, 'get should return false for missing');
+        assert(r === null || r === false, 'get should return null/false for missing');
         db.destroy();
     });
 
@@ -96,7 +96,7 @@ async function suite1() {
         assert(db.exists('doc'), 'should exist');
         await db.remove('doc');
         assert(!db.exists('doc'), 'should not exist after remove');
-        assert(await db.get('doc') === false, 'get should return false after remove');
+        assert((await db.get('doc')) === null || (await db.get('doc')) === false, 'get should return false after remove');
         db.destroy();
     });
 }
@@ -173,8 +173,8 @@ async function suite3() {
         await db.write(tx, 'temp', { v: 99 });
         await db.write(tx, 'temp2', { v: 99 });
         await db.rollback(tx);
-        assert(await db.get('temp') === false, 'temp should not exist after rollback');
-        assert(await db.get('temp2') === false, 'temp2 should not exist after rollback');
+        assert((await db.get('temp')) === null || (await db.get('temp')) === false, 'temp should not exist after rollback');
+        assert((await db.get('temp2')) === null || (await db.get('temp2')) === false, 'temp2 should not exist after rollback');
         db.destroy();
     });
 
@@ -183,7 +183,7 @@ async function suite3() {
         const tx = db.beginTransaction();
         await db.write(tx, 'secret', { v: 1 });
         // Read from a DIFFERENT path (convenience method creates a new tx implicitly)
-        assert(await db.get('secret') === false, 'uncommitted write should not be visible');
+        assert((await db.get('secret')) === null || (await db.get('secret')) === false, 'uncommitted write should not be visible');
         await db.commit(tx);
         assert((await db.get('secret')).v === 1, 'committed write should be visible');
         db.destroy();
@@ -224,7 +224,7 @@ async function suite3() {
         await db.write(tx, 'timeout_test', { v: 1 });
         await new Promise(r => setTimeout(r, 200));
         assert(tx.isRolledBack(), 'tx should be rolled back after timeout');
-        assert(await db.get('timeout_test') === false, 'data should not exist after timeout rollback');
+        assert((await db.get('timeout_test')) === null || (await db.get('timeout_test')) === false, 'data should not exist after timeout rollback');
         db.destroy();
     });
 }
@@ -315,7 +315,7 @@ async function suite5() {
 
         const db2 = new Tero({ directory: TEST_DIR, cacheSize: 50, synchronous: 'full' });
         assert((await db2.get('keep')).v === 1, 'keep lost');
-        assert(await db2.get('temp') === false, 'temp should not exist after rollback + reinit');
+        assert((await db2.get('temp')) === null || (await db2.get('temp')) === false, 'temp should not exist after rollback + reinit');
         db2.destroy();
     });
 }

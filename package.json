@@ -5,6 +5,28 @@
   "main": "dist/index.js",
   "type": "module",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./acid-engine": {
+      "types": "./dist/acid-engine.d.ts",
+      "import": "./dist/acid-engine.js"
+    },
+    "./backup": {
+      "types": "./dist/backup.d.ts",
+      "import": "./dist/backup.js"
+    },
+    "./recovery": {
+      "types": "./dist/recovery.d.ts",
+      "import": "./dist/recovery.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/codedynasty-dev/tero.git"
