@@ -12,8 +12,8 @@ export interface LogEntry {
     afterImage?: any;  // For redo
     timestamp: number;
     checksum: string;  // 64-bit dual-FNV hex (16 chars). 32-bit hash collisions
-                       // become likely at ~50k WAL entries (birthday paradox);
-                       // 64-bit pushes that ceiling to ~1B entries.
+    // become likely at ~50k WAL entries (birthday paradox);
+    // 64-bit pushes that ceiling to ~1B entries.
 }
 
 export type SynchronousMode = 'full' | 'normal' | 'off';
@@ -736,7 +736,7 @@ export class ACIDStorageEngine {
      * transactions, we rotate the WAL into an archive and start a fresh log.
      * This bounds WAL size without rewriting it on every commit.
      */
-    private readonly COMMIT_INTERVAL = 500;
+    private readonly COMMIT_INTERVAL = 10000;
     private commitCount: number = 0;
 
     /**
@@ -1293,11 +1293,11 @@ export class ACIDStorageEngine {
             if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
             if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
             if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key]) &&
-                    typeof target[key] === 'object' && target[key] !== null && !Array.isArray(target[key])) {
-                    result[key] = this.deepMerge(target[key], source[key]);
-                } else {
-                    result[key] = source[key];
-                }
+                typeof target[key] === 'object' && target[key] !== null && !Array.isArray(target[key])) {
+                result[key] = this.deepMerge(target[key], source[key]);
+            } else {
+                result[key] = source[key];
+            }
         }
 
         return result;

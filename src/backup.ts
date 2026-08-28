@@ -426,25 +426,23 @@ export class BackupManager {
     }
 
     try {
-      const fileStream = createReadStream(localPath);
-      const stats = statSync(localPath);
+      if (!existsSync(localPath)) return;
+      const fs = await import('fs/promises');
+      const body = await fs.readFile(localPath);
 
-      const upload = new Upload({
-        client: this.s3Client,
-        params: {
-          Bucket: this.config.cloudStorage.bucket,
-          Key: cloudKey,
-          Body: fileStream,
-          ContentLength: stats.size,
-          Metadata: {
-            'backup-timestamp': new Date().toISOString(),
-            'source-db': basename(this.dbPath),
-            'backup-format': this.config.format
-          }
+      const cmd = new PutObjectCommand({
+        Bucket: this.config.cloudStorage.bucket,
+        Key: cloudKey,
+        Body: body,
+        ContentType: cloudKey.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+        Metadata: {
+          'backup-timestamp': new Date().toISOString(),
+          'source-db': basename(this.dbPath),
+          'backup-format': this.config.format
         }
       });
 
-      await upload.done();
+      await this.s3Client.send(cmd);
     } catch (error) {
       throw new Error(`Failed to upload to cloud storage: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
