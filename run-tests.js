@@ -72,7 +72,7 @@ class TestRunner {
     }
 
     async runSingleTest(testFile) {
-        const testName = testFile.replace('./tests/', '').replace('.js', '');
+        const testName = testFile.replace('./local_tests/', '').replace('local_tests/', '').replace('./tests/', '').replace('.js', '');
         console.log(`\n🧪 Running ${testName}...`);
         console.log('='.repeat(60));
 

@@ -660,6 +660,120 @@ async function suite16() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// SUITE 17: Lock Upgrades, Wait-Queue Cleanup, and Safety Guards
+// ═══════════════════════════════════════════════════════════════════
+async function suite17() {
+    cleanup();
+
+    await test('shared -> exclusive lock upgrade succeeds without deadlock when other shared holders release', async () => {
+        const db = new Tero({ directory: TEST_DIR, cacheSize: 50, synchronous: 'normal' });
+        try {
+            await db.create('upgrade_key', { v: 1 });
+
+            const tx1 = db.beginTransaction();
+            const tx2 = db.beginTransaction();
+
+            // Both acquire shared locks
+            await tx1.read('upgrade_key');
+            await tx2.read('upgrade_key');
+
+            // tx1 attempts update (upgrade to exclusive, queues behind tx2)
+            let tx1UpgradeResolved = false;
+            const upgradePromise = tx1.update('upgrade_key', { v: 2 }).then(() => {
+                tx1UpgradeResolved = true;
+            });
+
+            // Small tick to ensure tx1 is in waitQueue
+            await new Promise(r => setTimeout(r, 20));
+            assert(!tx1UpgradeResolved, 'tx1 upgrade should be waiting on tx2');
+
+            // tx2 commits, draining its shared lock
+            await tx2.commit();
+
+            // tx1 upgrade should resolve now!
+            await upgradePromise;
+            assert(tx1UpgradeResolved, 'tx1 upgrade should resolve after tx2 releases');
+
+            await tx1.commit();
+            assert((await db.get('upgrade_key')).v === 2, 'value should be 2');
+        } finally {
+            db.destroy();
+        }
+    });
+
+    await test('aborted waiting transaction does not leak in wait queue and block subsequent writers', async () => {
+        const db = new Tero({ directory: TEST_DIR, cacheSize: 50, synchronous: 'normal' });
+        try {
+            await db.create('queue_key', { v: 1 });
+
+            const tx1 = db.beginTransaction();
+            const tx2 = db.beginTransaction();
+
+            // tx1 holds exclusive
+            await tx1.update('queue_key', { v: 10 });
+
+            // tx2 queues waiting on queue_key
+            const tx2WaitPromise = tx2.update('queue_key', { v: 20 }).catch(e => e);
+
+            await new Promise(r => setTimeout(r, 20));
+
+            // tx2 is aborted while waiting
+            await tx2.rollback();
+            await tx2WaitPromise;
+
+            // tx1 commits and releases
+            await tx1.commit();
+
+            // tx3 should acquire immediately without hanging on tx2
+            const tx3 = db.beginTransaction();
+            await tx3.update('queue_key', { v: 30 });
+            await tx3.commit();
+
+            assert((await db.get('queue_key')).v === 30, 'tx3 write should succeed');
+        } finally {
+            db.destroy();
+        }
+    });
+
+    await test('invalid synchronous parameter throws actionable error', async () => {
+        let threw = false;
+        try {
+            new Tero({ directory: 'InvalidSyncDB', synchronous: 'flul' });
+        } catch (e) {
+            threw = e.message.includes("Invalid synchronous mode 'flul'");
+        }
+        assert(threw, 'should throw for invalid synchronous mode');
+    });
+
+    await test('circular reference in document throws and is rejected', async () => {
+        const db = new Tero({ directory: TEST_DIR });
+        try {
+            const circ = { name: 'cycle' };
+            circ.self = circ;
+            let threw = false;
+            try {
+                await db.create('circ_doc', circ);
+            } catch (e) {
+                threw = e.message.includes('Circular reference detected');
+            }
+            assert(threw, 'should throw for circular reference');
+        } finally {
+            db.destroy();
+        }
+    });
+
+    await test('directory root . is rejected', async () => {
+        let threw = false;
+        try {
+            new Tero({ directory: '.' });
+        } catch (e) {
+            threw = e.message.includes('cannot use working directory root');
+        }
+        assert(threw, 'should throw for root directory');
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // REPORT
 // ═══════════════════════════════════════════════════════════════════
 async function main() {
@@ -682,6 +796,7 @@ async function main() {
     await suite14(); // File locking
     await suite15(); // Synchronous modes
     await suite16(); // Force checkpoint
+    await suite17(); // Lock upgrades, wait-queue cleanup & safety guards
 
     cleanup();
 

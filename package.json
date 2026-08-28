@@ -18,17 +18,13 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "build": "tsc && npm run test",
+    "build": "tsc",
     "dev": "tsc --watch",
     "test": "node run-tests.js",
     "test:production": "node local_tests/prod-test-suite.js",
     "test:s3": "node local_tests/s3-live-backup-test.js",
     "test:all": "npm run test && npm run test:production",
     "test:watch": "npm run test",
-    "prebuild": "echo 'Building Tero...'",
-    "postbuild": "echo 'Build completed successfully!'",
-    "pretest": "echo 'Running Tero test suite...'",
-    "posttest": "echo 'Test suite completed!'",
     "verify": "node local_tests/prod-test-suite.js && npm run test",
     "ci": "npm run test && node local_tests/prod-test-suite.js",
     "bench": "node bench/run-bench.js --synchronous normal",
