@@ -1040,23 +1040,42 @@ export class BackupManager {
     if (latest) {
       baseLsn = latest.baseLsn ?? null;
       const dataKeys = await this.listPrefix(`${prefix}checkpoint/${latest.baseTs}/data/`);
-      // Pool downloads — sequential GETs make a 50k-doc restore take ~12 minutes.
-      await pooledMap(dataKeys, 16, async (dk) => {
-        const isTomb = dk.endsWith('.deleted');
-        const key = basename(dk).replace(/\.json\.deleted$/, '').replace(/\.json$/, '');
-        const dest = partitionedPath(targetDir, key);
-        if (isTomb) {
-          // Tombstone: the document was deleted after the base checkpoint. Remove
-          // any copy the checkpoint data just restored so it STAYS deleted.
-          try { unlinkSync(dest); } catch {}
-          return;
+      
+      const tombstoneKeyNames = new Set<string>();
+      const activeDataKeys: string[] = [];
+
+      for (const dk of dataKeys) {
+        if (dk.endsWith('.deleted')) {
+          const keyName = basename(dk).replace(/\.json\.deleted$/, '');
+          tombstoneKeyNames.add(keyName);
+        } else if (dk.endsWith('.json')) {
+          activeDataKeys.push(dk);
         }
+      }
+
+      // Filter out any active key that has a tombstone so it is never downloaded or resurrected
+      const keysToDownload = activeDataKeys.filter(dk => {
+        const keyName = basename(dk).replace(/\.json$/, '');
+        return !tombstoneKeyNames.has(keyName);
+      });
+
+      // Pool downloads — sequential GETs make a 50k-doc restore take ~12 minutes.
+      await pooledMap(keysToDownload, 16, async (dk) => {
+        const key = basename(dk).replace(/\.json$/, '');
+        const dest = partitionedPath(targetDir, key);
         const body = await this.downloadBytes(dk);
         mkdirSync(dirname(dest), { recursive: true });
-        const tmp = `${dest}.tmp.${process.pid}`;
-        writeFileSync(tmp, body); renameSync(tmp, dest);
+        const tmp = `${dest}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+        writeFileSync(tmp, body);
+        renameSync(tmp, dest);
         docsRestored++;
       });
+
+      // Ensure any existing local file matching a tombstone is deleted
+      for (const keyName of tombstoneKeyNames) {
+        const dest = partitionedPath(targetDir, keyName);
+        try { if (existsSync(dest)) unlinkSync(dest); } catch {}
+      }
     }
     const walKeys = (await this.listPrefix(`${prefix}wal/`))
       .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) > (baseLsn ?? 0) : false; }).sort();

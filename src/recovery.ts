@@ -331,9 +331,15 @@ export class DataRecovery {
                 return [];
             }
 
-            // Filter for JSON files and extract keys
+            // Filter for JSON files and extract keys (excluding metadata manifests)
             const files = objects
-                .filter((obj: any) => obj.Key && obj.Key.endsWith('.json'))
+                .filter((obj: any) =>
+                    obj.Key &&
+                    obj.Key.endsWith('.json') &&
+                    !obj.Key.endsWith('MANIFEST.json') &&
+                    !obj.Key.endsWith('latest.json') &&
+                    !obj.Key.endsWith('index.json')
+                )
                 .map((obj: any) => {
                     const filename = obj.Key!.split('/').pop()!;
                     return filename.replace('.json', '');
