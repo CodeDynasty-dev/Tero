@@ -631,7 +631,10 @@ async function suite15() {
     for (const mode of ['full', 'normal', 'off']) {
         await test(`synchronous=${mode}: create + get round-trip`, async () => {
             const dir = `ModeTest_${mode}`;
+            const prev = process.env.TERO_ALLOW_UNSAFE_OFF;
+            if (mode === 'off') process.env.TERO_ALLOW_UNSAFE_OFF = '1';
             const db = new Tero({ directory: dir, cacheSize: 50, synchronous: mode });
+            if (mode === 'off') process.env.TERO_ALLOW_UNSAFE_OFF = prev;
             await db.create('k', { v: 42 });
             assert((await db.get('k')).v === 42, `${mode} mode round-trip failed`);
             db.destroy();
