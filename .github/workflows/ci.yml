@@ -64,3 +64,8 @@ jobs:
         S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=tero-live-test AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin node local_tests/live-backup-test.js
         S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=tero-live-backup-test AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin node local_tests/s3-live-backup-test.js
         echo "live-backup MinIO green"
+
+    - name: Run chaos & soak (kill -9 + restore + RSS <150MB) — edge envelope
+      run: |
+        S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=tero-chaos-test AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin node local_tests/chaos-test.js
+        echo "chaos/soak green"

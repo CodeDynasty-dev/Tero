@@ -99,13 +99,18 @@ setInterval(async()=>{
 
   const child = spawn(process.execPath, [workerPath, dir, '500'], { stdio: ['ignore','pipe','pipe'] });
   let ready = false;
-  await new Promise((res, rej) => {
-    const timer = setTimeout(() => rej(new Error('worker never ready')), 15000);
-    child.stdout.on('data', d => {
-      if (d.toString().includes('READY:')) { ready = true; clearTimeout(timer); res(); }
+  try {
+    await new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error('worker never ready')), 15000);
+      child.stdout.on('data', d => {
+        if (d.toString().includes('READY:')) { ready = true; clearTimeout(timer); res(); }
+      });
+      child.on('error', rej);
     });
-    child.on('error', rej);
-  });
+  } catch (e) {
+    try { child.kill('SIGKILL'); } catch {}
+    throw e;
+  }
   if (!ready) throw new Error('worker did not signal ready');
   // give it a moment to enter the tight commit loop
   await sleep(300);
@@ -248,10 +253,15 @@ async function phaseLive() {
   // wait for auto initial checkpoint
   for (let i = 0; i < 50; i++) { await sleep(100); if (db.getLiveBackupStatus().checkpointsTaken >= 1) break; }
 
-  // burst writes, then kill -9 within 900ms to test RPO 1s contract: restore must contain all commits ≥ t-1s
+  // burst writes, then kill -9 to test RPO 1s contract: restore must contain all commits ≥ t-1s
   for (let i = 0; i < 200; i++) await db.create(`live-${i}`, { v: i });
-  await sleep(800); // let shipper do at least one segment (500ms interval)
-  const ship1 = db.getLiveBackupStatus().segmentsShipped;
+  // poll for the shipper to emit at least one segment (interval 500ms, unref'd timer)
+  let ship1 = 0;
+  for (let w = 0; w < 30; w++) {
+    await sleep(200);
+    ship1 = db.getLiveBackupStatus().segmentsShipped;
+    if (ship1 > 0) break;
+  }
   if (ship1 === 0) { bad('live shipper did not ship before kill', JSON.stringify(db.getLiveBackupStatus())); db.destroy(); rmSync(dir,{recursive:true,force:true}); return; }
   ok(`shipper shipped ${ship1} segment(s) before kill`);
 
