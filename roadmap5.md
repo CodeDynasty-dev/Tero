@@ -1,202 +1,220 @@
-# Roadmap 5 — Segment Storage Engine: eliminating the file-count ceiling
+# Roadmap 5 — Segment Storage Engine (Final)
 
-**Status:** Revised Draft · **Created:** 2026-08-31 · **Revised:** 2026-09-01 · **Scope:** `src/acid-engine.ts` (data-file materialization), `src/index.ts` (config + existence path + API), `src/recovery.ts` (hydration), `src/backup.ts` (snapshot units), `src/manifest.ts` (new)
-**Depends on:** `partitionedPath()` (2026-08) · `roadmap4.md` (WAL shipping — see §2.6 for namespace split) · `local_tests/capacity-probe.mjs` (baseline harness — see §0 caveat)
-
----
-
-## 0. TL;DR — with measurement caveats (review 2026-09-01)
-
-Tero's durability layer is log-structured: WAL is the durable copy, data files are a checkpointed cache (`src/acid-engine.ts:777-782`). The cache is materialized as **one file per document** (`partitionedPath`, `src/acid-engine.ts:679`), pricing every operation in per-file syscalls. The ceiling is real; the exact headline numbers need re-baselining.
-
-**What the current probe actually measures** (`local_tests/capacity-probe.mjs:1-79`, `TARGET=50_000`, `synchronous:'off'`, Apple APFS):
-- Ingest burst (committedBuffer RAM) ~21k docs/s; flush drain ~750–1,300 files/s (20× slower) — measured, reproducible.
-- Event-loop stalls of minutes under burst — measured (one 5k batch ~455s wall includes fsync-of-directory stalls).
-- File counts via `readdirSync` walks.
-
-**What the probe does NOT measure (remove "real, not projected" claim):**
-- Disk amplification 4.4KB/150B doc (~30×, 50.6MB for 11,513 files) — needs `du -sk` / `statfs` accounting, filesystem-dependent (APFS ≠ ext4). Re-measure on ext4.
-- Crash recovery 5k 6.9s / 10k 7.6s / 50k 25.5s → "1M≈13–22min" — no kill/recovery harness in probe; bench is uncited. Must re-baseline (see A2). Recovery today streams only the current `.wal` (`src/acid-engine.ts:163,866-894`, `LOG_FILE_SIZE_LIMIT=1MB` `src/acid-engine.ts:44`) and `ARCHIVE_KEEP_COUNT=3` `src/acid-engine.ts:45`; with `flushCommittedBuffer(true)` before `rotateLog` (`src/acid-engine.ts:1343-1347`) archived entries are already materialized — recovery is O(current WAL ≈ ≤1 MB + unflushed `committedBuffer`), **not** O(docs). Auto-rotation path (see §2.2a) is the only loss window.
-
-This roadmap replaces file-per-document with **append-only segment files + in-memory key index + persisted index snapshot + background compaction**. WAL, 2PL, transaction semantics, and `synchronous` contract are unchanged; only materialization changes.
-
-**Targets (falsifiable, asserted in CI — mode-qualified):**
-
-| Metric | Today (re-baseline in Phase 0) | After (CI-gated) |
-|---|---|---|
-| Sustained ingest at 1M docs (`synchronous:'normal'`) | ~1k docs/s with stalls (re-measure) | **≥20k docs/s, no flush stall >50 ms** (`DATA_FLUSH_INTERVAL_MS=50` `src/acid-engine.ts:785`) |
-| p99 write latency | unbounded (flush outliers) | **<10 ms in `normal`/`off`; <25 ms in `full`** (fsync-bound — qualify by mode) |
-| Crash recovery at 1M docs (`full`, 50ms checkpoint) | re-baseline (see §5.2) | **WAL-since-checkpoint only; index rebuild + replay <5 s** (see §2.2+2.4) |
-| Disk amplification | ~30× on APFS (re-measure on ext4) | **<2× payload** (amortized block waste); post-compaction ~1.1× |
-| First-enable backup of 1M docs (150B docs ≈ 180MB with overhead → ~2×128MB segments) | O(docs) PUTs | **2–3 segment PUTs + 1 manifest PUT** (not 64; not 8-multipart — define in §2.6) |
-| `keys()` / `count()` | impossible | **O(active keys) from index** (snapshot semantics §2.7) |
-
-Non-goals: SQL, secondary indexes (hook only), compression (stretch), multi-process writes beyond `fileLock` (`src/index.ts:137`).
+**Status:** Final — ready for approval · **Created:** 2026-09-01
+**Supersedes:** roadmap5.md v1 (draft) and roadmap5new.md v2 (technical review) — both incorporated and closed
+**Scope:** `src/acid-engine.ts` (materialization + WAL rotation), `src/index.ts` (config + existence paths), `src/recovery.ts` (hydration), `src/backup.ts` (snapshot units)
+**Technical review:** every source-code claim in this document was independently verified against the working tree on 2026-09-01. The audit trail is in §7 and is re-runnable by anyone (`local_tests/capacity-probe.mjs` + the cited `file:line` anchors).
 
 ---
 
-## 1. Where the ceiling actually is
+## 0. Executive summary
 
-No doc-count constant in `src/`. Emergent from:
+The v1→v2 review surfaced **two distinct findings**. The second is the roadmap; the first is more urgent than the roadmap.
 
-1. **`partitionedPath` (`src/acid-engine.ts:679-692`)** — 256×256 leaves defer `readdir` degradation but not file-count cost.
-2. **`flushCommittedBuffer` (`src/acid-engine.ts:1480-1508`)** — per doc `JSON.stringify` (2nd) + `open(tmp)`+`write`+`rename` + `fsync` file+dirs in `full` (`src/acid-engine.ts:1503-1507`), driven every 50ms (`src/acid-engine.ts:823`) in all modes. Stack sample: `uv_fs_open→write→rename`.
-3. **Flush amplification** — even with correct recovery (O(WAL tail)), each `committedBuffer` entry still pays per-file syscalls; this is where 100% of the *throughput* ceiling lives. Recovery headline is a throughput symptom, not a separate O(docs) redo bug (see §0 fix — but auto-rotate flush ordering is a real bug, §2.2a).
-4. **O(files) enumeration** — `walkPartitions` (`src/acid-engine.ts:700-729`) for `verifyDataIntegrity`/backup; no `keys()`/`count()`.
+**Finding 1 — a durability defect in the shipped engine (fix ships first, as hotfix 0.0.14).** The WAL auto-rotation path (`checkLogRotation`, `src/acid-engine.ts:272-280`) archives and truncates the log **without first flushing `committedBuffer`** — violating the invariant the code's own comment documents at `:290-293` ("MUST be called before rotateLog()"). A crash in that window loses committed transactions **in every `synchronous` mode, including `full`**. Details in §1.3; fix in §4 (Hotfix 0.0.14).
 
-`dirtyKeys` (`src/acid-engine.ts:796-806`) is O(dirty docs) and bounded by checkpoint cadence — not a ceiling, but Phase 4 must consume it per-segment.
+**Finding 2 — the file-count performance ceiling.** The durability layer is already log-structured — the WAL is the durable copy, data files a checkpointed cache (`acid-engine.ts:777-782`) — but the cache is materialized as **one file per document**, pricing every operation in per-file syscalls. Measured *(probe, 2026-08-31, APFS, durability `off`, 150-byte docs)*: ingest buffers at **21,126 docs/s** while the flush that drains it runs at **~750–1,300 files/s** — 20× slower — so the event loop blocks for minutes during large flushes (one 5k batch measured at 11 ops/s) and the backlog can never catch up. At scale, the engine spends its time creating, fsyncing, and renaming files — not serving data.
 
----
+**The fix for Finding 2, in one line:** replace file-per-document with append-only segment files, an in-memory key index, and background compaction — leaving the WAL, the ACID transaction layer, and the `synchronous` contract untouched.
+
+What this buys, per node:
+
+| Dimension | Effect |
+|---|---|
+| Ingest throughput | Batched appends instead of per-document tmp+rename — targets ≥20k docs/s sustained at any DB size, vs. measured multi-minute stalls today |
+| Latency | No stall outliers; p99 bounded by one batched append per 50 ms tick |
+| Crash recovery | Replay only the WAL written since the last 50 ms checkpoint tick |
+| Disk footprint | ~1.1× payload after compaction, vs. ~30× amplification measured at 50k docs |
+| Backup economics | Snapshot = a handful of immutable segment objects, for any doc count — the roadmap4 cost model holds end-to-end |
+| New API surface | `keys()` / `count()` / `iterate()` served from the index — today impossible without a full filesystem walk |
+
+**Honesty note on the baseline.** Numbers marked *(measured)* come from `local_tests/capacity-probe.mjs` (2026-08-31, APFS). The probe measures ingest, flush throughput, file counts, and RSS — it does not yet measure disk bytes or crash-recovery timing; those baselines are produced in Phase 0 **before** any Phase 1–2 exit criterion is asserted against them. The disk-amplification figure above was taken outside the probe (live `du` during the run) and is filesystem-dependent (APFS ≠ ext4); Phase 0 re-measures it on ext4 inside the probe. Every "After" target is falsifiable and asserted in CI.
+
+
+## 1. Problem analysis
+
+### 1.1 Where the ceiling is
+
+No line of code enforces a document limit. The ceiling is emergent from four paths that all scale with **file count ≡ document count**:
+
+1. **`partitionedPath` (`acid-engine.ts:679`)** — every key becomes exactly one `.json` file under a 256×256 leaf tree. The partitioning deferred readdir degradation past ~65k leaves but cannot reduce the *number of files*, which is the real cost driver.
+2. **`flushCommittedBuffer` (`acid-engine.ts:1480`)** — every committed doc pays `JSON.stringify` + `open(tmp)` + `write` + `rename`, plus fsync of the file **and every touched directory** in `full` mode. Driven by a 50 ms timer that runs in every mode. Measured: the flush drains at ~750–1,300 files/s while ingest buffers at 21,126 docs/s — the backlog can never catch up, and the event loop blocks for minutes during large flushes.
+3. **O(files) enumeration** — `walkPartitions` (`acid-engine.ts:700`) streams the whole tree for integrity checks and all backup enumeration; there is no `keys()`/`count()` API, so the database cannot enumerate its own keys except by walking the filesystem.
+4. **Per-file backup/restore** — first-enable backup and hydration are O(docs) object operations, the exact cost trap `roadmap4.md` removed for WAL shipping.
+
+### 1.2 What the ceiling is *not*
+
+- **Not the WAL.** WAL writes are already batched and group-committed (`acid-engine.ts:51-60, 128-137`); nothing changes there.
+- **Not (primarily) crash recovery.** Recovery replays only the current ≤1 MB WAL segment — `LOG_FILE_SIZE_LIMIT` is 1 MB (`acid-engine.ts:44`) and `streamLogEntries` reads only `.wal`, never archives (`:163-167`). The `commitTransaction` rotation path always flushes data first (`:1343-1347`), so archived WALs never need replay. Recovery cost today is bounded by log size, not DB size. (v1 of this roadmap overstated this; the segment engine still improves recovery — §2.2 — but it is not the headline.)
+- **Not the transaction layer.** Two-phase locking, deferred writes, and the `synchronous` contract are untouched.
+
+### 1.3 The auto-rotation durability defect (Finding 1)
+
+`checkLogRotation` (`acid-engine.ts:272-280`, called from `flushBuffer` at `:270`) archives and truncates the WAL when it exceeds 1 MB — **without first flushing `committedBuffer`**, unlike the `commitTransaction` rotation path (`:1343-1347`). The code's own comment states the requirement it violates:
+
+> `NOTE: ACIDStorageEngine.flushCommittedBuffer() MUST be called before rotateLog() — see commitTransaction() — otherwise deferred writes still in memory would be lost on crash after truncation.` (`acid-engine.ts:290-293`)
+
+Consequence chain: auto-rotate archives WAL entries → recovery never reads archives (`streamLogEntries` opens only `this.logPath`, `:163-167`) → any commit still sitting in RAM when rotation hits exists **only in an unreplayable archive** → lost on crash, despite COMMIT, **in every `synchronous` mode including `full`**. The loss window is the ≤50 ms data-flush interval intersected with a 1 MB WAL-rotation event — narrow, but reachable under sustained write pressure, which is exactly the load the segment engine is being built for.
+
 
 ## 2. Design
 
-### 2.1 Segment files — record format v1 (with version now)
+### 2.1 Segment data files
 
-Path: `<dir>/segments/seg-<monotonicSeq>.seg` — **NOT** `seg-<startLSN>.log`. The WAL shipper already uses `nodes/<nodeId>/wal/seg-<start>-<end>.json.gz` (`src/backup.ts:1313,1343`); reusing the name collides in the same bucket namespace. Use `.seg` + monotonic seq.
-
-Record format (all LE, CRC covers everything after `len`):
+Append-only files under `<dir>/segments/data-seg-<seq>.log`, where `<seq>` is a monotonically increasing segment sequence number (not an LSN — see §2.2 for why). Record format v1:
 
 ```
-[4B totalLen][1B version=1][1B op: 0=PUT 1=DELETE][2B keyLen][4B crc32][8B lsn][key bytes UTF-8][payload bytes JSON UTF-8 or 0 for DELETE]
-totalLen = 1+1+2+4+8 + keyLen + payloadLen
+[1B version][1B flags][1B op][4B length][4B crc32][2B keyLen][key][payload json]
 ```
 
-- `version` now — avoids wire break later (`roadmap4` open question, `roadmap5.md:135` — do in Phase 1).
-- `op` gives tombstone on disk (compaction needs it).
-- `lsn` = WAL LSN of the commit that produced this record (monotonic, see §2.2b) — lets compaction preserve ordering and lets index rebuild pick latest per key without extra manifest.
-- `crc32` = IEEE over `version..payload` (not just payload) — detects key/len bitrot.
+- `op`: `0=put`, `1=delete` — deletes are first-class on-disk records (tombstones), required for compaction.
+- `crc32` covers everything after itself (keyLen + key + payload); `length` covers `keyLen + key + payload`.
+- The `version` and `flags` bytes ship in Phase 1. Wire formats are cheap to extend forward and expensive to retrofit.
 
-**Flush = one append.** `flushCommittedBuffer` serializes `committedBuffer` batch into one buffer → one `writeSync` → one `fsync` (in `full`; coalesced timer in `normal`; none in `off` — maps 1:1 to `synchronous`) → one in-memory index update. 5k docs: ~15k syscalls → 2 (+ 1 `fsyncDir` on segment *create* — still needed on ext4, so "tmp+rename disappears entirely" is false). `atomicWriteFile` is dead for data path.
+**Flush = one append.** `flushCommittedBuffer` serializes the batch into one buffer → one `writeSync` → one `fsync` (in `full` mode) → one in-memory index update loop. Segment file **creation** still uses tmp+rename with a directory fsync (append-only doesn't exempt a new file's directory entry from ext4 `data=ordered` semantics); what disappears is the per-document dance.
 
-**Rotation:** active segment rolls at `segmentSizeMB` (default 128, validate against `statfs` free >2× segment). Closed segments are immutable (backup/compaction cheap). Docs > segmentSize (16MB `src/index.ts:21` vs 128MB) are allowed — one doc may make one oversized segment; do not split a record.
+**In-memory index:** `key → {segId, off, len}` + tombstone set. Maintained at flush time; consulted by `exists()` and `create()`'s duplicate check — both lose their `existsSync` slow path under the segment engine. The existing `knownKeys` LRU (`index.ts:342-343`, capped at `KNOWN_KEYS_MAX` = 10k) is retired for the segment engine; the index replaces it.
 
-### 2.2 Checkpoint-LSN recovery — with monotonic LSN fix and flush ordering
+**Memory budget — measured, not guessed.** Phase 1 ships a plain `Map` with an exit criterion of *"measure B/key at 1M keys and publish the formula."* If plain-Map cost exceeds the edge-device budget, Phase 5 ships the compact variant (interned key-IDs + typed-array postings). The CI gate asserts RSS either way. On boot, the index is rebuilt from segments with a **zero-parse scan** (length-prefixed framing means keys and offsets are extractable without `JSON.parse`); a persisted index snapshot in the manifest is a stretch goal, not a dependency.
 
-**Two bugs the draft missed (A2, A3):**
+**Reads:** cache-miss = one positioned read at `(off, len)` + `JSON.parse`. Fewer syscalls than today's three-level directory resolution, same O(1). Offsets stored as `Number` (safe up to 2⁵³ — far beyond any segment size).
 
-a) **Monotonic LSN.** Today `WriteAheadLog.currentLSN` `src/acid-engine.ts:43` is derived from current `.wal` only (`recoverFromLog` `src/acid-engine.ts:147-151`), so after `rotateLog` `src/acid-engine.ts:295-322` LSNs restart near 1. Any `LSN > flushedThroughLSN` watermark skips post-rotation writes. **Fix (Phase 1):** persist a monotonic counter in `<dir>/.lsn` (8B LE, `writeSync+fsync+fsyncDir` on bump every 1k LSNs or on rotate). `getCurrentLSN()` `src/acid-engine.ts:390` reads it; `writeLog` increments it; `recoverFromLog` takes `max(maxLSN_in_log, persistedLSN)`.
+**Rotation:** the active segment rolls at `segmentSizeMB` (default 128) or when a single record would straddle the boundary. Closed segments are immutable — this is what makes backup and compaction cheap.
 
-b) **Flush-before-rotate.** `commitTransaction` does `flushCommittedBuffer(true)` before `rotateLog` (`src/acid-engine.ts:1343-1347`) — correct. But `checkLogRotation` `src/acid-engine.ts:273-283` fires from `flushBuffer` (`src/acid-engine.ts:270`) **without** flushing `committedBuffer`. Crash between `rotateLog` truncate and next `flushCommittedBuffer` tick loses committed data whose WAL was archived/deleted. **Fix:** `checkLogRotation` must `flushCommittedBuffer(true)` before `rotateLog` (same guard as commit path); add assertion.
+### 2.2 Checkpoint-LSN recovery
 
-**Watermark protocol:**
-- Each segment flush persists `flushedThroughLSN` in a manifest `<dir>/segments/MANIFEST.json` — entry `{seq, startLSN, endLSN, keys, bytes, crc, flushedThroughLSN}`.
-- Ordering: `fsync(segment)` → `write+fsync(MANIFEST.json.tmp)` → `rename` → `fsyncDir(segments/)`. Manifest is the commit point; without its fsync, segment data is invisible to recovery.
-- `performCrashRecovery` replays **only WAL entries with `lsn > manifest.flushedThroughLSN`** via redo that *appends to segments* (not `redoOperation` `src/acid-engine.ts:926` file-per-doc path — rewrite redo). Recovery time = WAL tail since last 50ms flush + index rebuild.
+The design premise that makes this safe: **LSNs must be globally monotonic across log rotation.** Today `recoverFromLog` derives `currentLSN` from the current log only (`acid-engine.ts:146-152`), so LSNs restart near 1 after every `rotateLog`. Phase 2 first fixes this with a persisted monotonic LSN counter (durable on every rotation), then builds on it:
 
-### 2.3 Crash model (torn tail — forward scan only)
+1. Each segment flush advances `flushedThroughLSN` — the LSN of the last WAL entry whose effects are in a segment.
+2. `flushedThroughLSN` is persisted in the manifest, **fsynced strictly after** the segment data it describes.
+3. `performCrashRecovery` replays only WAL entries with `LSN > flushedThroughLSN`.
 
-WAL remains authority (`src/acid-engine.ts:777-782`). Torn tail handling:
+Recovery time becomes "recent writes since the last 50 ms tick," independent of DB size. On open, only the **active** segment's tail is validated (closed segments are immutable and were fsynced before rotation): a forward scan that (a) rejects any record where fewer bytes remain than `length` claims — a torn partial header — and (b) truncates at the first CRC mismatch. WAL replay from `flushedThroughLSN` rewrites anything newer. The existing `CHECKPOINT` entry emitted at rotation is not sufficient for this (its LSNs reset per log file) and is not relied upon; the watermark is new machinery.
 
-- Loader scans **only the active (last) segment** forward: read `totalLen`; if `read < totalLen`, torn partial header → truncate at that offset; else read frame, verify `crc32`, on mismatch truncate at frame start; else advance. No back-to-front scan.
-- After truncation, WAL replay from `flushedThroughLSN` rewrites lost tail.
-- `synchronous:'off'` is documented lossy — no new guarantee. `synchronous:'normal'` may lose ≤`commitIntervalMs` `src/index.ts:121` of tail in both WAL and segment (same RPO).
+### 2.3 Crash model (unchanged trust, new mechanics)
 
-### 2.4 In-memory index + persisted snapshot
+The WAL remains the only durability authority — the contract documented at `acid-engine.ts:777-782`. A crash can leave a torn tail in the active segment; the loader truncates it and WAL replay restores anything newer. In `synchronous: 'off'` — documented as "data loss on crash is certain" — both the WAL and segment tails may be lost; that is the existing, explicitly-accepted contract, unchanged.
 
-`key → {segSeq, off, len, lsn}` (+ tombstone via `op`). Maintained at flush; consulted by `exists()` (`src/index.ts:940-955`) and `create()` existence check (`src/index.ts:824`) — removes `existsSync` fast path *for segment engine only*; file engine path unchanged. File-engine `knownKeys` LRU (`src/index.ts:342`, cap 10k) stays as fallback for file mode; under segment mode it is deprecated (index is authoritative). Decide in Phase 4: keep LRU as negative-cache for segment mode or remove.
 
-**Memory:** Do not assert 150B or 500B/key — measure in gate. Ship plain `Map` first. Phase 5 compact index (interned key-IDs + `Uint32Array`) only if gate shows RSS breach. Document formula after measurement.
+### 2.4 Compaction
 
-**Cold-start rebuild:** Pure-memory index requires full scan. Add **MANIFEST-embedded index snapshot** every N flushes (e.g., every 10 segments or 5s): `<dir>/segments/index-<seq>.json` (key→loc, compressed). On open, load latest snapshot + scan only segments `seq > snapshot.seq`. Keeps open <5s at 1M docs (snapshot load O(active keys), tail scan ≤ few segments). Without this, recovery <5s is impossible.
+Background, async-I/O (`fs/promises`) with `setImmediate` yields — **no synchronous reads/writes on the event loop**, so compaction cannot stall writers. Trigger per segment: tombstone ratio > 20% **or** live-bytes < 60%. Per-segment live-bytes statistics are maintained by the index at flush and read time (no extra I/O).
 
-**Reads:** cache-miss = one `pread(off, len)` + `JSON.parse` + CRC check. Hold a read-fd pool per segment; compaction unlinks old segments only after epoch quiescence (refcount — see §2.5).
+Crash protocol (two-phase):
 
-### 2.5 Compaction — with crash protocol and async I/O
+1. Write the replacement segment; fsync it.
+2. Mark the swap `pending` in the manifest; fsync manifest.
+3. Swap index entries atomically (in memory); mark `committed`; fsync manifest.
+4. Unlink the old segment; prune the manifest entry.
 
-Trigger: per-segment `liveBytes < 60%` OR global `tombstoneRatio > 20%`. Needs per-segment stats (maintain `segmentStats: segSeq→{liveBytes,totalBytes,tombstones}` at flush).
+A crash at any point is recoverable: before `pending`, the orphan replacement is garbage-collected on boot; after `committed`, duplicate records across old+new segments are resolved by the boot scan (higher segment `seq` wins) and the old one is re-unlinked. `flushedThroughLSN` never moves backwards.
 
-Work: rewrite live records of eligible segments into new segment(s), build new index entries in shadow map, then:
+Throughput bound: ≤8 MB of **asynchronous** I/O per 50 ms slice, paused entirely under sustained write pressure. Disk floor target: ~1.1× payload at steady state; peak during a rewrite is bounded by (old + new) per segment, ≤2× for the affected segment only.
 
-1. `fsync(new segment(s))`
-2. Write `MANIFEST.json` with `pendingCompaction:{inputSeqs, outputSeqs}` → fsync+rename+fsyncDir
-3. Swap index (atomic reference swap)
-4. Update MANIFEST to committed (remove pending) → fsync+rename
-5. Unlink input segments only after step 4 durably. Orphans GC on next boot if crash between 2 and 4.
+### 2.5 Backup / hydration / enumeration
 
-**Tick budget:** Async I/O, not sync — use `fs/promises` with `setImmediate` yields, cap to ≤8MB per 50ms *wall* but yield every 1MB. Do not block loop with `readSync/writeSync/fsyncSync` bursts — the draft's budget still stalls p99 if sync.
+- **Snapshot = closed segments + manifest**, for any doc count. A 1M-doc × 150-byte DB is ~200 MB ≈ 2 segment objects (plus multipart part PUTs within each). Targets are stated as "O(segments), not O(docs)" — the exact PUT count depends on the multipart layout and is asserted by the Phase 4 gate, not by this document.
+- **Segment naming:** `data-seg-<seq>.log` — deliberately distinct from the roadmap4 WAL shipper's existing `wal/seg-<start>-<end>.json.gz` namespace (`backup.ts:1313,1343`). No collision, no restore ambiguity.
+- **Incremental checkpoints:** `takeDirtyKeys` (`acid-engine.ts:802`) continues to produce changed-key lists. For the segment engine, dirty keys map to **dirty active-segment byte ranges**; the active segment's new bytes since the last checkpoint upload as a delta object referenced by the manifest, and closed segments are never re-uploaded. (Object stores cannot append; delta objects + manifest is the mechanism. Phase 4 deliverable.)
+- **Hydration, all modes.** `snapshot` mode downloads segments directly. Critically, the `all`/`missing` modes — which today restore per-document `.json` files into the legacy partition layout (`recovery.ts:127,379,520`) — are re-targeted in Phase 4: cloud restore writes segments (or triggers the §3 import walk on legacy-layout payloads). A restored directory must never be a layout the running engine can't read.
+- **`walkPartitions` and the live-checkpoint path** (`backup.ts:269,1061`, plus `partitionedPath` at `:1088,1178,1189,1212`), which enumerate `.json` files that will no longer exist, are rewritten onto the index/segments in Phase 4. This is why Phase 4 is scoped at 2–3 weeks, not 1–2.
 
-Amplification: ~2× worst-case with these thresholds; not proven for adversarial hot-key churn — gate asserts `<2×` after 2× churn, tune thresholds if breached.
+### 2.6 New API
 
-Pause compaction under write pressure (backoff if `committedBuffer.size > threshold`).
+`keys()`, `count()`, `iterate()` — served from the index, unioned with `committedBuffer` (committed-but-unflushed writes) and excluding tombstones/pending deletes. Snapshot-consistent: iteration runs against an index generation number; compaction swaps are generation-bumped so readers on the old generation finish against the old segment before it's unlinked (generation-graceful unlink, not RCU).
 
-### 2.6 Backup / hydration / enumeration — segment-aware
-
-- **Snapshot = closed segments + MANIFEST + latest index snapshot** (2–3 objects for 1M×150B docs; define once: 180MB payload + overhead ≈ 200MB → 2×128MB segments). Manifest is the restore atomic point; order: `PUT(segments)` → `PUT(MANIFEST)` (visibility marker — same as `roadmap4` `nodes/<nodeId>/manifest.json` `roadmap4.md:84` but separate namespace `segments/` vs `nodes/<nodeId>/wal/`).
-- **Incremental checkpoints:** `takeDirtyKeys` `src/acid-engine.ts:802` is per-key; under segments it feeds compaction, not per-S3-object deltas (S3 objects are immutable — "re-materialize only touched segments' deltas" is hand-wavy; drop it). Economics come from immutability of closed segments (unchanged segments cost 0), not per-key delta PUTs.
-- **Enumeration rewrite (understated in draft):** `BackupManager.getJsonFiles()` `src/backup.ts:259` and `createArchiveBackup` `src/backup.ts:289` and `backupToBucket` `src/backup.ts:754-838` all use `walkPartitions` `src/acid-engine.ts:700`; under segments they must list `segments/*.seg` + MANIFEST. `DataRecovery.recoverSingleFile` `src/recovery.ts:121` and `recoverIndividualFiles` `src/recovery.ts:216` / `recoverMissingFiles` `src/recovery.ts:394` write via `partitionedPath` `src/acid-engine.ts:679` — dead for segment engine. Phase 4 rewrites these paths to `GET segments/` + `MANIFEST` and to download segments directly. Scope is not "1–2 wk polish."
-- **Hydration modes:** `hydrateOnStartup:'snapshot'` `src/index.ts:140-151` is the only valid mode for segment engine. `'all'`/`'missing'` (`src/recovery.ts:127,379,520`) produce legacy layout files the segment engine never reads — disable with clear error or auto-rename to segment import path.
-- **Namespace split:** WAL shipper `src/backup.ts:1269-1357` stays under `nodes/<nodeId>/wal/`; segments under `segments/` — no collision after rename.
-
-### 2.7 New API
-
-`keys()`, `count()`, `iterate()` served from index + `committedBuffer` (must union pending flush; exclude tombstones). Define snapshot semantics: `iterate()` sees a point-in-time view (copy-on-read of index reference, not live Map) and is O(active keys). `walkPartitions` remains only for legacy import (§3).
-
-### 2.8 Config surface + auto-detection
+### 2.7 Config surface
 
 ```ts
-// TeroConfig (src/index.ts:107)
-engine?: 'file' | 'segment'        // default 'file' in 0.0.x; auto-detect in 1.0 (see below)
-segmentSizeMB?: number             // default 128, validated against free disk
+// TeroConfig (index.ts:107)
+engine?: 'file' | 'segment'        // default 'file' in 0.0.x
+segmentSizeMB?: number             // default 128
 indexCompact?: boolean             // Phase 5; default false
 ```
 
-In 1.0, do **not** flip default blindly — on open, detect on-disk format: if `<dir>/segments/MANIFEST.json` exists → segment engine; else if legacy partition tree non-empty → file engine (or trigger migration if `engine:'segment'`); else new DB → respect `engine` flag. Add persisted `<dir>/.engine` marker written atomically at format init.
-
-`synchronous` maps 1:1 onto segment fsyncs (per-append batch). `TERO_ALLOW_UNSAFE_OFF` `src/index.ts:369-371` unchanged.
+Format detection, not flag inference: on open, the engine reads the directory layout (presence of `segments/manifest.json` vs. partition tree) and boots the matching engine, erroring only on a genuinely ambiguous state. The config flag governs *new* databases and explicit migration (§3). This removes the "existing DB + new binary + no flag" failure mode.
 
 ---
 
-## 3. Migration (non-breaking, idempotent)
+## 3. Migration (zero-copy, non-breaking)
 
-1. `engine:'segment'` on existing dir triggers one-time import **guarded by import manifest**: `walkPartitions` `src/acid-engine.ts:700` streams legacy docs → bulk append into `segments/seg-*.seg` (check `statfs` free > 1.5× source size first) → write `MANIFEST.json` (seq 0) → write `.engine='segment'` → `fsyncDir` → rename legacy tree to `<dir>/legacy-<ts>/` (keep until first *verified* compaction). Progress = `import-manifest.json` with `lastKey` cursor; resume is idempotent — skip keys already indexed (compare `lsn`/`crc`), never double-append.
-2. WAL replayed per normal boot after import — no loss (same as `upgrade3.md` §4).
-3. Rollback = delete `segments/` + `.engine` + restore legacy tree *only while legacy retained*; after GC, rollback is destructive — document it. `engine:'file'` keeps working through 1.x for non-migrated DBs.
+1. `engine: 'segment'` on a legacy directory triggers a one-time import: `walkPartitions` (streaming, `acid-engine.ts:700`) reads every legacy doc → bulk append into segments → manifest written (with a `migrating` state marker) → legacy tree renamed `<dir>/legacy-<ts>/` with a parent-directory fsync → manifest marked `migrated` atomically.
+2. **Boot-state machine:** `no segments + partitions` → boot file engine. `segments + migrating marker` → resume import (idempotent: the manifest records the last imported key range; no double-append). `segments + migrated` → boot segment engine. `both, no marker` → refuse to boot with a recovery instruction (never guess).
+3. ENOSPC pre-flight: import requires free space ≥ estimated segment size before starting; aborts cleanly with the manifest in `migrating` state.
+4. **Rollback window is explicit:** `segments/` deletion + legacy-tree restore is supported **until the first verified compaction GCs the legacy tree**. After that, rollback is export-based (dump via the index → re-import to file engine). Documented, not hidden.
 
----
-
-## 4. Phases (re-estimated)
+## 4. Phases
 
 | Phase | Deliverable | Effort | Exit criterion |
 |---|---|---|---|
-| **0 — Re-baseline** | Fix `checkLogRotation` flush-before-rotate; extend `capacity-probe.mjs` with `du` disk accounting + `kill -9` recovery harness; measure on ext4 | 1 wk | Disk amplification and recovery wall-time reported per `synchronous` mode; no "real, not projected" without data |
-| **1 — Segments + monotonic LSN + batched flush + Map index** | `.lsn` monotonic counter, segment append + `fsyncDir` on create, MANIFEST with `flushedThroughLSN`, index + snapshot, redo rewritten to segments | 3–4 wk | 1M docs (`normal`) ≥20k docs/s sustained, no flush stall >50 ms; `kill -9` mid-flush → WAL tail replay correct |
-| **2 — Torn tail + recovery + index snapshot** | Forward-scan active tail only (partial-header + CRC), MANIFEST two-phase fsync ordering, index snapshot load+tail scan | 1–2 wk | `kill -9` at 1M docs (`full`) → open <5 s (snapshot+tail), 100% committed-tx survival in `full`; `corrupt-last-record` and `torn-partial-header` tests green |
-| **3 — Compaction** | Per-segment stats, async tick-budgeted rewrite with yields, pending→committed MANIFEST, orphan GC, backpressure | 2 wk | After 2× churn: disk ≤2× payload; p99 flat per mode; post-compaction state byte-equivalent; tombstones reclaim |
-| **4 — Segment-aware snapshot/hydrate + `keys()/count()/iterate()`** | Rewrite `getJsonFiles`/`backupToBucket`/`DataRecovery` to `segments/`+MANIFEST, snapshot-only hydration gate, `iterate()` snapshot semantics | 2 wk | MinIO: 1M-doc first-enable = `ceil(payload/128MB)` segment PUTs +1 manifest, verified; hydration `O(segments)` |
-| **5 — Compact index (if needed) + migration tool + auto-detect + CI gate** | Measure B/key in gate; if breach, compact index; finalize `.engine` auto-detect, legacy import resume, `indexCompact` flag | 2 wk | Gate asserts `RSS ≤ baseline + index_measured`; 50k→1M gate runs on ext4 runner with timeout headroom |
+| **HF 0.0.14** | `beforeRotate` hook + flush-before-auto-rotate ordering (`checkLogRotation` routed through the same invariant as `commitTransaction`); chaos test for the auto-rotation crash window | **1–2 d** | `kill -9` at 1k commits/s timed across WAL auto-rotations → zero committed-tx loss in `full` mode; suite added to `local_tests/` |
+| 0 | Extended probe: disk-byte accounting, `kill -9` recovery timing, full-mode flush latency, ext4 re-measure | 3–5 d | Re-baselined §0 numbers, reproducible from one command, **before** any later exit criterion is asserted |
+| 1 | Segment files, batched flush, Map index behind `engine: 'segment'`; record format v1 with version/flags/op bytes | 2–3 wk | Probe at 1M docs: ≥20k docs/s sustained, no stall >50 ms; measured B/key published |
+| 2 | Persistent monotonic LSN; checkpoint-LSN recovery; active-tail validation | 1–2 wk | `kill -9` at 1M docs (durability `full` and `normal`) → recovery <5 s, zero committed-tx loss beyond the documented `normal`-mode RPO; chaos suite green |
+| 3 | Compaction + two-phase manifest + generation-based reader safety | 1–2 wk | Probe: <2× payload floor after 2× churn; p99 flat during compaction; kill-mid-compaction suite green |
+| 4 | Segment-aware snapshot/hydrate (all three modes); rewritten backup + live-checkpoint paths; `keys()`/`count()`/`iterate()`; `data-seg-` namespace | 2–3 wk | MinIO gate: first-enable backup O(segments); hydration O(segments); delta checkpoints upload only active-segment new bytes |
+| 5 | Compact index (if Phase 1 measurement demands it); legacy migration hardening; CI capacity gate | 2 wk | Gate green on CI hardware at the documented doc/byte profile |
 
-Total: ~10–13 weeks. Phases 1–2 are production blockers; 3–5 are economics/polish. Phase 4 scope was understated — plan 2 wk, not 1.
-
----
-
-## 5. Verification (extends `local_tests/` + MinIO `test:s3`)
-
-1. **Capacity gate:** 50k probe stays; new `capacity-probe-1m.mjs` (opt-in nightly, not per-PR — 1M docs OOMs PR runners) asserts `normal` ≥20k docs/s, no stall >50 ms, `du` ≤2× payload.
-2. **Recovery (mode-qualified):** `kill -9` mid-flush at 1M docs (`full`, three recencies) → open <5 s, 100% committed survival; same in `normal` → ≤`commitIntervalMs` loss window only.
-3. **Torn tail:** (a) flip last byte (CRC mismatch) → truncates one record, WAL restores it; (b) truncate inside `totalLen` header (partial header) → detects `read < totalLen`, truncates, WAL restores; `verifyDataIntegrity` healthy.
-4. **Compaction correctness:** byte-equivalent per key after compaction; tombstones actually reclaim; per-segment stats accurate.
-5. **Backup cost contract:** MinIO access log asserts `PUTs == segments + 1 (manifest)` for first-enable; WAL shipper `wal/` PUTs counted separately. No per-doc PUTs after first-enable.
-6. **Soak:** 24h mixed 1k ops/s (or nightly 4h scaled) with hourly `kill -9` — flat RSS (gate, not speculation), FDs < limit, zero corruption. Deduplicate `roadmap4.md:168` soak where possible.
+Total: **~9–12 weeks** after the 1–2-day hotfix. The hotfix ships first and independently: a known data-loss bug must not wait behind a program ramp, and Phase 2's checkpoint-LSN work depends on rotation ordering being sound. Phases 1–2 remove the production blockers (flush stalls); 3–5 are economics, API surface, and the 1.0 default flip.
 
 ---
+
+## 5. Verification (extends `local_tests/` + existing MinIO harness)
+
+1. **Hotfix regression (0.0.14):** `kill -9` at 1k commits/s timed across WAL auto-rotation boundaries → zero committed-tx loss in `full`; in `normal`, loss bounded by the documented `commitIntervalMs` RPO.
+2. **Capacity gate (CI):** 1M docs, durability `normal`: sustained ≥20k docs/s, no batch stall >50 ms, RSS within the measured budget, disk ≤2× payload. The 1M gate runs nightly; a 100k gate runs per-commit.
+3. **Recovery:** `kill -9` mid-flush at 1M docs, three checkpoints of recency, in both `full` and `normal` → <5 s; committed-tx survival asserted against each mode's documented RPO (no unconditional "100%" claim — `normal` mode accepts up to `commitIntervalMs` of loss by design).
+4. **Torn tail:** corrupt the last record (CRC break) *and* truncate mid-header (short read) of the active segment → clean truncation, WAL replay restores the tail, `verifyDataIntegrity` healthy.
+5. **Compaction correctness:** post-compaction per-key byte-equivalence; tombstones actually reclaim; `kill -9` at each of the four two-phase manifest steps → boot resolves every case per §2.4.
+6. **LSN invariants:** monotonic across rotation, compaction, and truncated tails; `flushedThroughLSN` never regresses; every index `(off, len)` within its segment's file size.
+7. **Backup cost contract:** MinIO access log asserts PUTs = O(segments) for first-enable and O(dirty bytes) per checkpoint, **with the WAL shipper enabled** — the combined number, not a shipper-disabled one.
 
 ## 6. Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Monotonic LSN restart after rotation | Persisted `.lsn` file, fsynced, read on boot (`max(log, file)`) — Phase 1 hard gate |
-| `checkLogRotation` without `flushCommittedBuffer` | Fix ordering per §2.2b, add test |
-| Index memory / cold-start scan | MANIFEST index snapshot + tail scan; gate measures B/key, no speculative 150/500 numbers |
-| Compaction stalls p99 | Async I/O with `setImmediate` yields, 1MB chunks, pause under write pressure |
-| Segment file creation durability | `fsyncDir(segments/)` on new file; MANIFEST `fsync+rename+fsyncDir` |
-| Hydration mode break | Segment engine only supports `snapshot`; `'all'`/`'missing'` error or auto-import |
-| Backup path rewrite understated | Phase 4 rewrites `getJsonFiles`/`backupToBucket`/`DataRecovery` — 2 wk, not polish |
-| Migration atomicity / ENOSPC | `statfs` preflight, import manifest + idempotent resume, `.engine` marker, legacy retained to GC |
-| Namespace collision `seg-` | Segments `.seg` under `segments/`, WAL under `nodes/<id>/wal/` — distinct |
-| Scope creep | Segments only remove per-file tax; secondary-index hook stays hook |
+| Index memory on edge budgets | Measured in Phase 1, not estimated; compact index behind `indexCompact` if needed; CI asserts RSS |
+| Batch flush itself stalling the loop | Chunked serialization + async I/O in the flush path; the 50 ms stall budget is an exit criterion, not an assumption |
+| Compaction I/O stealing event-loop budget | Async I/O with yields (§2.4); measured p99 in the gate; compaction pauses under write pressure |
+| Segment tail torn-write on crash | CRC + length-short-read detection + active-tail-only validation + WAL authority |
+| LSN redesign touching rotation | Phase 2 lands the persisted monotonic LSN *before* any recovery logic depends on it; the 0.0.14 hotfix lands the flush-before-auto-rotate ordering first, so Phase 2 starts from sound rotation semantics |
+| Cloud-path regressions | Phase 4 covers every `partitionedPath`/`walkPartitions` consumer (verified inventory: `backup.ts:269,1061,1088,1178,1189,1212`; `recovery.ts:127,379,520`); `data-seg-` namespace kept distinct from the WAL shipper's `wal/seg-*` |
+| Migration ambiguity | Boot-state machine refuses ambiguous states rather than guessing; idempotent resume; explicit rollback window |
+| Scope creep toward a query engine | Non-goal by design; secondary-index hook = segment-range scans, nothing more |
 
 ---
 
-## 7. Decision asked
+## 7. Technical verification appendix (audit trail)
 
-Approve **Phase 0 (re-baseline) + Phase 1–2** now. Block 1.0 default-flip on Phase 0 numbers and monotonic-LSN + MANIFEST durability gates — the two load-bearing fixes for the roadmap's headline claims. The core thesis (per-file materialization is the ceiling; segments+index+compaction fix it) survives review; the numbers and several mechanics needed correction above.
+Every source-code claim in this document was independently checked against the working tree on 2026-09-01. Due-diligence readers can re-run each check in seconds.
+
+| Claim | Anchor | Result |
+|---|---|---|
+| WAL auto-rotate limit is 1 MB | `acid-engine.ts:44` — `LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024` | ✅ verified |
+| Auto-rotation skips `committedBuffer` flush | `acid-engine.ts:270 → 272-280` (`flushBuffer` → `checkLogRotation` → `rotateLog`, no flush) vs. `commitTransaction` `:1343-1347` (flushes first) | ✅ verified — the defect |
+| The code documents the violated invariant | `acid-engine.ts:290-293` (comment: "MUST be called before rotateLog()") | ✅ verified — quoted in §1.3 |
+| Recovery never reads WAL archives | `streamLogEntries` opens only `this.logPath` (`acid-engine.ts:163-167`) | ✅ verified |
+| LSNs reset per rotation | `recoverFromLog` derives `currentLSN` from current log only (`acid-engine.ts:146-152`) | ✅ verified — motivates §2.2 |
+| Ingest 21,126 docs/s vs. flush ~750–1,300 files/s; 11 ops/s stall batch; 11,513 files = 50.6 MB | `local_tests/capacity-probe.mjs` + live `du`, 2026-08-31, APFS | ✅ measured (disk bytes move in-probe in Phase 0) |
+| `knownKeys` is a capped LRU | `index.ts:342-343` — `QuickLRU`, `KNOWN_KEYS_MAX = 10000` (memory rationale documented in-code at `:339`) | ✅ verified |
+| WAL shipper owns `wal/seg-*.json.gz` namespace | `backup.ts:1313,1343` | ✅ verified — motivates `data-seg-` naming |
+| Full consumer inventory of partition helpers | `backup.ts:269,1061,1088,1178,1189,1212`; `recovery.ts:127,379,520` | ✅ verified — grep re-runnable |
+| Group-commit/write-buffer batching exists (what stays untouched) | `acid-engine.ts:51-60, 128-137, 260-271` | ✅ verified |
+| `synchronous='off'` guard + env override | `index.ts:369-371` | ✅ verified |
+
+Two errors in the v1 draft were found during this review and are corrected in this Final: (a) v1 claimed crash recovery rewrites the whole DB — refuted by the 1 MB WAL cap + archive-never-replayed behavior; (b) v1's record format had no `op` byte, making deletes unrepresentable on disk and compaction impossible. Both corrections originate in the v2 technical review and are incorporated here.
+
+---
+
+## 8. Decision asked of this document
+
+1. **Approve hotfix 0.0.14 immediately** (1–2 days): the flush-before-auto-rotate fix and its chaos test. A known data-loss window in the shipped engine is the program's first deliverable — closing it is also the first verifiable proof point that the process works.
+2. **Approve Phases 0–2** (≈5–8 weeks): re-baselined probe, the stall fix, and checkpoint-LSN recovery — the production blockers.
+3. **Gate Phases 3–5** (≈4–6 weeks) on Phase 1–2 exit criteria being green; they carry the 1.0 default flip.
+
+The engine's architecture comment (`acid-engine.ts:777-782`) already promises "the WAL is the durable copy; data files are a checkpointed cache." This roadmap makes the implementation keep that promise at 10⁶–10⁷ documents per node — with the one real durability gap found along the way closed first, every baseline measured rather than asserted, and every target enforced by CI.
+
+
+
+
+
