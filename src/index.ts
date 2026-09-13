@@ -1,10 +1,9 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync } from "fs";
-import { join, resolve as pathResolve, relative as pathRelative } from "path";
+import { resolve as pathResolve, relative as pathRelative } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath } from "./acid-engine.js";
-import { SchemaValidator, DocumentSchema, ValidationResult } from "./schema.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
-import { randomBytes } from "node:crypto";
 import QuickLRU from "quick-lru";
 
 /**
@@ -189,7 +188,7 @@ export class Transaction {
       this.timeoutTimer = setTimeout(() => {
         this.destroyed = true;
         this.rolledBack = true;
-        this.db._rollbackRaw(this.id).catch(() => {});
+        this.db._rollbackRaw(this.id).catch(() => { });
       }, options.timeout);
       (this.timeoutTimer as any).unref?.();
     }
@@ -316,7 +315,7 @@ export class Transaction {
     this.destroyed = true;
     this.rolledBack = true;
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
-    this.db._rollbackRaw(this.id).catch(() => {});
+    this.db._rollbackRaw(this.id).catch(() => { });
   }
 }
 
@@ -327,7 +326,6 @@ export class Tero {
   private cacheHits: number = 0;
   private cacheRequests: number = 0;
   private acidEngine: ACIDStorageEngine;
-  private schemaValidator: SchemaValidator;
   private backupManager?: BackupManager;
   private dataRecovery?: DataRecovery;
   private committedCount: number = 0;
@@ -404,9 +402,6 @@ export class Tero {
       const syncInterval: number = commitIntervalMs ?? 10;
       const dataFlushInterval: number = dataFlushIntervalMs ?? 50;
       this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval);
-
-      // Initialize schema validator
-      this.schemaValidator = new SchemaValidator();
 
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
@@ -629,9 +624,8 @@ export class Tero {
 
   async write(transactionId: string | Transaction, key: string, data: any, options?: {
     validate?: boolean;
-    schemaName?: string;
     strict?: boolean;
-  }): Promise<ValidationResult | void> {
+  }): Promise<void> {
     try {
       const txId = this._txId(transactionId);
       this.validateKey(key);
@@ -646,27 +640,8 @@ export class Tero {
       const jsonStr = JSON.stringify(data);
       const byteLen = Buffer.byteLength(jsonStr, 'utf8');
       if (byteLen > MAX_DOCUMENT_SIZE) {
-        throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB) — got ${(byteLen / (1024*1024)).toFixed(2)}MB`);
+        throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB) — got ${(byteLen / (1024 * 1024)).toFixed(2)}MB`);
       }
-
-      // Perform schema validation if requested
-      if (options?.validate || options?.schemaName) {
-        const schemaName = options.schemaName || key;
-        const validationResult = this.schemaValidator.validate(schemaName, data);
-
-        if (!validationResult.valid) {
-          if (options.strict) {
-            const errorMessages = validationResult.errors.map(e => `${e.field}: ${e.message}`).join(', ');
-            throw new Error(`Schema validation failed: ${errorMessages}`);
-          } else {
-            return validationResult;
-          }
-        }
-
-        // Use sanitized data from validation
-        data = validationResult.data || data;
-      }
-
       // Check cache for beforeImage so engine doesn't need disk I/O on hot writes
       const cachedEntry = this.cache.get(key);
       const cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) ? cachedEntry.data : undefined;
@@ -682,10 +657,6 @@ export class Tero {
       // updates to the same key would lose earlier fields).
       const afterImage = this.acidEngine.getPendingAfterImage(txId, key);
       this.updateCache(key, afterImage !== undefined ? afterImage : data, txId);
-
-      if (options?.validate || options?.schemaName) {
-        return { valid: true, errors: [], data };
-      }
     } catch (error) {
       throw new Error(`Write failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -796,7 +767,7 @@ export class Tero {
     validate?: boolean;
     schemaName?: string;
     strict?: boolean;
-  }): Promise<ValidationResult | boolean> {
+  }): Promise<boolean> {
     this.validateKey(key);
 
     const transactionId = this._beginTransaction();
@@ -830,13 +801,13 @@ export class Tero {
       // (write will deepMerge, but for create we need empty). The exclusive
       // lock guarantees no other tx is writing this key concurrently.
 
-      const result = await this.write(transactionId, key, initialData || {}, options);
+      await this.write(transactionId, key, initialData || {}, options);
       await this.commit(transactionId);
       this.knownKeys.set(key, true);
 
-      return result || true;
+      return true;
     } catch (error) {
-      try { await this.rollback(transactionId); } catch {}
+      try { await this.rollback(transactionId); } catch { }
       throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
@@ -845,13 +816,13 @@ export class Tero {
     validate?: boolean;
     schemaName?: string;
     strict?: boolean;
-  }): Promise<ValidationResult | void> {
+  }): Promise<void> {
     const transactionId = this._beginTransaction();
 
     try {
-      const result = await this.write(transactionId, key, data, options);
+      await this.write(transactionId, key, data, options);
       await this.commit(transactionId);
-      return result;
+      return;
     } catch (error) {
       await this.rollback(transactionId);
       throw error;
@@ -1110,68 +1081,6 @@ export class Tero {
       total: active + this.committedCount + this.rolledBackCount
     };
   }
-
-  // Schema Management
-  setSchema(collectionName: string, schema: DocumentSchema): void {
-    try {
-      this.schemaValidator.setSchema(collectionName, schema);
-    } catch (error) {
-      throw new Error(`Failed to set schema: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
-    }
-  }
-
-  getSchema(collectionName: string): DocumentSchema | undefined {
-    return this.schemaValidator.getSchema(collectionName);
-  }
-
-  removeSchema(collectionName: string): boolean {
-    return this.schemaValidator.removeSchema(collectionName);
-  }
-
-  validateData(collectionName: string, data: any): ValidationResult {
-    return this.schemaValidator.validate(collectionName, data);
-  }
-
-  hasSchema(collectionName: string): boolean {
-    return this.schemaValidator.hasSchema(collectionName);
-  }
-
-  listSchemas(): string[] {
-    return this.schemaValidator.listSchemas();
-  }
-
-  exportSchemas(): Record<string, DocumentSchema> {
-    return this.schemaValidator.exportSchemas();
-  }
-
-  getSchemaStats(): { totalSchemas: number; schemaNames: string[]; totalFields: number } {
-    return this.schemaValidator.getSchemaStats();
-  }
-
-  async createWithValidation(key: string, initialData?: any, options?: {
-    validate?: boolean;
-    schemaName?: string;
-    strict?: boolean;
-  }): Promise<ValidationResult> {
-    const result = await this.create(key, initialData, { ...options, validate: true });
-    if (result === true || result === false) {
-      return { valid: result, errors: [], data: initialData || {} };
-    }
-    return result;
-  }
-
-  async updateWithValidation(key: string, data: any, options?: {
-    validate?: boolean;
-    schemaName?: string;
-    strict?: boolean;
-  }): Promise<ValidationResult> {
-    const result = await this.update(key, data, { ...options, validate: true });
-    if (!result) {
-      return { valid: true, errors: [], data };
-    }
-    return result as ValidationResult;
-  }
-
   // ---------------------------------------------------------------------------
   // Backup Management
   // ---------------------------------------------------------------------------
@@ -1705,4 +1614,4 @@ export class Tero {
 }
 
 // Export types for external use
-export { DocumentSchema, ValidationResult, BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger };
+export { BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger };
