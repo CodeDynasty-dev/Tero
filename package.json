@@ -39,17 +39,17 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "node run-tests.js",
-    "test:production": "node local_tests/prod-test-suite.js",
-    "test:s3": "node local_tests/s3-live-backup-test.js",
+    "test:production": "node tests/prod-test-suite.js",
+    "test:s3": "node tests/s3-live-backup-test.js",
     "test:all": "npm run test && npm run test:production",
     "test:watch": "npm run test",
-    "verify": "node local_tests/prod-test-suite.js && npm run test",
-    "ci": "npm run test && node local_tests/prod-test-suite.js",
-    "bench": "node bench/run-bench.js --synchronous normal",
-    "bench:full": "node bench/run-bench.js --synchronous full",
-    "bench:quick": "node bench/run-bench.js --quick --synchronous normal",
-    "bench:live": "node bench/run-live-bench.js",
-    "bench:live:quick": "node bench/run-live-bench.js --quick"
+    "verify": "node tests/prod-test-suite.js && npm run test",
+    "ci": "npm run test && node tests/prod-test-suite.js",
+    "bench": "node tests/run-bench.js --synchronous normal",
+    "bench:full": "node tests/run-bench.js --synchronous full",
+    "bench:quick": "node tests/run-bench.js --quick --synchronous normal",
+    "bench:live": "node tests/run-live-bench.js",
+    "bench:live:quick": "node tests/run-live-bench.js --quick"
   },
   "files": [
     "dist/**/*"
