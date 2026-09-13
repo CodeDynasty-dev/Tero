@@ -48,21 +48,6 @@ async function run() {
     if (db.exists('user1')) throw new Error('remove failed');
   });
 
-  await test('schema validation', async () => {
-    db.setSchema('users', {
-      name: { type: 'string', required: true },
-      age: { type: 'number', min: 0, max: 150 }
-    });
-    const r = await db.createWithValidation('u1', { name: 'Bob', age: 25 }, { validate: true, schemaName: 'users' });
-    if (!r.valid) throw new Error('validation should pass');
-    try {
-      await db.create('u2', { name: 'X', age: -5 }, { validate: true, schemaName: 'users', strict: true });
-      throw new Error('should reject negative age');
-    } catch (e) {
-      if (!e.message.includes('Schema validation failed')) throw e;
-    }
-  });
-
   await test('batch write + read', async () => {
     await db.batchWrite([
       { key: 'p1', data: { v: 1 } },

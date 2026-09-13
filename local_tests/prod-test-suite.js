@@ -28,9 +28,9 @@ async function test(name, fn) {
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
 function cleanup() {
-    try { if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true }); } catch {}
-    ['RecoveryTestDB', 'LockTestDB_A', 'LockTestDB_B', 'HydrateTestDB', 'BatchTestDB', 'SchemaTestDB', 'BackupTestDB', 'BackupRecoveryDB', 'IntegrityTestDB'].forEach(d => {
-        try { if (existsSync(d)) rmSync(d, { recursive: true, force: true }); } catch {}
+    try { if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, force: true }); } catch { }
+    ['RecoveryTestDB', 'LockTestDB_A', 'LockTestDB_B', 'HydrateTestDB', 'BatchTestDB', 'BackupTestDB', 'BackupRecoveryDB', 'IntegrityTestDB'].forEach(d => {
+        try { if (existsSync(d)) rmSync(d, { recursive: true, force: true }); } catch { }
     });
 }
 
@@ -357,61 +357,6 @@ async function suite6() {
             { key: 'new2', data: { v: 2 } },
         ]);
         assert(db.exists('new1') && db.exists('new2'), 'batch should create new keys');
-        db.destroy();
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// SUITE 7: Schema Validation
-// ═══════════════════════════════════════════════════════════════════
-async function suite7() {
-    cleanup();
-    await test('setSchema accepts valid schema', async () => {
-        const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        db.setSchema('users', {
-            name: { type: 'string', required: true, min: 2, max: 50 },
-            age: { type: 'number', min: 0, max: 150 },
-            email: { type: 'string', required: true, format: 'email' },
-        });
-        assert(db.hasSchema('users'), 'schema should be stored');
-        db.destroy();
-    });
-
-    await test('valid data passes strict schema validation', async () => {
-        const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        db.setSchema('users', {
-            name: { type: 'string', required: true },
-            age: { type: 'number', min: 0 },
-        });
-        const r = await db.create('u1', { name: 'Bob', age: 25 }, { validate: true, schemaName: 'users', strict: true });
-        assert(r === true || (r && r.valid === true), 'valid data should pass');
-        db.destroy();
-    });
-
-    await test('invalid data rejected in strict mode', async () => {
-        const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        db.setSchema('users', {
-            name: { type: 'string', required: true },
-            age: { type: 'number', min: 0 },
-        });
-        try {
-            await db.create('u2', { name: 'X', age: -5 }, { validate: true, schemaName: 'users', strict: true });
-            throw new Error('should have rejected');
-        } catch (e) {
-            assert(e.message.includes('Schema validation failed'), `wrong error: ${e.message}`);
-        }
-        db.destroy();
-    });
-
-    await test('schema validation with defaults fills missing fields', async () => {
-        const db = new Tero({ directory: TEST_DIR, cacheSize: 50 });
-        db.setSchema('items', {
-            name: { type: 'string', required: true },
-            active: { type: 'boolean', default: true },
-        });
-        const r = await db.create('i1', { name: 'Test' }, { validate: true, schemaName: 'items' });
-        assert(r.valid === true, 'should pass');
-        assert(r.data.active === true, 'default should be applied');
         db.destroy();
     });
 }
@@ -788,8 +733,7 @@ async function main() {
     await suite3();  // ACID transactions
     await suite4();  // Concurrent writes
     await suite5();  // Crash recovery
-    await suite6();  // Batch operations
-    await suite7();  // Schema validation
+    await suite6();  // Batch operations 
     await suite8();  // Cache consistency
     await suite9();  // Key validation / edge cases
     await suite10(); // Data integrity

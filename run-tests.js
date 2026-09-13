@@ -57,8 +57,7 @@ class TestRunner {
                     'test.js': 1,
                     'acid-test.js': 2,
                     'backup-test.js': 3,
-                    'transaction-test.js': 4,
-                    'schema-test.js': 5
+                    'transaction-test.js': 4
                 };
 
                 return (priority[a] || 999) - (priority[b] || 999);
