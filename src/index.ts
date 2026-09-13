@@ -763,11 +763,7 @@ export class Tero {
   }
 
   // Convenience Methods (Auto-transaction)
-  async create(key: string, initialData?: any, options?: {
-    validate?: boolean;
-    schemaName?: string;
-    strict?: boolean;
-  }): Promise<boolean> {
+  async create(key: string, initialData?: any): Promise<boolean> {
     this.validateKey(key);
 
     const transactionId = this._beginTransaction();
@@ -801,7 +797,7 @@ export class Tero {
       // (write will deepMerge, but for create we need empty). The exclusive
       // lock guarantees no other tx is writing this key concurrently.
 
-      await this.write(transactionId, key, initialData || {}, options);
+      await this.write(transactionId, key, initialData || {});
       await this.commit(transactionId);
       this.knownKeys.set(key, true);
 
@@ -812,15 +808,11 @@ export class Tero {
     }
   }
 
-  async update(key: string, data: any, options?: {
-    validate?: boolean;
-    schemaName?: string;
-    strict?: boolean;
-  }): Promise<void> {
+  async update(key: string, data: any): Promise<void> {
     const transactionId = this._beginTransaction();
 
     try {
-      await this.write(transactionId, key, data, options);
+      await this.write(transactionId, key, data);
       await this.commit(transactionId);
       return;
     } catch (error) {
@@ -926,16 +918,12 @@ export class Tero {
   }
 
   // Batch Operations
-  async batchWrite(operations: Array<{ key: string; data: any }>, options?: {
-    validate?: boolean;
-    schemaName?: string;
-    strict?: boolean;
-  }): Promise<void> {
+  async batchWrite(operations: Array<{ key: string; data: any }>): Promise<void> {
     const transactionId = this._beginTransaction();
 
     try {
       for (const op of operations) {
-        await this.write(transactionId, op.key, op.data, options);
+        await this.write(transactionId, op.key, op.data);
       }
       await this.commit(transactionId);
       // Register all written keys in knownKeys so future exists() calls are O(1)

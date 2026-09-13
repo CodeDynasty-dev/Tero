@@ -13,7 +13,6 @@ Tero is a **library**, not a service. You embed it in a worker, container, or ed
 - **Embedded JSON document DB** with key/value + batch operations
 - **Real ACID**: WAL with fsync barriers on COMMIT/ROLLBACK, atomic data-file writes (temp → rename → fsync), in-memory pending-writes index so transaction reads never re-scan the WAL
 - **WAL rotation** into archive segments — backs up WAL segments and snapshots to object storage
-- **Schema validation** with strict mode (string/number/boolean/object/array/date/any, formats, enums, defaults, custom validators)
 - **Cloud backup** to AWS S3 or Cloudflare R2 (cron-scheduled), archive or individual-file format
 - **Cloud recovery** — full, single-file, or archive restore
 - **v2: hydrate on startup** — pull missing or all files from object storage before the ACID engine initializes to reconstruct node state
@@ -74,28 +73,6 @@ The money-transfer example demonstrates atomicity: `db.transferMoney('savings', 
 ### Durability guarantee
 
 A `commit()` returns only after the WAL `COMMIT` record and all pending writes have been fsynced to disk. A crash after `commit()` returns cannot lose the transaction. A crash mid-`commit()` leaves either the old or new state on disk, never a partial of either — data files are written via temp-file → fsync → atomic rename.
-
-## Schema validation
-
-```javascript
-db.setSchema('users', {
-  name:  { type: 'string', required: true, min: 2, max: 50 },
-  email: { type: 'string', required: true, format: 'email' },
-  age:   { type: 'number', min: 0, max: 150 },
-  profile: {
-    type: 'object',
-    properties: {
-      bio:     { type: 'string', max: 500 },
-      website: { type: 'string', format: 'url' },
-    },
-  },
-});
-
-await db.create('user1', userData, { validate: true, schemaName: 'users', strict: true });
-```
-
-Field types: `string`, `number`, `boolean`, `object`, `array`, `date`, `any`.
-Validation options: `required`, `min`, `max`, `format` (email/url/uuid/date/time/datetime/phone/ip), `pattern`, `enum`, `default`, `custom`.
 
 ## Batch operations
 
@@ -227,7 +204,6 @@ Tero instance (one per process)
 │   ├── WriteAheadLog ─── append-only, fsync on barriers, rotates to archive segments
 │   ├── LockManager   ─── per-key shared/exclusive locks with wait queue
 │   └── pendingWrites ─── in-memory per-transaction op index (O(1) reads within a tx)
-├── SchemaValidator
 ├── BackupManager     ─── cron-scheduled snapshot + WAL segment upload to object storage
 └── DataRecovery      ─── hydrate-on-startup + runtime getWithRecovery
 ```
@@ -239,7 +215,6 @@ Tero instance (one per process)
 try {
   await db.create('user', invalidData, { validate: true, strict: true });
 } catch (error) {
-  if (error.message.includes('Schema validation failed')) { /* validation error */ }
   else if (error.message.includes('already exists'))     { /* duplicate key */ }
 }
 ```
