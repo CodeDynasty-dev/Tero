@@ -8,8 +8,10 @@ import {
   WriteAheadLog,
   verifyWalSegmentContinuity,
   recoverPendingRestore,
-  partitionedPath
+  partitionedPath,
+  cloneJson
 } from '../dist/acid-engine.js';
+import { BackupManager } from '../dist/backup.js';
 import { DataRecovery, classifyRecoveryError } from '../dist/recovery.js';
 
 // ============================================================================
@@ -675,3 +677,307 @@ test('Static Audit: Zero unapproved broad catch {}, catch { continue; }, or catc
 
   assert.equal(violations.length, 0, `Unapproved broad catch blocks found:\n${JSON.stringify(violations, null, 2)}`);
 });
+
+// ============================================================================
+// Invariant I: Checkpoint dirty ACK ordering strictly after publishing latest
+// ============================================================================
+test('Invariant I: Checkpoint acknowledges dirty keys strictly after publishing latest.json', async () => {
+  const testDir = resolve('./test_invariant_i_ack_order');
+  rmSync(testDir, { recursive: true, force: true });
+  mkdirSync(testDir, { recursive: true });
+
+  try {
+    const uploadedKeys = [];
+    let simulateFailureBeforePublish = true;
+
+    const mockS3Client = {
+      send: async (cmd) => {
+        const key = cmd.input?.Key || '';
+        if (key) uploadedKeys.push(key);
+
+        if (simulateFailureBeforePublish && key.endsWith('latest.json')) {
+          const err = new Error('Simulated S3 failure right before publishing latest.json');
+          err.$metadata = { httpStatusCode: 500 };
+          throw err;
+        }
+
+        if (cmd.constructor.name === 'PutObjectCommand' || cmd.input?.Body) {
+          return { ETag: '"etag-123"' };
+        }
+        if (cmd.constructor.name === 'HeadObjectCommand') {
+          const err = new Error('NotFound');
+          err.name = 'NotFound';
+          err.$metadata = { httpStatusCode: 404 };
+          throw err;
+        }
+        return {};
+      }
+    };
+
+    const engine = new ACIDStorageEngine(testDir, 'full');
+    await engine.createDocument('user_1', { name: 'Alice' });
+    await engine.createDocument('user_2', { name: 'Bob' });
+
+    const backup = new BackupManager({
+      localPath: testDir,
+      cloudStorage: {
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        accessKeyId: 'test',
+        secretAccessKey: 'test'
+      },
+      customS3Client: mockS3Client,
+      engine
+    });
+
+    // 1) First attempt: S3 fails on latest.json upload
+    simulateFailureBeforePublish = true;
+    await assert.rejects(
+      async () => await backup.doFullCheckpoint(),
+      /Simulated S3 failure/
+    );
+
+    // Dirty keys must NOT be acknowledged if latest.json failed!
+    assert.equal(engine.hasPendingDirtyKeys(), true, 'Engine must still have pending dirty keys when publishing fails');
+
+    // 2) Second attempt: S3 succeeds
+    simulateFailureBeforePublish = false;
+    const res = await backup.doFullCheckpoint();
+    assert.ok(res.manifestKey, 'Checkpoint must succeed');
+
+    // Now dirty keys are acknowledged
+    assert.equal(engine.hasPendingDirtyKeys(), false, 'Engine dirty keys must be acknowledged after latest.json publishes');
+
+    // Verify ordering in uploadedKeys: data files -> index.json -> MANIFEST.json -> latest.json
+    const manifestIdx = uploadedKeys.findIndex(k => k.endsWith('MANIFEST.json'));
+    const latestIdx = uploadedKeys.findIndex(k => k.endsWith('latest.json'));
+    assert.ok(manifestIdx !== -1, 'MANIFEST.json must be uploaded');
+    assert.ok(latestIdx !== -1, 'latest.json must be uploaded');
+    assert.ok(latestIdx > manifestIdx, 'latest.json must be published after MANIFEST.json');
+
+    backup.destroy();
+    engine.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant J: Cloud restore zero-gap & checksum validation
+// ============================================================================
+test('Invariant J: Cloud restore enforces zero-gap and detects checksum/range corruptions', async () => {
+  const testDir = resolve('./test_invariant_j_restore');
+  rmSync(testDir, { recursive: true, force: true });
+  mkdirSync(testDir, { recursive: true });
+
+  try {
+    const targetDir = join(testDir, 'db_target');
+
+    // Scenario 1: Gap between base snapshot LSN and first WAL segment
+    // Base snapshot is LSN 10, but first WAL segment starts at LSN 12 (LSN 11 missing)
+    const backup = new BackupManager({
+      localPath: testDir,
+      cloudStorage: {
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        accessKeyId: 'test',
+        secretAccessKey: 'test'
+      },
+      customS3Client: {
+        send: async (cmd) => {
+          const key = cmd.input?.Key || '';
+          if (key.endsWith('latest.json') || key.endsWith('MANIFEST.json')) {
+            return {
+              Body: {
+                transformToString: async () => JSON.stringify({
+                  manifestVersion: 2,
+                  type: 'full',
+                  timestamp: Date.now(),
+                  baseSnapshotLsn: 10,
+                  lastLsn: 15,
+                  walSegments: ['tero-backups/db/wal/.wal.seg-12-15']
+                })
+              }
+            };
+          }
+          if (key.includes('.wal.seg-12-15')) {
+            return {
+              Body: {
+                transformToString: async () => '{"lsn": 12, "operation": "WRITE", "key": "k1", "data": {}}\n'
+              }
+            };
+          }
+          if (key.endsWith('index.json')) {
+            return {
+              Body: {
+                transformToString: async () => JSON.stringify({ lsn: 10, documents: {} })
+              }
+            };
+          }
+          return {};
+        }
+      }
+    });
+
+    await assert.rejects(
+      async () => await backup._restoreToTargetDirectory(targetDir, undefined),
+      (err) => {
+        assert.equal(err.code, 'RECOVERY_CORRUPTION');
+        assert.ok(err.message.includes('gap'), `Expected gap message, got: ${err.message}`);
+        return true;
+      }
+    );
+
+    backup.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant K: cloneJson strict validation
+// ============================================================================
+test('Invariant K: cloneJson strictly validates JSON and rejects non-serializable types', () => {
+  // Primitives allowed
+  assert.equal(cloneJson(null), null);
+  assert.equal(cloneJson(true), true);
+  assert.equal(cloneJson(false), false);
+  assert.equal(cloneJson(123), 123);
+  assert.equal(cloneJson(0), 0);
+  assert.equal(cloneJson('hello'), 'hello');
+
+  // Objects & arrays
+  assert.deepEqual(cloneJson({ a: 1, b: 'two', c: [3, 4] }), { a: 1, b: 'two', c: [3, 4] });
+
+  // Rejections
+  assert.throws(() => cloneJson(NaN), /Cannot serialize non-finite/);
+  assert.throws(() => cloneJson(Infinity), /Cannot serialize non-finite/);
+  assert.throws(() => cloneJson(-Infinity), /Cannot serialize non-finite/);
+  assert.throws(() => cloneJson(10n), /Cannot serialize non-JSON/);
+  assert.throws(() => cloneJson(Symbol('sym')), /Cannot serialize non-JSON/);
+  assert.throws(() => cloneJson(() => {}), /Cannot serialize non-JSON/);
+  assert.throws(() => cloneJson(new Date()), /Cannot serialize non-plain object/);
+  assert.throws(() => cloneJson(new Map()), /Cannot serialize non-plain object/);
+  assert.throws(() => cloneJson(new Set()), /Cannot serialize non-plain object/);
+  assert.throws(() => cloneJson({ a: NaN }), /Cannot serialize non-finite/);
+  assert.throws(() => cloneJson([new Date()]), /Cannot serialize non-plain object/);
+});
+
+// ============================================================================
+// Invariant L: Key validation permits non-traversal dots and forbids traversal
+// ============================================================================
+test('Invariant L: Key validation permits non-traversal dots (version..2) and rejects traversal', async () => {
+  const testDir = resolve('./test_invariant_l_keys');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const db = new Tero({ directory: testDir, synchronous: 'full' });
+
+    // version..2 must be valid!
+    await db.create('version..2', { version: 2 });
+    const doc = await db.get('version..2');
+    assert.deepEqual(doc, { version: 2 });
+
+    // Illegal keys must be rejected
+    const illegalKeys = ['.', '..', 'foo/bar', 'foo\\bar', 'foo\0bar', '.hidden', '..traversal'];
+    for (const badKey of illegalKeys) {
+      await assert.rejects(
+        async () => await db.create(badKey, { bad: true }),
+        /Key contains invalid characters/
+      );
+      await assert.rejects(
+        async () => await db.get(badKey),
+        /Key contains invalid characters/
+      );
+    }
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant M: getWithRecoveryStrict and eager hydration error propagation
+// ============================================================================
+test('Invariant M: getWithRecoveryStrict and eager hydration error propagation when continueOnError is false', async () => {
+  const testDir = resolve('./test_invariant_m_recovery_strict');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const mockS3Client = {
+      send: async () => {
+        const err = new Error('AccessDenied: S3 Bucket 403 Forbidden');
+        err.name = 'AccessDenied';
+        err.$metadata = { httpStatusCode: 403 };
+        throw err;
+      }
+    };
+
+    // 1) Eager hydration with continueOnError: false MUST reject Tero.create()
+    await assert.rejects(
+      async () => await Tero.create({
+        directory: testDir,
+        hydrateOnStartup: {
+          mode: 'eager',
+          continueOnError: false,
+          cloudStorage: {
+            bucket: 'test-bucket',
+            region: 'us-east-1',
+            accessKeyId: 'test',
+            secretAccessKey: 'test'
+          },
+          customS3Client: mockS3Client
+        }
+      }),
+      /AccessDenied/
+    );
+
+    // 2) getWithRecoveryStrict MUST throw cloud errors instead of returning null
+    const db = new Tero({
+      directory: testDir,
+      hydrateOnStartup: {
+        mode: 'lazy',
+        cloudStorage: {
+          bucket: 'test-bucket',
+          region: 'us-east-1',
+          accessKeyId: 'test',
+          secretAccessKey: 'test'
+        },
+        customS3Client: mockS3Client
+      }
+    });
+
+    // getWithRecovery returns null by default (lenient)
+    const lenient = await db.getWithRecovery('missing_key');
+    assert.equal(lenient, null);
+
+    // getWithRecoveryStrict throws the 403
+    await assert.rejects(
+      async () => await db.getWithRecoveryStrict('missing_key'),
+      /AccessDenied/
+    );
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant N: Degraded mode and last maintenance error tracking
+// ============================================================================
+test('Invariant N: db.isDegraded() and db.getLastMaintenanceError() track status', async () => {
+  const testDir = resolve('./test_invariant_n_status');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const db = new Tero({ directory: testDir });
+    assert.equal(db.isDegraded(), false);
+    assert.equal(db.getLastMaintenanceError(), null);
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+

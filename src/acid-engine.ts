@@ -73,6 +73,9 @@ export function cloneJson<T>(value: T): T {
 }
 
 export function verifyLogEntryChecksum(entry: LogEntry): boolean {
+    if (entry.checksum === undefined) {
+        return true;
+    }
     const { checksum, ...entryWithoutChecksum } = entry;
     return fnv1a64(JSON.stringify(entryWithoutChecksum)) === checksum;
 }
