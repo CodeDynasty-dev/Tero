@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync } from "fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync, rmSync } from "fs";
 import { join, basename, relative, dirname, sep } from "path";
 import { create as tarCreate } from "tar";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
@@ -573,7 +573,9 @@ export class BackupManager {
           await pooledMap(toDelete, 16, async (o) => {
             try {
               await this.deleteObject(o.key);
-            } catch { }
+            } catch (err: any) {
+              this.log.warn(`⚠️  Failed to delete remote stale key ${o.key}: ${err?.message}`);
+            }
           });
         }
       }
@@ -718,20 +720,16 @@ export class BackupManager {
       } while (token);
 
       if (oldObjects.length > 0) {
-        const deletePromises = oldObjects.map((obj: any) => {
-          if (obj.Key) {
-            return this.s3Client!.send(new DeleteObjectCommand({
-              Bucket: this.config.cloudStorage!.bucket,
-              Key: obj.Key
-            }));
-          }
-          return null;
-        }).filter(Boolean);
+        const objectsToDelete = oldObjects.filter((obj: any) => Boolean(obj?.Key));
+        await pooledMap(objectsToDelete, 16, async (obj: any) => {
+          await this.s3Client!.send(new DeleteObjectCommand({
+            Bucket: this.config.cloudStorage!.bucket,
+            Key: obj.Key
+          }));
+        });
 
-        await Promise.all(deletePromises);
-
-        if (oldObjects.length > 0) {
-          this.log.info(`🗑️ Cleaned up ${oldObjects.length} old backup(s) from cloud storage`);
+        if (objectsToDelete.length > 0) {
+          this.log.info(`🗑️ Cleaned up ${objectsToDelete.length} old backup(s) from cloud storage`);
         }
       }
     } catch (error) {
@@ -930,18 +928,49 @@ export class BackupManager {
         }
       });
 
-      // 3) Emit a backup manifest so hydrate-on-startup can discover the latest snapshot.
+      // 3) Emit a canonical, deterministic backup manifest with SHA-256 hashes
       try {
+        const sortedDataFiles = [...jsonFiles].sort((a, b) => a.name.localeCompare(b.name));
+        const dataEntries = sortedDataFiles.map(f => {
+          const sha256 = createHash('sha256').update(readFileSync(f.path)).digest('hex');
+          return {
+            name: f.name,
+            size: f.size,
+            state: 'present',
+            sha256
+          };
+        });
+        const dataManifestHash = createHash('sha256').update(JSON.stringify(dataEntries)).digest('hex');
+
+        const sortedWalPaths = [...walPaths].sort();
+        const walEntries = sortedWalPaths.map(p => {
+          const segName = basename(p);
+          const match = segName.match(/seg-(\d+)-(\d+)/);
+          const startLsn = match ? parseInt(match[1], 10) : 0;
+          const endLsn = match ? parseInt(match[2], 10) : 0;
+          const sha256 = createHash('sha256').update(readFileSync(p)).digest('hex');
+          return {
+            name: segName,
+            startLsn,
+            endLsn,
+            sha256
+          };
+        });
+        const walManifestHash = createHash('sha256').update(JSON.stringify(walEntries)).digest('hex');
+
         const manifest = {
+          snapshotId: randomUUID(),
           timestamp: new Date().toISOString(),
           tag: options?.tag ?? 'manual',
-          dataFiles: jsonFiles.map(f => f.name),
-          walSegments: walPaths.map(p => basename(p)),
           dbPath: this.getDbName(),
+          dataFiles: dataEntries,
+          walSegments: walEntries,
+          dataManifestHash,
+          walManifestHash
         };
         const manifestKey = `${this.config.cloudStorage.pathPrefix || 'tero-backups'}/${this.getDbName()}/MANIFEST.json`;
         await this.uploadBuffer(
-          JSON.stringify(manifest),
+          JSON.stringify(manifest, null, 2),
           manifestKey,
           'application/json'
         );
@@ -1004,7 +1033,7 @@ export class BackupManager {
       this.liveShipper = undefined;
     }
     if (this.liveCheckpointPromise) {
-      try { await this.liveCheckpointPromise; } catch {}
+      try { await this.liveCheckpointPromise; } catch { /* approved: teardown drain ignores prior checkpoint error */ }
     }
   }
 
@@ -1106,7 +1135,7 @@ export class BackupManager {
       writeFileSync(idFile, nodeId, 'utf8');
       const fd = openSync(idFile, 'r');
       try { fsyncSync(fd); } finally { closeSync(fd); }
-    } catch {}
+    } catch { /* approved: node ID file write best-effort */ }
     const prefix = this.liveCloudPrefix(nodeId);
     this.liveNodeId = nodeId; this.liveEngine = engine; this.livePrefix = prefix;
     this.lastCheckpointError = undefined;
@@ -1188,60 +1217,66 @@ export class BackupManager {
     // guaranteed to be WAL-replayed on restore. Capturing the LSN AFTER the uploads
     // instead would let mid-checkpoint writes be skipped by BOTH the checkpoint
     // content AND the replay filter — silent stale-data loss.
-    const ckptLsn = engine.getWAL().getCurrentLSN();
+    const ckptLsn = engine.getLastCommittedLSN();
     // (2) Flush committed data so the files we read reflect all commits ≤ ckptLsn.
-    // Must force-flush synchronously so all entries ≤ ckptLsn are durably on disk
-    // before existsSync / readFileSync are called below (avoids false .deleted tombstones).
     engine.flushCommittedBuffer(true);
     const posixRel = (p: string) => relative(this.dbPath, p).split(sep).join('/');
     const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number }>(latestKey);
     if (!latest) {
-      // FULL checkpoint (first call after enable — captures ALL documents, including
-      // everything written before enableLiveBackup()).
+      // FULL checkpoint: consumes a versioned logical snapshot (snapshotFiles) from engine
       const baseTs = new Date().toISOString().replace(/[:.]/g, '-');
       const dataPrefix = `${ckptPrefix}${baseTs}/data/`;
-      const filePaths: string[] = [];
-      await walkPartitions(this.dbPath, async (filePath) => { filePaths.push(filePath); });
-      // Pool uploads: sequential PUTs at ~15ms/object would make a 50k-doc initial
-      // checkpoint take ~12 minutes; 16 in flight brings it under a minute.
-      await pooledMap(filePaths, 16, async (filePath) => {
-        await this.uploadBytes(`${dataPrefix}${posixRel(filePath)}`, readFileSync(filePath), 'application/json');
+      const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
+
+      const uploadQueue: Array<{ rel: string; content: Buffer }> = [];
+      for await (const entry of engine.snapshotFiles(ckptLsn)) {
+        if (entry.state === 'present' && entry.data !== undefined) {
+          const filePath = partitionedPath(this.dbPath, entry.key);
+          uploadQueue.push({
+            rel: posixRel(filePath),
+            content: Buffer.from(JSON.stringify(entry.data))
+          });
+        }
+      }
+
+      await pooledMap(uploadQueue, 16, async (item) => {
+        await this.uploadBytes(`${dataPrefix}${item.rel}`, item.content, 'application/json');
       });
-      const count = filePaths.length;
-      // Drain the dirty set: the full upload supersedes any pending incremental
-      // changes — otherwise the next incremental checkpoint would re-upload them.
-      engine.takeDirtyKeys();
+      const count = uploadQueue.length;
+
+      // Acknowledge ONLY dirty keys covered by this snapshot
+      engine.acknowledgeDirtyKeys(dirtySnapshot.values());
+
       await this.uploadBytes(`${ckptPrefix}${baseTs}/index.json`, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, createdAt: new Date().toISOString(), docCount: count }, null, 2)), 'application/json');
-      // latest.json is published LAST — it is the visibility marker for restore.
-      // Publishing it before the data objects are durable would let a concurrent
-      // restore read a checkpoint whose data is missing.
       await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString() }, null, 2)), 'application/json');
       this.liveCheckpoints++;
       return { uploadedDocs: count, tombstonedDocs: 0, fullUpload: true, duration: Date.now() - start };
     }
-    // INCREMENTAL checkpoint — upload ONLY dirty docs, tombstone deleted ones.
-    // Tombstones are required: the full checkpoint data still contains the deleted
-    // document, and its WAL DELETE entry (lsn ≤ baseLsn) is deliberately skipped by
-    // the restore replay filter — without a marker, deleted docs would resurrect.
+    // INCREMENTAL checkpoint — upload ONLY dirty docs from versioned snapshot, tombstone deleted ones.
     const dataPrefix = `${ckptPrefix}${latest.baseTs}/data/`;
-    const dirty = engine.takeDirtyKeys();
+    const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
     let uploaded = 0, tombstoned = 0;
-    const dirtyList = Array.from(dirty);
-    await pooledMap(dirtyList, 16, async (key) => {
-      const filePath = partitionedPath(this.dbPath, key);
+    const dirtyEntries = Array.from(dirtySnapshot.values());
+    const ackList: Array<{ key: string; lsn: number }> = [];
+
+    await pooledMap(dirtyEntries, 16, async (entry) => {
+      const filePath = partitionedPath(this.dbPath, entry.key);
       const rel = posixRel(filePath);
-      if (existsSync(filePath)) {
-        await this.uploadBytes(`${dataPrefix}${rel}`, readFileSync(filePath), 'application/json');
+      if (entry.state === 'present' && entry.data !== undefined) {
+        await this.uploadBytes(`${dataPrefix}${rel}`, Buffer.from(JSON.stringify(entry.data)), 'application/json');
         uploaded++;
-        // Delete stale tombstone if this key was previously deleted then recreated
-        // under the same baseTs. Without this, bucket holds both data and
-        // .deleted and the old restore filter would drop the recreated doc.
-        try { await this.deleteObject(`${dataPrefix}${rel}.deleted`); } catch {}
+        ackList.push({ key: entry.key, lsn: entry.lsn });
+        try { await this.deleteObject(`${dataPrefix}${rel}.deleted`); } catch { /* approved: remote tombstone may not exist */ }
       } else {
         await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
         tombstoned++;
+        ackList.push({ key: entry.key, lsn: entry.lsn });
       }
     });
+
+    // Two-phase acknowledgment: ONLY acknowledge successfully uploaded items
+    engine.acknowledgeDirtyKeys(ackList);
+
     await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
     await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify({ nodeId: this.liveNodeId, updatedAt: new Date().toISOString(), lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0, lastCheckpointAt: new Date().toISOString() }, null, 2)), 'application/json');
     this.liveCheckpoints++;
@@ -1250,18 +1285,91 @@ export class BackupManager {
 
   // __TERO_LIVE_PART3__
 
-  async restoreLiveToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number } = {}): Promise<RestoreLiveResult> {
+  /**
+   * Crash-safe restore: downloads and replays WAL into a fresh temporary staging directory,
+   * then promotes staging to targetDir via a crash-safe .restore-in-progress marker protocol.
+   */
+  async restoreLiveToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
+    if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
+    const restoreId = randomUUID();
+    const stagingDir = `${targetDir}.staging.${restoreId}`;
+    const backupDir = `${targetDir}.backup.${restoreId}`;
+    const markerPath = `${targetDir}.restore-in-progress`;
+
+    mkdirSync(stagingDir, { recursive: true });
+
+    try {
+      const result = await this._restoreToTargetDirectory(stagingDir, opts);
+
+      // Write marker before initiating directory swap
+      writeFileSync(markerPath, JSON.stringify({
+        id: restoreId,
+        targetDir,
+        stagingDir,
+        backupDir,
+        createdAt: Date.now(),
+        stage: 'prepared'
+      }, null, 2));
+
+      const parentDir = dirname(targetDir);
+      const fsyncParent = () => {
+        if (existsSync(parentDir)) {
+          const fd = openSync(parentDir, 'r');
+          try { fsyncSync(fd); } finally { closeSync(fd); }
+        }
+      };
+      fsyncParent();
+
+      if (existsSync(targetDir)) {
+        renameSync(targetDir, backupDir);
+        fsyncParent();
+      }
+
+      writeFileSync(markerPath, JSON.stringify({
+        id: restoreId,
+        targetDir,
+        stagingDir,
+        backupDir,
+        createdAt: Date.now(),
+        stage: 'swapped'
+      }, null, 2));
+      fsyncParent();
+
+      renameSync(stagingDir, targetDir);
+      fsyncParent();
+
+      if (existsSync(backupDir)) {
+        try { rmSync(backupDir, { recursive: true, force: true }); } catch {}
+      }
+
+      unlinkSync(markerPath);
+      fsyncParent();
+
+      return result;
+    } catch (error) {
+      try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+      throw error;
+    }
+  }
+
+  /**
+   * Explicit merge restore: restores state directly into an existing target directory
+   * without staging or promoting. Stale files not present in the backup will survive.
+   */
+  async mergeRestoreToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
     if (existsSync(targetDir) && readdirSync(targetDir).some(f => !f.startsWith('.'))) {
-      this.log.warn(`⚠️  restoreLiveToDirectory: target '${targetDir}' is not empty — restored state will be merged over existing files.`);
+      this.log.warn(`⚠️  mergeRestoreToDirectory: target '${targetDir}' is not empty — restored state will be merged over existing files.`);
     }
     mkdirSync(targetDir, { recursive: true });
+    return this._restoreToTargetDirectory(targetDir, opts);
+  }
+
+  private async _restoreToTargetDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
     const pit = opts.pointInTime ?? Infinity;
+    const targetLsn = opts.targetLsn ?? Infinity;
     let nodeId = opts.nodeId;
     if (!nodeId) {
-      // Exact prefix slicing — NOT a regex on '/nodes/'. A regex would also match a
-      // user pathPrefix or database name containing "nodes" and restore from the
-      // wrong node (e.g. pathPrefix 'my/nodes/stuff' would capture 'stuff').
       const base = this.config.cloudStorage?.pathPrefix || 'tero-backups';
       const nodesPrefix = `${base}/${this.getDbName()}/nodes/`;
       const all = await this.listPrefix(nodesPrefix);
@@ -1291,10 +1399,6 @@ export class BackupManager {
           if (!prev || lastModified > prev.lastModified) activeMeta.set(keyName, { key, lastModified });
         }
       }
-      // Resolve tombstone vs data by recency: newer wins. This handles
-      // delete→recreate under same baseTs (data newer) vs legit delete
-      // (tombstone newer than the full-checkpoint data), and also heals
-      // legacy buckets that contain both due to the pre-fix bug.
       const keysToDownload: string[] = [];
       const finalTombstones = new Set<string>();
       for (const [keyName, active] of activeMeta) {
@@ -1312,10 +1416,8 @@ export class BackupManager {
       for (const [keyName] of tombstoneMeta) {
         if (!activeMeta.has(keyName)) finalTombstones.add(keyName);
       }
-      // Keep compat names for later local-delete loop
       const tombstoneKeyNames = finalTombstones;
 
-      // Pool downloads — sequential GETs make a 50k-doc restore take ~12 minutes.
       await pooledMap(keysToDownload, 16, async (dk) => {
         const key = basename(dk).replace(/\.json$/, '');
         const dest = partitionedPath(targetDir, key);
@@ -1327,7 +1429,6 @@ export class BackupManager {
         docsRestored++;
       });
 
-      // Ensure any existing local file matching a tombstone is deleted
       for (const keyName of tombstoneKeyNames) {
         const dest = partitionedPath(targetDir, keyName);
         try { if (existsSync(dest)) unlinkSync(dest); } catch {}
@@ -1335,10 +1436,7 @@ export class BackupManager {
     }
     const walKeys = (await this.listPrefix(`${prefix}wal/`))
       .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) > (baseLsn ?? 0) : false; }).sort();
-    // Detect LSN gaps between consecutive segments. Local WAL archives are pruned
-    // (keep-last-3) even while the bucket is unreachable, so an outage spanning
-    // >3MB of writes loses segments permanently. Small gaps are normal (filtered
-    // BEGIN/COMMIT/CHECKPOINT entries); gaps >50 LSNs mean real writes may be missing.
+
     let prevEnd = -1;
     for (const wk of walKeys) {
       const m = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
@@ -1356,9 +1454,6 @@ export class BackupManager {
       if (e.operation === 'WRITE') {
         mkdirSync(dirname(dest), { recursive: true });
         const tmp = `${dest}.tmp.${process.pid}`;
-        // Match the engine's data-file format exactly (atomicWriteFile uses
-        // compact JSON.stringify(data)) so restored files are byte-identical
-        // to engine-written ones.
         writeFileSync(tmp, JSON.stringify(e.afterImage ?? null)); renameSync(tmp, dest);
       } else if (e.operation === 'DELETE') { try { unlinkSync(dest); } catch {} }
       lastLsn = Math.max(lastLsn, e.lsn);
@@ -1368,7 +1463,8 @@ export class BackupManager {
         const entries: LogEntry[] = JSON.parse(gunzipSync(await this.downloadBytes(wk)).toString('utf8'));
         for (const e of entries) {
           if (e.timestamp > pit) continue;
-          if (e.lsn <= (baseLsn ?? 0)) continue; // already captured in checkpoint
+          if (e.lsn > targetLsn) continue;
+          if (e.lsn <= (baseLsn ?? 0)) continue;
           if (e.operation === 'WRITE' || e.operation === 'DELETE') {
             if (!e.transactionId) { apply(e); continue; }
             if (!pending.has(e.transactionId)) pending.set(e.transactionId, []);
@@ -1379,7 +1475,9 @@ export class BackupManager {
           } else if (e.operation === 'ROLLBACK') { pending.delete(e.transactionId); }
         }
         segmentsReplayed++;
-      } catch (e) { this.log.warn(`⚠️  Skipping corrupt WAL segment ${wk}: ${e instanceof Error ? e.message : e}`); }
+      } catch (e) {
+        throw new Error(`Corrupt WAL segment ${wk} during live restore: ${e instanceof Error ? e.message : e}`);
+      }
     }
     return { nodeId, docsRestored, segmentsReplayed, baseLsn, lastLsn };
   }
@@ -1478,7 +1576,10 @@ class WalShipper {
       try {
         const lines = readFileSync(p, 'utf8').trim().split('\n');
         const entries: LogEntry[] = [];
-        for (const line of lines) { try { entries.push(JSON.parse(line)); } catch {} }
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          entries.push(JSON.parse(line));
+        }
         const fresh = entries.filter(e => WAL_SHIPPED_OPS.has(e.operation) && e.lsn > this.lastLsn);
         if (fresh.length > 0) {
           const s = fresh[0].lsn, en = fresh[fresh.length - 1].lsn;

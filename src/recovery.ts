@@ -3,7 +3,37 @@ import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSyn
 import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
 import { CloudStorageConfig } from "./backup.js";
-import { partitionedPath } from "./acid-engine.js";
+import { partitionedPath, DataCorruptionError } from "./acid-engine.js";
+
+export const MAX_DOCUMENT_SIZE = 10 * 1024 * 1024; // 10MB limit
+
+export type RecoveryErrorKind = 'NOT_FOUND' | 'RETRYABLE_NETWORK' | 'FATAL_AUTH' | 'CANCELLED' | 'FATAL_CORRUPTION';
+
+export function classifyRecoveryError(error: any): RecoveryErrorKind {
+    if (
+        error?.name === 'NotFound' ||
+        error?.name === 'NoSuchKey' ||
+        error?.$metadata?.httpStatusCode === 404 ||
+        (error?.Code && (error.Code === 'NotFound' || error.Code === 'NoSuchKey'))
+    ) {
+        return 'NOT_FOUND';
+    }
+    if (
+        error?.name === 'AbortError' ||
+        error?.name === 'CanceledError' ||
+        error?.code === 'ABORT_ERR'
+    ) {
+        return 'CANCELLED';
+    }
+    const status = error?.$metadata?.httpStatusCode;
+    if (status === 403 || status === 401 || error?.name === 'AccessDenied' || error?.name === 'InvalidAccessKeyId') {
+        return 'FATAL_AUTH';
+    }
+    if (error instanceof DataCorruptionError || error?.name === 'DataCorruptionError' || error?.code === 'DATA_CORRUPTION') {
+        return 'FATAL_CORRUPTION';
+    }
+    return 'RETRYABLE_NETWORK';
+}
 
 export interface RecoveryConfig {
     cloudStorage: CloudStorageConfig;
@@ -128,7 +158,8 @@ export class DataRecovery {
      * to the partitioned disk location, and returns the parsed JSON data directly
      * from memory — avoiding redundant disk reads or extra syscalls.
      */
-    async fetchAndPersist(key: string): Promise<any | null> {
+    async fetchAndPersist(key: string, options?: { abortSignal?: AbortSignal }): Promise<any | null> {
+        options?.abortSignal?.throwIfAborted();
         try {
             const cloudKey = this.getCloudKey(`${key}.json`);
             const localFilePath = partitionedPath(this.config.localPath, key);
@@ -143,15 +174,37 @@ export class DataRecovery {
                 return null;
             }
 
+            if (response.ContentLength !== undefined && response.ContentLength > MAX_DOCUMENT_SIZE) {
+                throw new Error(`Document '${key}' exceeds maximum allowed size of ${MAX_DOCUMENT_SIZE} bytes (got ${response.ContentLength})`);
+            }
+
             let content: string;
             if (typeof (response.Body as any).transformToString === 'function') {
                 content = await (response.Body as any).transformToString('utf-8');
             } else {
                 const chunks: Buffer[] = [];
+                let totalBytes = 0;
                 for await (const chunk of response.Body as any) {
-                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    options?.abortSignal?.throwIfAborted();
+                    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                    totalBytes += buf.length;
+                    if (totalBytes > MAX_DOCUMENT_SIZE) {
+                        throw new Error(`Document '${key}' exceeds maximum allowed size of ${MAX_DOCUMENT_SIZE} bytes`);
+                    }
+                    chunks.push(buf);
                 }
                 content = Buffer.concat(chunks).toString('utf-8');
+            }
+
+            options?.abortSignal?.throwIfAborted();
+
+            // Validate JSON in memory before writing to disk
+            const trimmed = content.trim();
+            let parsed: any;
+            try {
+                parsed = trimmed ? JSON.parse(trimmed) : {};
+            } catch (err: any) {
+                throw new DataCorruptionError(localFilePath, `Downloaded corrupted JSON from cloud for key '${key}': ${err?.message}`);
             }
 
             const localDir = dirname(localFilePath);
@@ -169,13 +222,12 @@ export class DataRecovery {
                 throw writeErr;
             }
 
-            const trimmed = content.trim();
-            return trimmed ? JSON.parse(trimmed) : {};
+            return parsed;
         } catch (error: any) {
             if (this.isNotFound(error)) {
                 return null;
             }
-            throw new Error(`Failed to recover file from cloud: ${error?.message || 'Unknown error'}`);
+            throw error;
         }
     }
 
@@ -328,14 +380,10 @@ export class DataRecovery {
     }
 
     async listAvailableArchives(): Promise<string[]> {
+        const prefix = this.getCloudKey('');
+        const objects: any[] = [];
+        let token: string | undefined;
         try {
-            const prefix = this.getCloudKey('');
-
-            // Paginated listing — a bucket with >1000 objects would otherwise
-            // silently truncate the archive list (hydrate 'snapshot' mode would
-            // miss the newest archive sitting past the first page).
-            const objects: any[] = [];
-            let token: string | undefined;
             do {
                 const response: any = await this.s3Client.send(new ListObjectsV2Command({
                     Bucket: this.config.cloudStorage.bucket,
@@ -346,97 +394,90 @@ export class DataRecovery {
                 if (response.Contents) objects.push(...response.Contents);
                 token = response.IsTruncated ? response.NextContinuationToken : undefined;
             } while (token);
+        } catch (error: any) {
+            if (this.isNotFound(error)) return [];
+            throw error;
+        }
 
-            if (objects.length === 0) {
-                return [];
-            }
+        if (objects.length === 0) return [];
 
-            // Filter for archive files and sort by date (newest first)
-            const archives = objects
-                .filter((obj: any) => obj.Key && obj.Key.endsWith('.tar.gz'))
-                .sort((a: any, b: any) => {
-                    const dateA = a.LastModified?.getTime() || 0;
-                    const dateB = b.LastModified?.getTime() || 0;
-                    return dateB - dateA; // Newest first
-                })
-                .map((obj: any) => obj.Key!.split('/').pop()!)
-                .filter(Boolean);
+        return objects
+            .filter((obj: any) => obj.Key && obj.Key.endsWith('.tar.gz'))
+            .sort((a: any, b: any) => {
+                const dateA = a.LastModified?.getTime() || 0;
+                const dateB = b.LastModified?.getTime() || 0;
+                return dateB - dateA;
+            })
+            .map((obj: any) => obj.Key!.split('/').pop()!)
+            .filter(Boolean);
+    }
 
-            return archives;
-        } catch (error) {
-            return [];
+    async *iterateAvailableFiles(options?: { abortSignal?: AbortSignal }): AsyncGenerator<string, void, unknown> {
+        const prefix = this.getCloudKey('');
+        let token: string | undefined;
+        try {
+            do {
+                options?.abortSignal?.throwIfAborted();
+                let response: any;
+                try {
+                    response = await this.s3Client.send(new ListObjectsV2Command({
+                        Bucket: this.config.cloudStorage.bucket,
+                        Prefix: prefix,
+                        MaxKeys: 1000,
+                        ContinuationToken: token
+                    }));
+                } catch (error: any) {
+                    if (this.isNotFound(error)) return;
+                    throw error;
+                }
+                if (response.Contents) {
+                    for (const obj of response.Contents) {
+                        options?.abortSignal?.throwIfAborted();
+                        if (!obj.Key || !obj.Key.endsWith('.json') || obj.Key.endsWith('.deleted')) continue;
+                        if (
+                            obj.Key.endsWith('MANIFEST.json') ||
+                            obj.Key.endsWith('latest.json') ||
+                            obj.Key.endsWith('index.json') ||
+                            obj.Key.endsWith('backup-metadata.json') ||
+                            obj.Key.endsWith('-metadata.json') ||
+                            obj.Key.includes('/wal/') ||
+                            obj.Key.includes('/nodes/')
+                        ) continue;
+                        const filename = obj.Key.split('/').pop()!;
+                        if (filename.startsWith('.')) continue;
+                        yield filename.replace(/\.json$/, '');
+                    }
+                }
+                token = response.IsTruncated ? response.NextContinuationToken : undefined;
+            } while (token);
+        } catch (err: any) {
+            if (this.isNotFound(err)) return;
+            throw err;
         }
     }
 
-    async listAvailableFiles(): Promise<string[]> {
-        try {
-            const prefix = this.getCloudKey('');
-
-            // Paginated listing — restores from buckets with >1000 objects
-            // previously saw a silently truncated file list.
-            const objects: any[] = [];
-            let token: string | undefined;
-            do {
-                const response: any = await this.s3Client.send(new ListObjectsV2Command({
-                    Bucket: this.config.cloudStorage.bucket,
-                    Prefix: prefix,
-                    MaxKeys: 1000,
-                    ContinuationToken: token
-                }));
-                if (response.Contents) objects.push(...response.Contents);
-                token = response.IsTruncated ? response.NextContinuationToken : undefined;
-            } while (token);
-
-            if (objects.length === 0) {
-                return [];
-            }
-
-            // Filter for JSON files and extract keys (excluding metadata manifests, internal files, dotfiles, and internal folders like wal/ or nodes/)
-            const files = objects
-                .filter((obj: any) => {
-                    if (!obj.Key || !obj.Key.endsWith('.json') || obj.Key.endsWith('.deleted')) return false;
-                    if (
-                        obj.Key.endsWith('MANIFEST.json') ||
-                        obj.Key.endsWith('latest.json') ||
-                        obj.Key.endsWith('index.json') ||
-                        obj.Key.endsWith('backup-metadata.json') ||
-                        obj.Key.endsWith('-metadata.json') ||
-                        obj.Key.includes('/wal/') ||
-                        obj.Key.includes('/nodes/')
-                    ) return false;
-                    const filename = obj.Key.split('/').pop()!;
-                    return !filename.startsWith('.');
-                })
-                .map((obj: any) => {
-                    const filename = obj.Key!.split('/').pop()!;
-                    return filename.replace(/\.json$/, '');
-                })
-                .filter(Boolean);
-
-            return files;
-        } catch (error) {
-            return [];
+    async listAvailableFiles(options?: { abortSignal?: AbortSignal }): Promise<string[]> {
+        const files: string[] = [];
+        for await (const file of this.iterateAvailableFiles(options)) {
+            files.push(file);
         }
+        return files;
     }
 
     /**
      * List files that exist in the cloud bucket but are missing from the local directory.
      * This is the v2 fast path used during hydrate-on-startup with mode='missing'.
      */
-    async listMissingLocally(): Promise<string[]> {
-        try {
-            const cloudFiles = await this.listAvailableFiles();
-            const missing: string[] = [];
-            for (const key of cloudFiles) {
-                const localPath = partitionedPath(this.config.localPath, key);
-                if (!existsSync(localPath)) {
-                    missing.push(key);
-                }
+    async listMissingLocally(options?: { abortSignal?: AbortSignal }): Promise<string[]> {
+        const cloudFiles = await this.listAvailableFiles(options);
+        const missing: string[] = [];
+        for (const key of cloudFiles) {
+            const localPath = partitionedPath(this.config.localPath, key);
+            if (!existsSync(localPath)) {
+                missing.push(key);
             }
-            return missing;
-        } catch (error) {
-            return [];
         }
+        return missing;
     }
 
     /**
@@ -539,7 +580,7 @@ export class DataRecovery {
             try {
                 const fd = openSync(targetDir, 'r');
                 try { fsyncSync(fd); } finally { closeSync(fd); }
-            } catch {}
+            } catch { /* approved: directory fsync best-effort */ }
 
             return true;
         } catch (error) {

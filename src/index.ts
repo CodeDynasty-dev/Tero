@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync } from "fs";
 import { resolve as pathResolve, relative as pathRelative } from "path";
-import { ACIDStorageEngine, SynchronousMode, partitionedPath } from "./acid-engine.js";
+import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
 import QuickLRU from "quick-lru";
@@ -27,7 +27,12 @@ const MAX_DOCUMENT_SIZE = 16 * 1024 * 1024; // 16MB max document size limit
  * Nested docs are recursively cloned with depth and cycle guards.
  */
 function deepClone<T>(value: T, depth = 0, seen = new WeakSet<object>()): T {
-  if (value === null || typeof value !== 'object') return value;
+  if (value === null || typeof value !== 'object') {
+    if (typeof value === 'function' || typeof value === 'symbol') {
+      throw new TypeError(`Cannot serialize value of type ${typeof value} into JSON document`);
+    }
+    return value;
+  }
   if (depth > MAX_DOCUMENT_DEPTH) {
     throw new Error(`Document depth exceeds maximum allowed depth (${MAX_DOCUMENT_DEPTH})`);
   }
@@ -36,6 +41,9 @@ function deepClone<T>(value: T, depth = 0, seen = new WeakSet<object>()): T {
     for (const k in value as any) {
       if (Object.prototype.hasOwnProperty.call(value, k)) {
         const v = (value as any)[k];
+        if (typeof v === 'function' || typeof v === 'symbol') {
+          throw new TypeError(`Cannot serialize non-JSON property '${k}' of type ${typeof v}`);
+        }
         if (v !== null && typeof v === 'object') { hasNested = true; break; }
       }
     }
@@ -48,6 +56,9 @@ function deepClone<T>(value: T, depth = 0, seen = new WeakSet<object>()): T {
     for (const k in value as any) {
       if (Object.prototype.hasOwnProperty.call(value, k)) {
         const v = (value as any)[k];
+        if (typeof v === 'function' || typeof v === 'symbol') {
+          throw new TypeError(`Cannot serialize non-JSON property '${k}' of type ${typeof v}`);
+        }
         copy[k] = (v !== null && typeof v === 'object') ? deepClone(v, depth + 1, seen) : v;
       }
     }
@@ -58,6 +69,9 @@ function deepClone<T>(value: T, depth = 0, seen = new WeakSet<object>()): T {
   const len = (value as any).length;
   for (let i = 0; i < len; i++) {
     const v = (value as any)[i];
+    if (typeof v === 'function' || typeof v === 'symbol') {
+      throw new TypeError(`Cannot serialize array element of type ${typeof v}`);
+    }
     if (v !== null && typeof v === 'object') { hasNested = true; break; }
   }
   if (!hasNested) return [...(value as any)] as unknown as T;
@@ -68,6 +82,9 @@ function deepClone<T>(value: T, depth = 0, seen = new WeakSet<object>()): T {
   const arr = new Array(len);
   for (let i = 0; i < len; i++) {
     const el = (value as any)[i];
+    if (typeof el === 'function' || typeof el === 'symbol') {
+      throw new TypeError(`Cannot serialize array element of type ${typeof el}`);
+    }
     arr[i] = (el !== null && typeof el === 'object') ? deepClone(el, depth + 1, seen) : el;
   }
   seen.delete(value as object);
@@ -208,7 +225,7 @@ export class Transaction {
 
   isActive(): boolean {
     if (this.destroyed || this.committed || this.rolledBack) return false;
-    return this.db.getActiveTransactions().includes(this.id);
+    return this.db._isTransactionActive(this.id);
   }
 
   isRolledBack(): boolean {
@@ -246,7 +263,7 @@ export class Transaction {
     const lockRes = (this.db as any).acidEngine.acquireExclusiveLock(this.id, key);
     if (lockRes instanceof Promise) await lockRes;
     if (this.db.exists(key)) throw new Error(`Document '${key}' already exists`);
-    await this.db._writeRaw(this.id, key, initialData || {});
+    await this.db._writeRaw(this.id, key, initialData === undefined ? {} : initialData);
     this.opCount++;
     this.operationsLog.push({ key, operation: 'create' });
   }
@@ -444,6 +461,9 @@ export class Tero {
         });
       }
     } catch (error) {
+      if (error instanceof RecoveryCorruptionError || error instanceof DataCorruptionError) {
+        throw error;
+      }
       throw new Error(`Failed to initialize Tero: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
   }
@@ -478,27 +498,20 @@ export class Tero {
         customS3Client: hydrate.customS3Client,
       });
 
-      let hydrateCancelled = false;
-      const hydrateWork = async (): Promise<void> => {
-        try {
-          if (hydrateCancelled) return;
-          await recovery.recoverMissingFiles(() => hydrateCancelled);
-        } catch {
-          // Hydration errors are non-fatal
-        }
-      };
-
+      const abortController = new AbortController();
+      let timer: any;
       const timeoutMs = hydrate.timeout;
       if (typeof timeoutMs === 'number' && timeoutMs > 0) {
-        await Promise.race([
-          hydrateWork(),
-          new Promise<void>((resolve) => {
-            const t = setTimeout(() => { hydrateCancelled = true; resolve(); }, timeoutMs);
-            (t as any).unref?.();
-          }),
-        ]);
-      } else {
-        await hydrateWork();
+        timer = setTimeout(() => abortController.abort(), timeoutMs);
+        timer.unref?.();
+      }
+
+      try {
+        await recovery.recoverMissingFiles(() => abortController.signal.aborted);
+      } catch {
+        // Hydration errors are non-fatal on boot
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
 
@@ -537,11 +550,14 @@ export class Tero {
           this.updateCache(key, data, undefined);
           return data;
         } else {
+          // Genuine 404: cache negative lookup
           this.missingKeys.set(key, true);
           return null;
         }
-      } catch {
-        return null;
+      } catch (err) {
+        // Transient network/auth error: DO NOT cache in missingKeys!
+        // Re-throw so callers are aware of cloud failure
+        throw err;
       } finally {
         this.inFlightHydrations.delete(key);
       }
@@ -869,7 +885,7 @@ export class Tero {
       // (write will deepMerge, but for create we need empty). The exclusive
       // lock guarantees no other tx is writing this key concurrently.
 
-      await this.write(transactionId, key, initialData || {});
+      await this.write(transactionId, key, initialData === undefined ? {} : initialData);
       await this.commit(transactionId);
       this.knownKeys.set(key, true);
       this.missingKeys.delete(key);
@@ -1146,6 +1162,10 @@ export class Tero {
 
   _getTxStatus(transactionId: string): 'active' | 'committed' | 'aborted' | 'not_found' {
     return this.acidEngine.getTransactionStatus(transactionId);
+  }
+
+  _isTransactionActive(transactionId: string): boolean {
+    return this.acidEngine.isTransactionActive(transactionId);
   }
 
   getTransactionStats(): TransactionStats {
@@ -1714,5 +1734,7 @@ export {
   LiveBackupStatus,
   LiveCheckpointResult,
   RestoreLiveResult,
-  BackupLogger
+  BackupLogger,
+  RecoveryCorruptionError,
+  DataCorruptionError
 };

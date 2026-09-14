@@ -55,16 +55,17 @@ class TestRunner {
                 return file.endsWith('.test.js') || file.endsWith('-test.js') || file === 'prod-test-suite.js';
             });
 
-            // Order priority: sanity -> issues -> hydration -> fault -> cloud -> concurrency -> fuzz -> production
+            // Order priority: sanity -> invariants -> issues -> hydration -> fault -> cloud -> concurrency -> fuzz -> production
             const priority = {
                 'sanity-test.js': 1,
-                'issue-fixes.test.js': 2,
-                'gradual-hydration.test.js': 3,
-                'fault-injection.test.js': 4,
-                'cloud-resilience.test.js': 5,
-                'concurrency-chaos.test.js': 6,
-                'fuzz-oracle.test.js': 7,
-                'prod-test-suite.js': 8,
+                'invariants.test.js': 2,
+                'issue-fixes.test.js': 3,
+                'gradual-hydration.test.js': 4,
+                'fault-injection.test.js': 5,
+                'cloud-resilience.test.js': 6,
+                'concurrency-chaos.test.js': 7,
+                'fuzz-oracle.test.js': 8,
+                'prod-test-suite.js': 9,
             };
 
             const sortedTests = testFiles.sort((a, b) => {

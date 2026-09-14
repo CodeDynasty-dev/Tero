@@ -1,6 +1,70 @@
-import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync } from "fs";
+import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync, rmSync } from "fs";
 import { join, dirname } from "path";
 import { randomBytes } from "crypto";
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonArray = JsonValue[];
+export type JsonObject = { [key: string]: JsonValue };
+export type JsonValue = JsonPrimitive | JsonObject | JsonArray;
+
+export class RecoveryCorruptionError extends Error {
+    code = 'RECOVERY_CORRUPTION';
+    constructor(
+        public walPath: string,
+        public offset: number,
+        public reason: string,
+        public lsn?: number
+    ) {
+        super(`RECOVERY_CORRUPTION at ${walPath} (offset: ${offset}${lsn !== undefined ? `, lsn: ${lsn}` : ''}): ${reason}`);
+        this.name = 'RecoveryCorruptionError';
+    }
+}
+
+export class DataCorruptionError extends Error {
+    code = 'DATA_CORRUPTION';
+    filePath?: string;
+    constructor(filePathOrMessage: string, details?: string) {
+        const message = details !== undefined ? `DATA_CORRUPTION in ${filePathOrMessage}: ${details}` : filePathOrMessage;
+        super(message);
+        this.name = 'DataCorruptionError';
+        if (details !== undefined) {
+            this.filePath = filePathOrMessage;
+        }
+    }
+}
+
+export function cloneJson<T>(value: T): T {
+    if (value === null || typeof value !== 'object') {
+        if (typeof value === 'function' || typeof value === 'symbol') {
+            throw new TypeError(`Cannot serialize non-JSON value of type ${typeof value}`);
+        }
+        return value;
+    }
+    if (Array.isArray(value)) {
+        const arr = new Array(value.length);
+        for (let i = 0; i < value.length; i++) {
+            arr[i] = cloneJson(value[i]);
+        }
+        return arr as unknown as T;
+    }
+    const copy: any = {};
+    for (const k of Object.keys(value)) {
+        if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+        const v = (value as any)[k];
+        if (typeof v === 'function' || typeof v === 'symbol') {
+            throw new TypeError(`Cannot serialize non-JSON property '${k}' of type ${typeof v}`);
+        }
+        copy[k] = cloneJson(v);
+    }
+    return copy as T;
+}
+
+export interface DirtyEntry {
+    key: string;
+    lsn: number;
+    state: 'present' | 'deleted';
+    data?: JsonValue;
+}
 
 // ACID-compliant transaction log entry
 export interface LogEntry {
@@ -8,8 +72,8 @@ export interface LogEntry {
     transactionId: string;
     operation: 'BEGIN' | 'WRITE' | 'DELETE' | 'COMMIT' | 'ROLLBACK' | 'CHECKPOINT';
     key?: string;
-    beforeImage?: any; // For rollback
-    afterImage?: any;  // For redo
+    beforeImage?: JsonValue; // For rollback
+    afterImage?: JsonValue;  // For redo
     timestamp: number;
     checksum: string;  // 64-bit dual-FNV hex (16 chars). 32-bit hash collisions
     // become likely at ~50k WAL entries (birthday paradox);
@@ -145,10 +209,12 @@ export class WriteAheadLog {
 
     private recoverFromLog(): void {
         let maxLSN = 0;
+        let hasEntries = false;
         this.streamLogEntries((entry) => {
+            hasEntries = true;
             if (entry.lsn > maxLSN) maxLSN = entry.lsn;
         });
-        this.currentLSN = maxLSN + 1;
+        this.currentLSN = hasEntries ? maxLSN + 1 : 0;
     }
 
     /**
@@ -156,9 +222,12 @@ export class WriteAheadLog {
      * into a single V8 string. Reads 64KB chunks, processes complete lines, and
      * calls visitor(entry) for each valid (checksum-verified) entry.
      *
-     * This prevents OOM on large WALs — a 200MB, 1M-entry log previously
-     * allocated ~400MB of V8 string objects via readFileSync + split(); now
-     * peak memory is bounded to ~64KB + any objects the visitor retains.
+     * Invariant:
+     * - Newline-terminated invalid record -> fatal RecoveryCorruptionError
+     * - Interior invalid record -> fatal RecoveryCorruptionError
+     * - Final unterminated valid record -> replay (accept)
+     * - Final unterminated invalid record -> ignore as torn tail
+     * - Monotonic LSN strictly required within the log stream
      */
     streamLogEntries(visitor: (entry: LogEntry) => void): void {
         if (!existsSync(this.logPath)) return;
@@ -170,6 +239,8 @@ export class WriteAheadLog {
         }
         const buf = Buffer.alloc(65536); // 64KB read chunks
         let partial = '';
+        let currentOffset = 0;
+        let lastLsn = -1;
         try {
             let bytesRead: number;
             while ((bytesRead = readSync(fd, buf, 0, buf.length, null)) > 0) {
@@ -178,22 +249,47 @@ export class WriteAheadLog {
                 // Last element may be a partial line — carry it to next chunk
                 partial = lines.pop() || '';
                 for (const line of lines) {
+                    const recordOffset = currentOffset;
+                    currentOffset += Buffer.byteLength(line, 'utf8') + 1; // +1 for \n
                     if (!line.trim()) continue;
+
+                    let entry: LogEntry;
                     try {
-                        const entry: LogEntry = JSON.parse(line);
-                        if (this.verifyChecksum(entry)) visitor(entry);
-                    } catch {
-                        // skip corrupted / partial entries
-                        continue;
+                        entry = JSON.parse(line);
+                    } catch (e: any) {
+                        throw new RecoveryCorruptionError(this.logPath, recordOffset, `Invalid JSON record: ${e?.message || 'parse error'}`);
                     }
+
+                    if (!this.verifyChecksum(entry)) {
+                        throw new RecoveryCorruptionError(this.logPath, recordOffset, 'Checksum mismatch', entry.lsn);
+                    }
+
+                    if (lastLsn !== -1 && entry.lsn <= lastLsn) {
+                        throw new RecoveryCorruptionError(this.logPath, recordOffset, `Non-monotonic LSN: expected > ${lastLsn}, got ${entry.lsn}`, entry.lsn);
+                    }
+                    lastLsn = entry.lsn;
+
+                    visitor(entry);
                 }
             }
+
+            // EOF reached: check final unterminated record (partial)
             if (partial.trim()) {
+                const recordOffset = currentOffset;
                 try {
                     const entry: LogEntry = JSON.parse(partial);
-                    if (this.verifyChecksum(entry)) visitor(entry);
-                } catch {
-                    // skip corrupted / partial entries
+                    if (this.verifyChecksum(entry)) {
+                        if (lastLsn !== -1 && entry.lsn <= lastLsn) {
+                            throw new RecoveryCorruptionError(this.logPath, recordOffset, `Non-monotonic LSN: expected > ${lastLsn}, got ${entry.lsn}`, entry.lsn);
+                        }
+                        lastLsn = entry.lsn;
+                        visitor(entry);
+                    } else {
+                        // Tolerated torn tail at EOF: checksum mismatch on final unterminated fragment
+                    }
+                } catch (err: any) {
+                    if (err instanceof RecoveryCorruptionError) throw err;
+                    // Tolerated torn tail at EOF: invalid JSON on final unterminated fragment
                 }
             }
         } finally {
@@ -279,54 +375,59 @@ export class WriteAheadLog {
     }
 
     private checkLogRotation(): void {
-        try {
-            const stats = statSync(this.logPath);
-            if (stats.size > this.LOG_FILE_SIZE_LIMIT) {
-                this.rotateLog();
-            }
-        } catch (error: any) {
-            // Surface disk-full errors — silent rotation failure masks durability loss
-            if (error?.code === 'ENOSPC') throw error;
+        const stats = statSync(this.logPath);
+        if (stats.size > this.LOG_FILE_SIZE_LIMIT) {
+            this.rotateLog();
         }
     }
 
     /**
-     * Rotate the WAL: archive the current log to .wal.<timestamp>, start a fresh log,
-     * and write a CHECKPOINT entry at the head of the new log. Old archives beyond
-     * ARCHIVE_KEEP_COUNT are pruned locally (cloud upload in v2 retains durable copies).
-     *
-     * NOTE: ACIDStorageEngine.flushCommittedBuffer() MUST be called before
-     * rotateLog() — see commitTransaction() — otherwise deferred writes still
-     * in memory would be lost on crash after truncation. rotateLog() itself
-     * only guarantees WAL durability (forceFlush before archiving).
+     * Rotate the WAL:
+     * 1. Ensure current WAL is fsynced.
+     * 2. Rename current log to .wal.seg-<startLsn>-<endLsn> (atomic segment rotation).
+     * 3. Fsync archive and parent directory.
+     * 4. Create fresh empty WAL and fsync it and parent directory.
+     * 5. Emit a CHECKPOINT entry at the head of the new log.
+     * 6. Clean up old archives beyond ARCHIVE_KEEP_COUNT.
      */
-    rotateLog(): void {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const archivePath = `${this.logPath}.${timestamp}`;
+    rotateLog(): string | null {
+        this.forceFlush();
+        if (!existsSync(this.logPath)) return null;
+        const stats = statSync(this.logPath);
+        if (stats.size === 0) return null;
 
-        try {
-            // Ensure the current WAL is fsynced before archiving (regardless of mode)
-            this.forceFlush();
+        // Determine first and last record LSN in the WAL
+        let firstLsn: number | null = null;
+        let lastLsn: number | null = null;
+        this.streamLogEntries((entry) => {
+            if (firstLsn === null) firstLsn = entry.lsn;
+            lastLsn = entry.lsn;
+        });
 
-            // Snapshot current log content to archive
-            const currentContent = readFileSync(this.logPath, 'utf-8');
-            writeFileSync(archivePath, currentContent);
-            if (this.synchronous === 'full') this.fsyncFile(archivePath);
-
-            // Start new log empty
-            writeFileSync(this.logPath, '');
-            if (this.synchronous === 'full') this.fsyncFile(this.logPath);
-
-            // Emit a CHECKPOINT entry at the head of the new log so crash recovery
-            // knows everything before this LSN was already persistent.
-            this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
-
-            // Clean up old archives to prevent indefinite growth (keep last N locally)
-            this.cleanupOldArchives(this.ARCHIVE_KEEP_COUNT);
-        } catch (error: any) {
-            if (error?.code === 'ENOSPC') throw error;
-            // Other rotation errors are best-effort; WAL remains usable
+        if (firstLsn === null || lastLsn === null) {
+            return null;
         }
+
+        const archivePath = `${this.logPath}.seg-${firstLsn}-${lastLsn}`;
+        const dir = dirname(this.logPath);
+
+        // 1. Atomic rename to immutable segment
+        renameSync(this.logPath, archivePath);
+        if (this.synchronous === 'full') this.fsyncFile(archivePath);
+        if (this.synchronous === 'full') this.fsyncDir(dir);
+
+        // 2. Start fresh empty log
+        writeFileSync(this.logPath, '');
+        if (this.synchronous === 'full') this.fsyncFile(this.logPath);
+        if (this.synchronous === 'full') this.fsyncDir(dir);
+
+        // 3. Emit a CHECKPOINT entry at the head of the new log
+        this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
+
+        // 4. Prune old archives
+        this.cleanupOldArchives(this.ARCHIVE_KEEP_COUNT);
+
+        return archivePath;
     }
 
     /**
@@ -334,42 +435,30 @@ export class WriteAheadLog {
      * Used by v2 backup to upload segments to the client's bucket.
      */
     listArchives(): string[] {
-        try {
-            const dir = dirname(this.logPath);
-            if (!existsSync(dir)) return [];
-            const files = readdirSync(dir);
-            return files
-                .filter(f => f.startsWith('.wal.'))
-                .sort()
-                .reverse()
-                .map(f => join(dir, f));
-        } catch (error) {
-            return [];
-        }
+        const dir = dirname(this.logPath);
+        if (!existsSync(dir)) return [];
+        const files = readdirSync(dir);
+        return files
+            .filter(f => (f.startsWith('.wal.seg-') || f.startsWith('.wal.')) && f !== '.wal')
+            .sort()
+            .reverse()
+            .map(f => join(dir, f));
     }
 
     private cleanupOldArchives(keepCount: number): void {
-        try {
-            const dir = dirname(this.logPath);
-            if (!existsSync(dir)) return;
-            const files = readdirSync(dir);
-            const archiveFiles = files
-                .filter(f => f.startsWith('.wal.'))
-                .map(f => join(dir, f))
-                .sort(); // oldest first
+        const dir = dirname(this.logPath);
+        if (!existsSync(dir)) return;
+        const files = readdirSync(dir);
+        const archiveFiles = files
+            .filter(f => (f.startsWith('.wal.seg-') || f.startsWith('.wal.')) && f !== '.wal')
+            .map(f => join(dir, f))
+            .sort(); // oldest first
 
-            while (archiveFiles.length > keepCount) {
-                const oldestFile = archiveFiles.shift();
-                if (oldestFile && existsSync(oldestFile)) {
-                    try {
-                        unlinkSync(oldestFile);
-                    } catch {
-                        // ignore
-                    }
-                }
+        while (archiveFiles.length > keepCount) {
+            const oldestFile = archiveFiles.shift();
+            if (oldestFile && existsSync(oldestFile)) {
+                unlinkSync(oldestFile);
             }
-        } catch (error) {
-            // Silent failure for production
         }
     }
 
@@ -405,17 +494,13 @@ export class WriteAheadLog {
      * In v2 this is also called after a successful bucket snapshot upload to bound growth.
      */
     truncateLog(): void {
-        try {
-            this.writeBuffer.length = 0;
-            this.writeBufferSize = 0;
-            this.flushBuffer(); // flush any remaining entries (will be a no-op since buffer is empty)
-            writeFileSync(this.logPath, '');
-            if (this.synchronous === 'full') this.fsyncFile(this.logPath);
-            this.dirty = false;
-            this.cleanupOldArchives(0);
-        } catch (error: any) {
-            if (error?.code === 'ENOSPC') throw error;
-        }
+        this.writeBuffer.length = 0;
+        this.writeBufferSize = 0;
+        this.flushBuffer(); // flush any remaining entries (will be a no-op since buffer is empty)
+        writeFileSync(this.logPath, '');
+        if (this.synchronous === 'full') this.fsyncFile(this.logPath);
+        this.dirty = false;
+        this.cleanupOldArchives(0);
     }
 
     destroy(): void {
@@ -773,6 +858,12 @@ export class LockManager {
  * partition the engine reads from (deterministic from the key).
  */
 export function partitionedPath(dbPath: string, key: string): string {
+    if (!key || typeof key !== 'string' || !key.trim()) {
+        throw new TypeError(`Invalid key '${key}': key must be a non-empty string`);
+    }
+    if (key.includes('..') || key.includes('/') || key.includes('\\') || key.includes('\0') || key === '.' || key.startsWith('.')) {
+        throw new TypeError(`Invalid key '${key}': keys must not contain slashes, null bytes, or directory traversal`);
+    }
     // Fast 32-bit FNV-1a of the key to pick the partition dirs. We only need
     // ~16 bits of dispersion for partitioning (65k buckets), so 32-bit hash
     // is more than sufficient (collision here just means two keys share a
@@ -814,14 +905,157 @@ export async function walkPartitions(dbPath: string, visitor: (filePath: string)
                             if (!entry2.name.endsWith('.json')) continue;
                             await visitor(join(level1Path, entry2.name));
                         }
-                        await level2.close();
                     } catch { /* dir may be removed mid-walk */ }
                 }
-                await level1.close();
             } catch { /* dir may be removed mid-walk */ }
         }
-        await level0.close();
     } catch { /* dbPath may not exist */ }
+}
+
+export interface RestoreMarker {
+    id: string;
+    targetDir: string;
+    stagingDir: string;
+    backupDir: string;
+    createdAt: number;
+    stage: 'prepared' | 'swapped';
+}
+
+export function recoverPendingRestore(dbPath: string): void {
+    const markerPath = `${dbPath}.restore-in-progress`;
+    if (!existsSync(markerPath)) return;
+
+    let marker: RestoreMarker;
+    try {
+        const content = readFileSync(markerPath, 'utf-8');
+        marker = JSON.parse(content);
+    } catch {
+        // Corrupt marker file — leave for manual investigation
+        return;
+    }
+
+    const targetExists = existsSync(marker.targetDir);
+    const backupExists = existsSync(marker.backupDir);
+    const stagingExists = existsSync(marker.stagingDir);
+
+    if (backupExists && !targetExists && stagingExists) {
+        // backup exists + target missing + staging exists -> complete promotion
+        renameSync(marker.stagingDir, marker.targetDir);
+        if (existsSync(marker.backupDir)) {
+            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+        }
+    } else if (targetExists && backupExists && !stagingExists) {
+        // target exists + backup exists + staging missing -> promotion likely completed
+        if (existsSync(marker.backupDir)) {
+            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+        }
+    } else if (targetExists && backupExists && stagingExists) {
+        // backup exists + target exists + staging exists -> ambiguous
+        // use marker state/metadata to deterministically recover:
+        if (marker.stage === 'swapped') {
+            // promotion was swapping staging into target; staging and backup are discarded
+            try { rmSync(marker.stagingDir, { recursive: true, force: true }); } catch { }
+            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+        } else {
+            // stage === 'prepared': original target is intact, clean up staging and backup
+            try { rmSync(marker.stagingDir, { recursive: true, force: true }); } catch { }
+            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+        }
+    } else if (!targetExists && backupExists && !stagingExists) {
+        // target missing + backup exists + staging missing -> rollback: restore backup to target
+        renameSync(marker.backupDir, marker.targetDir);
+    } else if (!targetExists && !backupExists && stagingExists) {
+        // target missing + backup missing + staging exists -> complete promotion
+        renameSync(marker.stagingDir, marker.targetDir);
+    } else if (targetExists) {
+        if (stagingExists) {
+            try { rmSync(marker.stagingDir, { recursive: true, force: true }); } catch { }
+        }
+        if (backupExists) {
+            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+        }
+    }
+
+    // Fsync parent directory
+    const parentDir = dirname(marker.targetDir);
+    if (existsSync(parentDir)) {
+        let fd: number | undefined;
+        try {
+            fd = openSync(parentDir, 'r');
+            fsyncSync(fd);
+        } catch { /* approved: parent directory fsync best-effort */ } finally {
+            if (fd !== undefined) closeSync(fd);
+        }
+    }
+    try { unlinkSync(markerPath); } catch { }
+}
+
+export function verifyWalSegmentContinuity(segmentPaths: string[], verifyContent: boolean = true): Array<{ path: string; startLsn: number; endLsn: number }> {
+    const segments: Array<{ path: string; startLsn: number; endLsn: number }> = [];
+    for (const p of segmentPaths) {
+        const base = p.split('/').pop()!;
+        const match = base.match(/\.seg-(\d+)-(\d+)$/);
+        if (!match) continue;
+        const startLsn = parseInt(match[1], 10);
+        const endLsn = parseInt(match[2], 10);
+        if (startLsn > endLsn) {
+            throw new RecoveryCorruptionError(p, 0, `Invalid segment range: startLsn (${startLsn}) > endLsn (${endLsn})`);
+        }
+        segments.push({ path: p, startLsn, endLsn });
+    }
+
+    segments.sort((a, b) => a.startLsn - b.startLsn);
+
+    for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (i > 0) {
+            const prev = segments[i - 1];
+            if (seg.startLsn === prev.startLsn && seg.endLsn === prev.endLsn) {
+                throw new RecoveryCorruptionError(seg.path, 0, `Duplicate WAL segment range ${seg.startLsn}-${seg.endLsn}`);
+            }
+            if (seg.startLsn <= prev.endLsn) {
+                throw new RecoveryCorruptionError(seg.path, 0, `Overlapping WAL segments: ${prev.startLsn}-${prev.endLsn} and ${seg.startLsn}-${seg.endLsn}`);
+            }
+            if (seg.startLsn !== prev.endLsn + 1) {
+                throw new RecoveryCorruptionError(seg.path, 0, `WAL segment gap: expected ${prev.endLsn + 1}, found ${seg.startLsn}`);
+            }
+        }
+
+        if (verifyContent && existsSync(seg.path)) {
+            const content = readFileSync(seg.path, 'utf8').trim();
+            if (!content) {
+                throw new RecoveryCorruptionError(seg.path, 0, `Empty WAL segment with non-empty declared range ${seg.startLsn}-${seg.endLsn}`);
+            }
+            const lines = content.split('\n').filter(l => l.trim().length > 0);
+            if (lines.length === 0) {
+                throw new RecoveryCorruptionError(seg.path, 0, `Empty WAL segment with non-empty declared range ${seg.startLsn}-${seg.endLsn}`);
+            }
+            let firstLsn: number | null = null;
+            let lastLsn: number | null = null;
+            let prevRecordLsn = -1;
+            for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                let entry: LogEntry;
+                try {
+                    entry = JSON.parse(lines[lineIdx]);
+                } catch (e: any) {
+                    throw new RecoveryCorruptionError(seg.path, lineIdx, `Invalid JSON record in segment: ${e?.message || 'parse error'}`);
+                }
+                if (firstLsn === null) firstLsn = entry.lsn;
+                if (prevRecordLsn !== -1 && entry.lsn <= prevRecordLsn) {
+                    throw new RecoveryCorruptionError(seg.path, lineIdx, `Non-monotonic record LSN in segment: expected > ${prevRecordLsn}, got ${entry.lsn}`, entry.lsn);
+                }
+                prevRecordLsn = entry.lsn;
+                lastLsn = entry.lsn;
+            }
+            if (firstLsn !== seg.startLsn) {
+                throw new RecoveryCorruptionError(seg.path, 0, `WAL segment start LSN mismatch: declared ${seg.startLsn}, actual first record ${firstLsn}`);
+            }
+            if (lastLsn !== seg.endLsn) {
+                throw new RecoveryCorruptionError(seg.path, 0, `WAL segment end LSN mismatch: declared ${seg.endLsn}, actual last record ${lastLsn}`);
+            }
+        }
+    }
+    return segments;
 }
 
 // ACID-compliant storage engine
@@ -841,32 +1075,18 @@ export class ACIDStorageEngine {
     private finishedTransactions: Map<string, 'committed' | 'aborted'> = new Map();
 
     /**
-     * In-memory pending-writes index per active transaction. This is the performant
-     * replacement for the previous per-op full-WAL re-read + filter. Each write/read
-     * within a transaction reads/writes this map directly in O(1) instead of replaying
-     * the entire WAL on every operation.
-     *
+     * In-memory pending-writes index per active transaction.
      * Keyed by transactionId -> key -> { beforeImage, afterImage, op }
      */
-    private pendingWrites: Map<string, Map<string, { beforeImage: any; afterImage: any; op: 'write' | 'delete' }>> = new Map();
+    private pendingWrites: Map<string, Map<string, { beforeImage: JsonValue; afterImage: JsonValue; op: 'write' | 'delete' }>> = new Map();
 
     /**
      * Compaction cadence: every COMMIT_INTERVAL commits, if there are no active
      * transactions, we rotate the WAL into an archive and start a fresh log.
-     * This bounds WAL size without rewriting it on every commit.
      */
     private readonly COMMIT_INTERVAL = 10000;
     private commitCount: number = 0;
 
-    /**
-     * Monotonic counter + PID + per-process random salt. The old counter-only
-     * scheme reused IDs after a restart (txCounter resets to 0), so a WAL
-     * containing  t<oldPid>_0  COMMIT  and a new uncommitted  t<newPid>_0  would
-     * collide — recovery treated the new writes as committed (data loss / ghost
-     * docs). Including a per-process 3-byte random + timestamp makes IDs
-     * unique across restarts with zero hot-path cost (one random draw at
-     * construction, then cheap counter).
-     */
     private txCounter: number = 0;
     private readonly pid: number = process.pid;
     private readonly txSalt: string = randomBytes(3).toString('hex');
@@ -874,38 +1094,150 @@ export class ACIDStorageEngine {
     /**
      * Deferred data-file write buffer. On commit, committed data moves here instead
      * of being written to data files immediately. A background timer flushes this
-     * to disk every `dataFlushIntervalMs` (default 50ms). This is the SQLite WAL-mode
-     * architecture: the WAL is the durable copy; data files are a checkpointed cache
-     * rebuilt via redo on crash recovery.
+     * to disk every `dataFlushIntervalMs` (default 50ms).
      */
-    private committedBuffer: Map<string, { data: any; op: 'write' | 'delete' }> = new Map();
+    private committedBuffer: Map<string, { data: JsonValue; op: 'write' | 'delete' }> = new Map();
     private dataFlushTimer?: ReturnType<typeof setInterval>;
     private readonly DATA_FLUSH_INTERVAL_MS: number;
 
     /**
-     * Dirty-key tracker for incremental cloud checkpoints (roadmap4.md).
-     * Every committed write/delete marks its key here at commit time — O(1) per
-     * committed op, no I/O, no locks on the hot path. The backup layer drains
-     * the set via takeDirtyKeys() to upload ONLY changed documents; the set is
-     * cleared atomically on take. Unbounded growth is bounded by checkpoint
-     * cadence (drained on every live checkpoint), and even with no checkpoints
-     * each entry is just the key string (~50-100 bytes).
+     * Version-consistent dirty-key tracker for cloud checkpoints.
+     * Every committed write/delete stores its immutable DirtyEntry here with commit LSN.
      */
-    private dirtyKeys: Set<string> = new Set();
+    private dirtyKeys: Map<string, DirtyEntry> = new Map();
+    private activeSnapshotLsn: number | null = null;
+    private snapshotBeforeImages: Map<string, { state: 'present' | 'deleted'; data?: JsonValue }> = new Map();
+    private lastCommittedLSN: number = 0;
 
-    /**
-     * Atomically drain the dirty-key set: returns the keys changed since the
-     * last take and clears the set in one swap. Used by incremental checkpoints.
-     */
-    takeDirtyKeys(): Set<string> {
-        const taken = this.dirtyKeys;
-        this.dirtyKeys = new Set();
-        return taken;
+    getLastCommittedLSN(): number {
+        return this.lastCommittedLSN;
     }
 
-    /** Current dirty-key count (diagnostics/status). */
+    peekDirtyKeys(upToLsn?: number): Map<string, DirtyEntry> {
+        const threshold = upToLsn !== undefined ? upToLsn : Infinity;
+        const snapshot = new Map<string, DirtyEntry>();
+        for (const [key, entry] of this.dirtyKeys) {
+            if (entry.lsn <= threshold) {
+                snapshot.set(key, {
+                    key: entry.key,
+                    lsn: entry.lsn,
+                    state: entry.state,
+                    data: entry.data !== undefined ? cloneJson(entry.data) : undefined
+                });
+            }
+        }
+        return snapshot;
+    }
+
+    acknowledgeDirtyKeys(acked: Iterable<{ key: string; lsn: number }>): void {
+        for (const item of acked) {
+            const current = this.dirtyKeys.get(item.key);
+            if (current && current.lsn === item.lsn) {
+                this.dirtyKeys.delete(item.key);
+            }
+        }
+    }
+
     getDirtyKeyCount(): number {
         return this.dirtyKeys.size;
+    }
+
+    /**
+     * Streams a version-consistent logical snapshot of the database as of upToLsn.
+     * Fully protected against concurrent writes via Copy-On-Write snapshotBeforeImages.
+     */
+    snapshotFiles(upToLsn: number): AsyncGenerator<{ key: string; lsn: number; state: 'present' | 'deleted'; data?: JsonValue }> {
+        const dirtySnapshot = this.peekDirtyKeys(upToLsn);
+        this.activeSnapshotLsn = upToLsn;
+        this.snapshotBeforeImages.clear();
+        return this._streamSnapshotFiles(upToLsn, dirtySnapshot);
+    }
+
+    private async *_streamSnapshotFiles(upToLsn: number, dirtySnapshot: Map<string, DirtyEntry>): AsyncGenerator<{ key: string; lsn: number; state: 'present' | 'deleted'; data?: JsonValue }> {
+        const yieldedKeys = new Set<string>();
+
+        try {
+            const fs = await import('fs/promises');
+            if (existsSync(this.dbPath)) {
+                const level0 = await fs.opendir(this.dbPath);
+                for await (const entry0 of level0) {
+                    if (!entry0.isDirectory() || entry0.name.startsWith('.')) continue;
+                    const level0Path = join(this.dbPath, entry0.name);
+                    try {
+                        const level1 = await fs.opendir(level0Path);
+                        for await (const entry1 of level1) {
+                            if (!entry1.isDirectory() || entry1.name.startsWith('.')) continue;
+                            const level1Path = join(level0Path, entry1.name);
+                            try {
+                                const level2 = await fs.opendir(level1Path);
+                                for await (const entry2 of level2) {
+                                    if (!entry2.isFile() || !entry2.name.endsWith('.json')) continue;
+                                    const key = entry2.name.slice(0, -5);
+                                    yieldedKeys.add(key);
+
+                                    // 1. If key was modified AFTER upToLsn, use preserved before-image
+                                    if (this.snapshotBeforeImages.has(key)) {
+                                        const b = this.snapshotBeforeImages.get(key)!;
+                                        if (b.state === 'present' && b.data !== undefined) {
+                                            yield { key, lsn: upToLsn, state: 'present', data: b.data };
+                                        }
+                                        continue;
+                                    }
+
+                                    // 2. If key was dirty <= upToLsn, use dirtySnapshot
+                                    if (dirtySnapshot.has(key)) {
+                                        const d = dirtySnapshot.get(key)!;
+                                        if (d.state === 'present') {
+                                            yield { key, lsn: d.lsn, state: 'present', data: d.data };
+                                        }
+                                        continue;
+                                    }
+
+                                    // 3. Unmodified on disk
+                                    const filePath = join(level1Path, entry2.name);
+                                    let content: string;
+                                    try {
+                                        content = readFileSync(filePath, 'utf-8');
+                                    } catch (readErr: any) {
+                                        if (readErr?.code === 'ENOENT') continue;
+                                        throw readErr;
+                                    }
+                                    let parsed: any;
+                                    try {
+                                        parsed = content.trim() ? JSON.parse(content) : {};
+                                    } catch (parseErr: any) {
+                                        throw new DataCorruptionError(filePath, `Corrupted document during snapshot: ${parseErr?.message}`);
+                                    }
+                                    yield { key, lsn: upToLsn, state: 'present', data: parsed };
+                                }
+                            } catch (err: any) {
+                                if (err instanceof DataCorruptionError) throw err;
+                            }
+                        }
+                    } catch (err: any) {
+                        if (err instanceof DataCorruptionError) throw err;
+                    }
+                }
+            }
+
+            // Yield keys in dirtySnapshot that were not yet on disk (deferred in committedBuffer)
+            for (const [key, d] of dirtySnapshot) {
+                if (!yieldedKeys.has(key)) {
+                    yieldedKeys.add(key);
+                    if (this.snapshotBeforeImages.has(key)) {
+                        const b = this.snapshotBeforeImages.get(key)!;
+                        if (b.state === 'present' && b.data !== undefined) {
+                            yield { key, lsn: upToLsn, state: 'present', data: b.data };
+                        }
+                    } else if (d.state === 'present') {
+                        yield { key, lsn: d.lsn, state: 'present', data: d.data };
+                    }
+                }
+            }
+        } finally {
+            this.activeSnapshotLsn = null;
+            this.snapshotBeforeImages.clear();
+        }
     }
 
     private synchronous: SynchronousMode;
@@ -913,6 +1245,8 @@ export class ACIDStorageEngine {
 
     constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50, checkpointBatchSize: number = 1000) {
         this.dbPath = dbPath;
+        // Startup ordering: restore-marker recovery -> filesystem validation -> WAL recovery
+        recoverPendingRestore(this.dbPath);
         this.synchronous = synchronous;
         this.DATA_FLUSH_INTERVAL_MS = dataFlushIntervalMs;
         this.checkpointBatchSize = checkpointBatchSize > 0 ? checkpointBatchSize : 1000;
@@ -967,29 +1301,19 @@ export class ACIDStorageEngine {
         const committedTransactions = new Set<string>();
         const abortedTransactions = new Set<string>();
 
-        // Phase 1: streaming analysis — determine which transactions committed
-        // or aborted. Only stores txId strings (~100 bytes each) in Sets, not
-        // the full log entries. A 200MB WAL with 10k transactions uses ~1MB for
-        // this phase instead of ~400MB for the old readFileSync + split() array.
+        // Phase 1: streaming analysis — determine which transactions committed or aborted
         this.wal.streamLogEntries((entry) => {
             if (entry.operation === 'COMMIT') {
                 committedTransactions.add(entry.transactionId);
+                if (entry.lsn > this.lastCommittedLSN) {
+                    this.lastCommittedLSN = entry.lsn;
+                }
             } else if (entry.operation === 'ROLLBACK') {
                 abortedTransactions.add(entry.transactionId);
             }
         });
 
-        // Phase 2: redo + undo — single streaming pass. For each entry:
-        //   - committed WRITE/DELETE → redo (apply to data file)
-        //   - uncommitted WRITE/DELETE → undo (restore beforeImage; these txns
-        //     never wrote data files with deferred writes, but committedBuffer
-        //     flushes may have raced a WAL barrier — undo handles that edge).
-        //
-        // Undo runs in REVERSE order so earlier writes to the same key don't
-        // overwrite later undo restores. We buffer uncommitted ops and process
-        // them in reverse after the pass completes. The buffer holds at most one
-        // entry per key (latest write wins), so memory is bounded by unique-key
-        // count — not total entries.
+        // Phase 2: redo + undo — single streaming pass
         const undoByKey = new Map<string, LogEntry>();
         this.wal.streamLogEntries((entry) => {
             if (entry.operation === 'WRITE' && committedTransactions.has(entry.transactionId)) {
@@ -1002,21 +1326,13 @@ export class ACIDStorageEngine {
                 !abortedTransactions.has(entry.transactionId) &&
                 entry.key
             ) {
-                // Uncommitted: keep the FIRST (earliest) entry per key, whose
-                // beforeImage is the ORIGINAL pre-transaction state. The old
-                // code kept the LAST entry — for two uncommitted writes to the
-                // same key (e.g. create {a:1} then update {a:1,b:2}) that
-                // stored {a:1} as the beforeImage and undo resurrected a ghost
-                // document that never existed before the transaction. Undo
-                // must restore the state BEFORE the first uncommitted write.
                 if (!undoByKey.has(entry.key)) {
                     undoByKey.set(entry.key, entry);
                 }
             }
         });
 
-        // Phase 3: reverse undo — process buffered uncommitted ops. Order within
-        // the Map is insertion order, so reverse to process latest-first per key.
+        // Phase 3: reverse undo — process buffered uncommitted ops
         const undoEntries = [...undoByKey.values()];
         for (let i = undoEntries.length - 1; i >= 0; i--) {
             this.undoOperation(undoEntries[i]);
@@ -1024,51 +1340,36 @@ export class ACIDStorageEngine {
     }
 
     private redoOperation(entry: LogEntry): void {
-        if (!entry.key || !entry.afterImage) return;
+        if (!entry.key || entry.afterImage === undefined) return;
 
-        try {
-            const filePath = partitionedPath(this.dbPath, entry.key!);
-            this.atomicWriteFile(filePath, JSON.stringify(entry.afterImage));
-        } catch (error: any) {
-            if (error?.code === 'ENOSPC') throw error;
-        }
+        const filePath = partitionedPath(this.dbPath, entry.key!);
+        this.atomicWriteFile(filePath, JSON.stringify(entry.afterImage));
     }
 
     private redoDelete(entry: LogEntry): void {
         if (!entry.key) return;
 
-        try {
-            const filePath = partitionedPath(this.dbPath, entry.key!);
-            if (existsSync(filePath)) {
-                unlinkSync(filePath);
-            }
-        } catch (error: any) {
-            if (error?.code === 'ENOSPC') throw error;
+        const filePath = partitionedPath(this.dbPath, entry.key!);
+        if (existsSync(filePath)) {
+            unlinkSync(filePath);
         }
     }
 
     private undoOperation(entry: LogEntry): void {
         if (!entry.key) return;
 
-        try {
-            const filePath = partitionedPath(this.dbPath, entry.key!);
+        const filePath = partitionedPath(this.dbPath, entry.key!);
 
-            if (entry.operation === 'WRITE') {
-                if (entry.beforeImage === null) {
-                    // File didn't exist before, delete it
-                    if (existsSync(filePath)) {
-                        unlinkSync(filePath);
-                    }
-                } else {
-                    // Restore previous content
-                    this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
+        if (entry.operation === 'WRITE') {
+            if (entry.beforeImage === null || entry.beforeImage === undefined) {
+                if (existsSync(filePath)) {
+                    unlinkSync(filePath);
                 }
-            } else if (entry.operation === 'DELETE' && entry.beforeImage) {
-                // Restore deleted file
+            } else {
                 this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
             }
-        } catch (error: any) {
-            if (error?.code === 'ENOSPC') throw error;
+        } else if (entry.operation === 'DELETE' && entry.beforeImage !== undefined && entry.beforeImage !== null) {
+            this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
         }
     }
 
@@ -1190,7 +1491,7 @@ export class ACIDStorageEngine {
                         const content = readFileSync(filePath, 'utf-8');
                         currentData = content.trim() ? JSON.parse(content) : {};
                     } catch (error) {
-                        currentData = {};
+                        throw new DataCorruptionError(`Data corruption detected in document '${key}': invalid JSON content at ${filePath}`);
                     }
                 }
             }
@@ -1370,7 +1671,7 @@ export class ACIDStorageEngine {
                         const content = readFileSync(filePath, 'utf-8');
                         beforeImage = content.trim() ? JSON.parse(content) : {};
                     } catch (error) {
-                        // Silent failure for production
+                        throw new DataCorruptionError(`Data corruption detected in document '${key}': invalid JSON content at ${filePath}`);
                     }
                 }
             }
@@ -1405,31 +1706,52 @@ export class ACIDStorageEngine {
         }
 
         // 1. Write WAL COMMIT record. If this throws, transaction can safely rollback.
+        let commitLsn: number;
         try {
-            this.wal.writeLog({
+            commitLsn = this.wal.writeLog({
                 operation: 'COMMIT',
                 transactionId
             });
         } catch (error) {
-            try { this.rollbackTransaction(transactionId); } catch { }
+            try { this.rollbackTransaction(transactionId); } catch { /* approved: rollback during commit error best-effort */ }
             throw new Error(`Commit failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
 
-        // 2. Point of no return: WAL COMMIT is durable. Irrevocably committed.
-        // NEVER attempt rollback after this point.
+        // 2. Point of no return from the logical transaction engine. Durability depends on synchronous mode (immediate in 'full', interval in 'normal').
         transaction.status = 'committed';
+        this.lastCommittedLSN = commitLsn;
 
         // DEFERRED data-file writes: move committed data to committedBuffer
         const pendingTx = this.pendingWrites.get(transactionId);
         if (pendingTx) {
             for (const [key, op] of pendingTx.entries()) {
+                // If a snapshot is active at ckptLsn and this commit is after ckptLsn, preserve pre-snapshot state
+                if (this.activeSnapshotLsn !== null && commitLsn > this.activeSnapshotLsn) {
+                    if (!this.snapshotBeforeImages.has(key)) {
+                        this.snapshotBeforeImages.set(key, {
+                            state: op.beforeImage === null || op.beforeImage === undefined ? 'deleted' : 'present',
+                            data: op.beforeImage !== null && op.beforeImage !== undefined ? cloneJson(op.beforeImage) : undefined
+                        });
+                    }
+                }
+
                 if (op.op === 'write' && op.afterImage !== undefined && op.afterImage !== null) {
                     this.committedBuffer.set(key, { data: op.afterImage, op: 'write' });
+                    this.dirtyKeys.set(key, {
+                        key,
+                        lsn: commitLsn,
+                        state: 'present',
+                        data: cloneJson(op.afterImage)
+                    });
                 } else if (op.op === 'delete') {
                     this.committedBuffer.set(key, { data: null, op: 'delete' });
+                    this.dirtyKeys.set(key, {
+                        key,
+                        lsn: commitLsn,
+                        state: 'deleted',
+                        data: undefined
+                    });
                 }
-                // Mark dirty for incremental cloud checkpoints (O(1), no I/O)
-                this.dirtyKeys.add(key);
             }
         }
 
@@ -1592,6 +1914,22 @@ export class ACIDStorageEngine {
     }
 
     /**
+     * Truncate WAL log with strict precondition checks.
+     */
+    truncateLog(): void {
+        if (this.activeTransactions.size > 0) {
+            throw new Error(`Cannot truncate WAL: ${this.activeTransactions.size} active transactions in progress`);
+        }
+        if (this.pendingWrites.size > 0) {
+            throw new Error(`Cannot truncate WAL: pending writes exist`);
+        }
+        if (this.committedBuffer.size > 0) {
+            throw new Error(`Cannot truncate WAL: committed buffer not flushed (${this.committedBuffer.size} entries remaining)`);
+        }
+        this.wal.truncateLog();
+    }
+
+    /**
      * Flush the committedBuffer to data files. Called by the background timer
      * and by forceCheckpoint(). Writes buffered entries to data files using
      * the atomic temp→rename pattern. When unforced, processes in chunks to prevent
@@ -1611,25 +1949,31 @@ export class ACIDStorageEngine {
 
             const filePath = partitionedPath(this.dbPath, key);
             touchedDirs.add(dirname(filePath));
+            let success = false;
             if (entry.op === 'write') {
                 try {
                     this.atomicWriteFile(filePath, JSON.stringify(entry.data), syncNeeded);
+                    success = true;
                 } catch {
-                    // best-effort — WAL redo will handle on crash
+                    // best-effort — WAL redo will handle on crash, retain in committedBuffer to retry
+                } finally {
+                    if (success) this.committedBuffer.delete(key);
                 }
             } else if (entry.op === 'delete') {
                 try {
                     if (existsSync(filePath)) unlinkSync(filePath);
+                    success = true;
                 } catch {
-                    // ignore
+                    // retain in committedBuffer to retry
+                } finally {
+                    if (success) this.committedBuffer.delete(key);
                 }
             }
-            this.committedBuffer.delete(key);
         }
 
         if (syncNeeded) {
             for (const dir of touchedDirs) {
-                try { this.fsyncDir(dir); } catch {}
+                try { this.fsyncDir(dir); } catch { /* approved: directory fsync best-effort */ }
             }
         }
 

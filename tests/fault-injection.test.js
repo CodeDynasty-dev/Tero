@@ -67,18 +67,19 @@ test('WAL Fault Injection: Bit-flip checksum corruption is rejected without corr
     }) + '\n';
     appendFileSync(walPath, badLine);
 
-    // Boot new instance
-    db = new Tero({ directory: testDir, synchronous: 'full' });
-
-    // Good documents are valid
-    assert.equal((await db.get('good_doc_1')).valid, true);
-    assert.equal((await db.get('good_doc_2')).valid, true);
-
-    // Corrupted entry with invalid checksum was NOT replayed
-    const corruptDoc = await db.get('corrupt_doc');
-    assert.equal(corruptDoc, null, 'Entry with invalid checksum must never be replayed');
+    // Boot new instance — must fail-stop with RecoveryCorruptionError
+    assert.throws(
+      () => {
+        new Tero({ directory: testDir, synchronous: 'full' });
+      },
+      (err) => {
+        assert.equal(err.code, 'RECOVERY_CORRUPTION');
+        return true;
+      },
+      'WAL corruption must throw RecoveryCorruptionError'
+    );
   } finally {
-    db.destroy();
+    try { db.destroy(); } catch {}
     rmSync(testDir, { recursive: true, force: true });
   }
 });
