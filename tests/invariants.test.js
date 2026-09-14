@@ -714,39 +714,37 @@ test('Invariant I: Checkpoint acknowledges dirty keys strictly after publishing 
       }
     };
 
-    const engine = new ACIDStorageEngine(testDir, 'full');
-    await engine.createDocument('user_1', { name: 'Alice' });
-    await engine.createDocument('user_2', { name: 'Bob' });
+    const db = new Tero({ directory: testDir, synchronous: 'full' });
+    await db.create('user_1', { name: 'Alice' });
+    await db.create('user_2', { name: 'Bob' });
 
-    const backup = new BackupManager({
-      localPath: testDir,
+    const backup = new BackupManager(testDir, {
       cloudStorage: {
         bucket: 'test-bucket',
         region: 'us-east-1',
         accessKeyId: 'test',
         secretAccessKey: 'test'
       },
-      customS3Client: mockS3Client,
-      engine
+      customS3Client: mockS3Client
     });
 
     // 1) First attempt: S3 fails on latest.json upload
     simulateFailureBeforePublish = true;
     await assert.rejects(
-      async () => await backup.doFullCheckpoint(),
+      async () => await backup.liveCheckpointToBucket(db.acidEngine, { forceFull: true }),
       /Simulated S3 failure/
     );
 
     // Dirty keys must NOT be acknowledged if latest.json failed!
-    assert.equal(engine.hasPendingDirtyKeys(), true, 'Engine must still have pending dirty keys when publishing fails');
+    assert.ok(db.acidEngine.peekDirtyKeys().size > 0, 'Engine must still have pending dirty keys when publishing fails');
 
     // 2) Second attempt: S3 succeeds
     simulateFailureBeforePublish = false;
-    const res = await backup.doFullCheckpoint();
-    assert.ok(res.manifestKey, 'Checkpoint must succeed');
+    const res = await backup.liveCheckpointToBucket(db.acidEngine, { forceFull: true });
+    assert.equal(res.fullUpload, true, 'Checkpoint must succeed');
 
     // Now dirty keys are acknowledged
-    assert.equal(engine.hasPendingDirtyKeys(), false, 'Engine dirty keys must be acknowledged after latest.json publishes');
+    assert.equal(db.acidEngine.peekDirtyKeys().size, 0, 'Engine dirty keys must be acknowledged after latest.json publishes');
 
     // Verify ordering in uploadedKeys: data files -> index.json -> MANIFEST.json -> latest.json
     const manifestIdx = uploadedKeys.findIndex(k => k.endsWith('MANIFEST.json'));
@@ -756,7 +754,7 @@ test('Invariant I: Checkpoint acknowledges dirty keys strictly after publishing 
     assert.ok(latestIdx > manifestIdx, 'latest.json must be published after MANIFEST.json');
 
     backup.destroy();
-    engine.destroy();
+    db.destroy();
   } finally {
     rmSync(testDir, { recursive: true, force: true });
   }
@@ -773,10 +771,8 @@ test('Invariant J: Cloud restore enforces zero-gap and detects checksum/range co
   try {
     const targetDir = join(testDir, 'db_target');
 
-    // Scenario 1: Gap between base snapshot LSN and first WAL segment
-    // Base snapshot is LSN 10, but first WAL segment starts at LSN 12 (LSN 11 missing)
-    const backup = new BackupManager({
-      localPath: testDir,
+    // Scenario 1: Gap between base snapshot LSN (10) and first WAL segment (12)
+    const backup = new BackupManager(testDir, {
       cloudStorage: {
         bucket: 'test-bucket',
         region: 'us-east-1',
@@ -786,31 +782,24 @@ test('Invariant J: Cloud restore enforces zero-gap and detects checksum/range co
       customS3Client: {
         send: async (cmd) => {
           const key = cmd.input?.Key || '';
-          if (key.endsWith('latest.json') || key.endsWith('MANIFEST.json')) {
+          const prefix = cmd.input?.Prefix || '';
+          if (prefix.includes('nodes/')) {
+            return {
+              Contents: [{ Key: `${prefix}node1/` }]
+            };
+          }
+          if (prefix.includes('wal/')) {
+            return {
+              Contents: [{ Key: `${prefix}seg-12-15.json.gz` }]
+            };
+          }
+          if (key.endsWith('latest.json')) {
             return {
               Body: {
                 transformToString: async () => JSON.stringify({
-                  manifestVersion: 2,
-                  type: 'full',
-                  timestamp: Date.now(),
-                  baseSnapshotLsn: 10,
-                  lastLsn: 15,
-                  walSegments: ['tero-backups/db/wal/.wal.seg-12-15']
+                  baseTs: '1000',
+                  baseLsn: 10
                 })
-              }
-            };
-          }
-          if (key.includes('.wal.seg-12-15')) {
-            return {
-              Body: {
-                transformToString: async () => '{"lsn": 12, "operation": "WRITE", "key": "k1", "data": {}}\n'
-              }
-            };
-          }
-          if (key.endsWith('index.json')) {
-            return {
-              Body: {
-                transformToString: async () => JSON.stringify({ lsn: 10, documents: {} })
               }
             };
           }
@@ -820,7 +809,7 @@ test('Invariant J: Cloud restore enforces zero-gap and detects checksum/range co
     });
 
     await assert.rejects(
-      async () => await backup._restoreToTargetDirectory(targetDir, undefined),
+      async () => await backup.restoreLiveToDirectory(targetDir, { nodeId: 'node1' }),
       (err) => {
         assert.equal(err.code, 'RECOVERY_CORRUPTION');
         assert.ok(err.message.includes('gap'), `Expected gap message, got: ${err.message}`);

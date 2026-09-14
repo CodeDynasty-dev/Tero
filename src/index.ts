@@ -1443,9 +1443,16 @@ export class Tero {
     const fallbackToCloud = options?.fallbackToCloud ?? true;
 
     // 1) Try local first. Handle both null (new) and false (legacy) as "not found"
-    const localData = await this.get(key);
-    if (localData !== null && (localData as any) !== false) {
-      return localData;
+    try {
+      const localData = await this.get(key);
+      if (localData !== null && (localData as any) !== false) {
+        return localData;
+      }
+    } catch (err) {
+      if (options?.throwOnRecoveryError) {
+        throw err;
+      }
+      return null;
     }
 
     // 2) Not local. Optionally fall back to cloud.
