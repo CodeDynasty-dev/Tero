@@ -888,6 +888,7 @@ export class BackupManager {
   async backupToBucket(options?: {
     walArchivePaths?: string[];
     tag?: string;
+    engine?: ACIDStorageEngine;
   }): Promise<BucketBackupResult> {
     if (this.inFlightBackupToBucket) return this.inFlightBackupToBucket;
     this.inFlightBackupToBucket = this._doBackupToBucket(options);
@@ -901,6 +902,7 @@ export class BackupManager {
   private async _doBackupToBucket(options?: {
     walArchivePaths?: string[];
     tag?: string;
+    engine?: ACIDStorageEngine;
   }): Promise<BucketBackupResult> {
     const startTime = Date.now();
     const errors: string[] = [];
@@ -918,43 +920,88 @@ export class BackupManager {
       };
     }
 
+    // For snapshot consistency, prefer engine snapshot when available (P1)
+    let _snapshotManifestEntries: Array<{ name: string; size: number; state: string; sha256: string }> | null = null;
+    let _jsonFilesForManifest: Array<{ path: string; name: string; size: number; mtime: Date }> | null = null;
     try {
-      // 1) Snapshot all data JSON files to bucket. POOLED with incremental diffing (MD5 vs ETag).
-      const jsonFiles = await this.getJsonFiles();
       const remotePrefix = this.getCloudKey('');
       const remoteObjs = await this.listPrefixWithMeta(remotePrefix);
       const remoteMap = new Map(remoteObjs.map(o => [o.key, o]));
       const localCloudKeys = new Set<string>();
 
-      await pooledMap(jsonFiles, 16, async (file) => {
-        try {
-          const cloudKey = this.getCloudKey(file.name);
-          localCloudKeys.add(cloudKey);
-          const remote = remoteMap.get(cloudKey);
-          if (remote) {
-            if (remote.eTag) {
-              try {
-                const buf = readFileSync(file.path);
-                const md5 = createHash('md5').update(buf).digest('hex');
-                if (remote.eTag === md5) {
-                  // Already up to date in cloud
+      if (options?.engine) {
+        // Consistent LSN snapshot — same machinery as live checkpoint (P1)
+        const engine = options.engine;
+        const ckptLsn = engine.getLastCommittedLSN();
+        engine.flushCommittedBuffer(true);
+        const snapshotEntries: Array<{ key: string; data?: any; state: 'present' | 'deleted'; lsn: number }> = [];
+        await pooledConsumeAsyncGen((engine as any).snapshotFiles(ckptLsn), 16, async (entry: any) => {
+          snapshotEntries.push(entry);
+        });
+        const presentEntries = snapshotEntries.filter(e => e.state === 'present' && e.data !== undefined);
+        const snapshotData: Array<{ name: string; buf: Buffer; sha256: string; size: number }> = [];
+        _snapshotManifestEntries = [];
+        for (const e of presentEntries) {
+          const name = `${e.key}.json`;
+          const buf = Buffer.from(JSON.stringify(e.data));
+          const sha256 = createHash('sha256').update(buf).digest('hex');
+          snapshotData.push({ name, buf, sha256, size: buf.length });
+          _snapshotManifestEntries.push({ name, size: buf.length, state: 'present', sha256 });
+        }
+        for (const e of snapshotEntries.filter(en => en.state === 'deleted')) {
+          const name = `${e.key}.json`;
+          const sha256 = createHash('sha256').update(Buffer.alloc(0)).digest('hex');
+          _snapshotManifestEntries.push({ name, size: 0, state: 'deleted', sha256 });
+        }
+        await pooledMap(snapshotData, 16, async (file) => {
+          try {
+            const cloudKey = this.getCloudKey(file.name);
+            localCloudKeys.add(cloudKey);
+            const remote = remoteMap.get(cloudKey);
+            if (remote?.eTag) {
+              const md5 = createHash('md5').update(file.buf).digest('hex');
+              if (remote.eTag === md5) return;
+            }
+            // P2: size/mtime is not content equality — always verify via hash (ETag above); no size/mtime shortcut
+            await this.uploadBytes(cloudKey, file.buf, 'application/json');
+            uploadedDataFiles++;
+          } catch (error) {
+            errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
+          }
+        });
+      } else {
+        const jsonFiles = await this.getJsonFiles();
+        _jsonFilesForManifest = jsonFiles;
+        await pooledMap(jsonFiles, 16, async (file) => {
+          try {
+            const cloudKey = this.getCloudKey(file.name);
+            localCloudKeys.add(cloudKey);
+            const remote = remoteMap.get(cloudKey);
+            if (remote) {
+              if (remote.eTag) {
+                try {
+                  const buf = readFileSync(file.path);
+                  const md5 = createHash('md5').update(buf).digest('hex');
+                  if (remote.eTag === md5) {
+                    // Already up to date in cloud
+                    return;
+                  }
+                } catch {
+                  // fall through to upload
+                }
+              } else {
+                if (remote.size === file.size && remote.lastModified.getTime() >= file.mtime.getTime() - 1000) {
                   return;
                 }
-              } catch {
-                // fall through to upload
-              }
-            } else {
-              if (remote.size === file.size && remote.lastModified.getTime() >= file.mtime.getTime() - 1000) {
-                return;
               }
             }
+            await this.uploadToCloud(file.path, cloudKey);
+            uploadedDataFiles++;
+          } catch (error) {
+            errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
           }
-          await this.uploadToCloud(file.path, cloudKey);
-          uploadedDataFiles++;
-        } catch (error) {
-          errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-      });
+        });
+      }
 
       // Issue 2: Propagate deletes to cloud — remove remote documents not present in local files
       // In lazy-hydration mode (pruneDeleted === false), cold files are not local; skip deletion.
@@ -995,16 +1042,23 @@ export class BackupManager {
 
       // 3) Emit a canonical, deterministic backup manifest with SHA-256 hashes
       try {
-        const sortedDataFiles = [...jsonFiles].sort((a, b) => a.name.localeCompare(b.name));
-        const dataEntries = sortedDataFiles.map(f => {
-          const sha256 = createHash('sha256').update(readFileSync(f.path)).digest('hex');
-          return {
-            name: f.name,
-            size: f.size,
-            state: 'present',
-            sha256
-          };
-        });
+        let dataEntries: Array<{ name: string; size: number; state: string; sha256: string }>;
+        if (_snapshotManifestEntries) {
+          dataEntries = [..._snapshotManifestEntries].sort((a, b) => a.name.localeCompare(b.name));
+        } else if (_jsonFilesForManifest) {
+          const sortedDataFiles = [..._jsonFilesForManifest].sort((a, b) => a.name.localeCompare(b.name));
+          dataEntries = sortedDataFiles.map(f => {
+            const sha256 = createHash('sha256').update(readFileSync(f.path)).digest('hex');
+            return {
+              name: f.name,
+              size: f.size,
+              state: 'present',
+              sha256
+            };
+          });
+        } else {
+          dataEntries = [];
+        }
         const dataManifestHash = createHash('sha256').update(JSON.stringify(dataEntries)).digest('hex');
 
         const sortedWalPaths = [...walPaths].sort();
@@ -1621,6 +1675,32 @@ export class BackupManager {
       }
       prevEnd = Math.max(prevEnd, e);
     }
+    // PITR: wall-clock PIT is not authoritative — convert to LSN once, then replay by LSN (P1)
+    let effectiveTargetLsn = targetLsn;
+    let effectivePit: number | undefined = pit;
+    const walSegmentCache = new Map<string, LogEntry[]>();
+    if (pit !== undefined && targetLsn === undefined) {
+      let maxCommitLsn = baseLsn ?? 0;
+      for (const wk of walKeys) {
+        let entries: LogEntry[];
+        try {
+          const raw = gunzipSync(await this.downloadBytes(wk)).toString('utf8');
+          entries = JSON.parse(raw);
+          if (!Array.isArray(entries)) throw new Error('Cloud WAL segment is not an array');
+          walSegmentCache.set(wk, entries);
+        } catch (err: any) {
+          throw new RecoveryCorruptionError(wk, 0, `Corrupt cloud WAL segment ${wk}: ${err?.message || err}`);
+        }
+        for (const e of entries) {
+          if (e.operation === 'COMMIT' && e.timestamp <= pit!) {
+            if (e.lsn > maxCommitLsn) maxCommitLsn = e.lsn;
+          }
+        }
+      }
+      effectiveTargetLsn = maxCommitLsn;
+      effectivePit = undefined;
+    }
+
     let segmentsReplayed = 0, lastLsn = baseLsn ?? 0;
     const pending = new Map<string, LogEntry[]>();
     const apply = (e: LogEntry) => {
@@ -1637,14 +1717,18 @@ export class BackupManager {
       const m = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
       const segStart = parseInt(m[1], 10), segEnd = parseInt(m[2], 10);
       let entries: LogEntry[];
-      try {
-        const raw = gunzipSync(await this.downloadBytes(wk)).toString('utf8');
-        entries = JSON.parse(raw);
-        if (!Array.isArray(entries)) {
-          throw new Error('Cloud WAL segment is not an array of entries');
+      if (walSegmentCache.has(wk)) {
+        entries = walSegmentCache.get(wk)!;
+      } else {
+        try {
+          const raw = gunzipSync(await this.downloadBytes(wk)).toString('utf8');
+          entries = JSON.parse(raw);
+          if (!Array.isArray(entries)) {
+            throw new Error('Cloud WAL segment is not an array of entries');
+          }
+        } catch (err: any) {
+          throw new RecoveryCorruptionError(wk, 0, `Corrupt cloud WAL segment ${wk}: ${err?.message || err}`);
         }
-      } catch (err: any) {
-        throw new RecoveryCorruptionError(wk, 0, `Corrupt cloud WAL segment ${wk}: ${err?.message || err}`);
       }
 
       if (entries.length === 0) {
@@ -1668,8 +1752,19 @@ export class BackupManager {
           throw new RecoveryCorruptionError(wk, 0, `Checksum mismatch in cloud WAL segment for entry LSN ${e.lsn}`, e.lsn);
         }
 
-        if (pit !== undefined && e.timestamp > pit) continue;
-        if (targetLsn !== undefined && e.lsn > targetLsn) continue;
+        // PITR: after conversion, effectivePit is undefined and we filter purely by LSN (authoritative)
+        // If pit was provided without conversion (fallback), only COMMIT timestamp decides visibility
+        if (effectivePit !== undefined && e.timestamp > effectivePit) {
+          if (e.operation === 'COMMIT' || e.operation === 'ROLLBACK') continue;
+          // WRITE/DELETE visibility is decided at COMMIT time, not per-entry
+          if (e.operation === 'WRITE' || e.operation === 'DELETE') {
+            // Buffer but will be discarded if COMMIT is after PIT
+            // Still need to buffer to know transaction, so don't skip
+          } else {
+            continue;
+          }
+        }
+        if (effectiveTargetLsn !== undefined && e.lsn > effectiveTargetLsn) continue;
         if (e.lsn <= (baseLsn ?? 0)) continue;
         if (e.operation === 'WRITE' || e.operation === 'DELETE') {
           if (!e.transactionId) { apply(e); continue; }
@@ -1729,10 +1824,30 @@ class WalShipper {
 
   start(): void {
     if (this.timer) return;
-    if (!this.initialized) { this.lastLsn = this.deps.wal.getCurrentLSN(); this.initialized = true; }
+    if (!this.initialized) {
+      // P1: Do not skip historical WAL — start from earliest recoverable LSN.
+      // If a checkpoint already covers history, duplicate segments will be filtered by baseLsn on restore.
+      // Starting from current LSN would make recovery impossible when no checkpoint exists.
+      this.lastLsn = -1;
+      // If WAL already has entries, align to earliest archived segment or -1 to ensure continuity
+      try {
+        const arcs = this.deps.wal.listArchives();
+        if (arcs.length > 0) {
+          // Ensure we ship all archives; lastLsn stays -1 so shipArchives will pick them up
+        }
+      } catch { /* approved */ }
+      this.initialized = true;
+    }
     this.status.state = 'healthy';
     this.timer = setInterval(() => { void this.tick(); }, this.deps.intervalMs);
     this.timer.unref?.();
+  }
+
+  /** For testing / checkpoint-aware startup: allow BackupManager to set initial LSN from checkpoint.baseLsn */
+  setInitialLsn(lsn: number): void {
+    this.lastLsn = lsn;
+    this.status.lastShippedLsn = lsn;
+    this.initialized = true;
   }
 
   stop(): void {

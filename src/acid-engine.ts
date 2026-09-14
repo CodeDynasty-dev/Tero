@@ -1460,8 +1460,8 @@ export class ACIDStorageEngine {
             }
         });
 
-        // Phase 2: redo + undo — single streaming pass
-        const undoByKey = new Map<string, LogEntry>();
+        // Phase 2: redo + collect uncommitted ops per transaction
+        const undoByTx = new Map<string, LogEntry[]>();
         this.wal.streamAllLogEntries((entry) => {
             if (entry.operation === 'WRITE' && committedTransactions.has(entry.transactionId)) {
                 this.redoOperation(entry);
@@ -1473,16 +1473,20 @@ export class ACIDStorageEngine {
                 !abortedTransactions.has(entry.transactionId) &&
                 entry.key
             ) {
-                if (!undoByKey.has(entry.key)) {
-                    undoByKey.set(entry.key, entry);
-                }
+                let arr = undoByTx.get(entry.transactionId);
+                if (!arr) { arr = []; undoByTx.set(entry.transactionId, arr); }
+                arr.push(entry);
             }
         });
 
-        // Phase 3: reverse undo — process buffered uncommitted ops
-        const undoEntries = [...undoByKey.values()];
-        for (let i = undoEntries.length - 1; i >= 0; i--) {
-            this.undoOperation(undoEntries[i]);
+        // Phase 3: reverse undo — per-transaction reverse WAL order, globally LSN-descending
+        const allUndoEntries: LogEntry[] = [];
+        for (const arr of undoByTx.values()) {
+            allUndoEntries.push(...arr);
+        }
+        allUndoEntries.sort((a, b) => b.lsn - a.lsn);
+        for (const entry of allUndoEntries) {
+            this.undoOperation(entry);
         }
     }
 

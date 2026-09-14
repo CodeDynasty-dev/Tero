@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync } from "fs";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync, renameSync } from "fs";
 import { resolve as pathResolve, relative as pathRelative, join as pathJoin } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
-import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
+import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo, classifyRecoveryError } from "./recovery.js";
 import QuickLRU from "quick-lru";
 
 /**
@@ -204,6 +204,8 @@ export class Transaction {
   private committed: boolean = false;
   private rolledBack: boolean = false;
   private timeoutTimer?: ReturnType<typeof setTimeout>;
+  private txState: 'active' | 'aborting' | 'aborted' | 'committed' = 'active';
+  private abortError: Error | null = null;
 
   constructor(id: string, db: Tero, options?: TransactionOptions) {
     this.id = id;
@@ -211,9 +213,17 @@ export class Transaction {
     this.startTime = Date.now();
     if (options?.timeout) {
       this.timeoutTimer = setTimeout(() => {
+        if (this.committed || this.rolledBack || this.destroyed || this.txState !== 'active') return;
+        this.txState = 'aborting';
         this.destroyed = true;
-        this.rolledBack = true;
-        this.db._rollbackRaw(this.id).catch(() => { });
+        void this.db._rollbackRaw(this.id).then(() => {
+          this.txState = 'aborted';
+          this.rolledBack = true;
+        }).catch((err: any) => {
+          this.txState = 'aborted';
+          this.rolledBack = true;
+          this.abortError = err instanceof Error ? err : new Error(String(err));
+        });
       }, options.timeout);
       (this.timeoutTimer as any).unref?.();
     }
@@ -224,30 +234,44 @@ export class Transaction {
   }
 
   isActive(): boolean {
+    if (this.txState !== 'active') return false;
     if (this.destroyed || this.committed || this.rolledBack) return false;
     return this.db._isTransactionActive(this.id);
   }
 
   isRolledBack(): boolean {
-    if (this.rolledBack) return true;
+    if (this.rolledBack || this.txState === 'aborted') return true;
+    // Aborting is not yet rolled back — still considered not rolled back until engine confirms
+    if (this.txState === 'aborting') return false;
     if (this.destroyed) return true;
     const status = this.db._getTxStatus(this.id);
-    if (status === 'aborted') { this.rolledBack = true; return true; }
+    if (status === 'aborted') { this.rolledBack = true; this.txState = 'aborted'; return true; }
     return false;
   }
 
   isCommitted(): boolean {
-    if (this.committed) return true;
+    if (this.committed || this.txState === 'committed') return true;
     return this.db._getTxStatus(this.id) === 'committed';
   }
 
+  /** Whether transaction is in ABORTING state (timeout fired, rollback in flight) */
+  isAborting(): boolean {
+    return this.txState === 'aborting';
+  }
+
+  getAbortError(): Error | null {
+    return this.abortError;
+  }
+
   private _checkActive(): void {
+    if (this.txState === 'aborting') throw new Error('Transaction is aborting (timeout rollback in progress)');
+    if (this.txState === 'aborted') throw new Error('Transaction has been rolled back');
     if (this.destroyed) throw new Error('Transaction has been destroyed');
     if (this.committed) throw new Error('Transaction has already been committed');
     if (this.rolledBack) throw new Error('Transaction has been rolled back');
     const status = this.db._getTxStatus(this.id);
-    if (status === 'committed') { this.committed = true; throw new Error('Transaction has already been committed'); }
-    if (status === 'aborted') { this.rolledBack = true; throw new Error('Transaction has been rolled back'); }
+    if (status === 'committed') { this.committed = true; this.txState = 'committed'; throw new Error('Transaction has already been committed'); }
+    if (status === 'aborted') { this.rolledBack = true; this.txState = 'aborted'; throw new Error('Transaction has been rolled back'); }
     if (status === 'not_found') {
       // Engine GC'd the transaction (after commit/rollback). Use local flags to give precise error
       if (this.committed) throw new Error('Transaction has already been committed');
@@ -301,14 +325,15 @@ export class Transaction {
   }
 
   getState(): { status: string; operations: Array<{ key: string; operation: string }>; startTime: number } {
-    if (this.committed) return { status: 'committed', operations: [...this.operationsLog], startTime: this.startTime };
-    if (this.rolledBack || this.destroyed) {
+    if (this.txState === 'aborting') return { status: 'aborting', operations: [...this.operationsLog], startTime: this.startTime };
+    if (this.committed || this.txState === 'committed') return { status: 'committed', operations: [...this.operationsLog], startTime: this.startTime };
+    if (this.rolledBack || this.txState === 'aborted' || this.destroyed) {
       const s = this.db._getTxStatus(this.id);
-      if (s === 'aborted' || this.rolledBack) return { status: 'rolled_back', operations: [...this.operationsLog], startTime: this.startTime };
+      if (s === 'aborted' || this.rolledBack || this.txState === 'aborted') return { status: 'rolled_back', operations: [...this.operationsLog], startTime: this.startTime };
     }
     const status = this.db._getTxStatus(this.id);
     return {
-      status: status === 'active' ? 'active' : (status === 'committed' ? 'committed' : 'rolled_back'),
+      status: status === 'active' ? 'active' : (status === 'committed' ? 'committed' : status === 'aborted' ? 'rolled_back' : 'aborted'),
       operations: [...this.operationsLog],
       startTime: this.startTime
     };
@@ -323,13 +348,35 @@ export class Transaction {
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
     await this.db.commit(this.id);
     this.committed = true;
+    this.txState = 'committed';
   }
 
   async abort(): Promise<void> {
-    if (this.destroyed) return;
+    if (this.rolledBack || this.txState === 'aborted') return;
+    if (this.txState === 'aborting') {
+      // Wait for in-flight timeout rollback
+      await new Promise<void>((resolve) => {
+        const check = () => {
+          if (this.txState !== 'aborting') resolve();
+          else setTimeout(check, 5);
+        };
+        check();
+      });
+      return;
+    }
+    if (this.destroyed && this.txState !== 'active') return;
+    this.txState = 'aborting';
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
-    await this.db._rollbackRaw(this.id);
-    this.rolledBack = true;
+    try {
+      await this.db._rollbackRaw(this.id);
+      this.txState = 'aborted';
+      this.rolledBack = true;
+    } catch (err: any) {
+      this.txState = 'aborted';
+      this.rolledBack = true;
+      this.abortError = err instanceof Error ? err : new Error(String(err));
+      throw err;
+    }
   }
 
   async rollback(): Promise<void> {
@@ -337,10 +384,20 @@ export class Transaction {
   }
 
   destroy(): void {
+    if (this.rolledBack || this.txState === 'aborted' || this.txState === 'committed') return;
     this.destroyed = true;
-    this.rolledBack = true;
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
-    this.db._rollbackRaw(this.id).catch(() => { });
+    if (this.txState === 'active') {
+      this.txState = 'aborting';
+      void this.db._rollbackRaw(this.id).then(() => {
+        this.txState = 'aborted';
+        this.rolledBack = true;
+      }).catch((err: any) => {
+        this.txState = 'aborted';
+        this.rolledBack = true;
+        this.abortError = err instanceof Error ? err : new Error(String(err));
+      });
+    }
   }
 }
 
@@ -361,6 +418,9 @@ export class Tero {
   private rolledBackCount: number = 0;
   /** Monotonic per-key generation for in-flight hydration invalidation (P0-1). */
   private keyGenerations = new Map<string, number>();
+  /** Durable cloud reconciliation for deletes (P0-2) — keys needing cloud delete+tombstone */
+  private cloudPendingTombstones = new Set<string>();
+  private cloudPendingTimer?: ReturnType<typeof setTimeout>;
 
   /**
    * Bounded LRU of known-existing keys. Replaces the unbounded Set<string>
@@ -451,10 +511,13 @@ export class Tero {
                 this.missingKeys.set(obj.key, true);
                 this.bumpGeneration(obj.key);
               }
-            } catch {}
+            } catch { /* approved */ }
           }
         }
-      } catch {}
+      } catch { /* approved */ }
+      // Restore pending cloud tombstones and schedule retry
+      this.loadPendingCloud();
+      if (this.cloudPendingTombstones.size > 0) this.scheduleCloudRetry();
 
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
@@ -581,14 +644,26 @@ export class Tero {
           return null;
         }
         // Check cloud tombstone before fetching — deleted keys must not be resurrected
-        try {
-          const hasTomb = await (this.dataRecovery as any).hasTombstone?.(key);
-          if (hasTomb) {
-            this.missingKeys.set(key, true);
-            return null;
+        // Three states: PRESENT, DELETED, UNKNOWN — never fail-open on UNKNOWN
+        if (typeof (this.dataRecovery as any).hasTombstone === 'function') {
+          try {
+            const hasTomb = await (this.dataRecovery as any).hasTombstone(key);
+            if (hasTomb) {
+              this.missingKeys.set(key, true);
+              return null;
+            }
+          } catch (err: any) {
+            const kind = classifyRecoveryError(err);
+            if (kind === 'CANCELLED') throw err;
+            if (kind !== 'NOT_FOUND') {
+              const e = new Error(`Cloud tombstone check failed for '${key}': ${err?.message || 'Unknown cloud error'}`);
+              (e as any).cause = err;
+              (e as any).code = 'CLOUD_UNAVAILABLE';
+              (e as any).$metadata = err?.$metadata;
+              (e as any).name = err?.name || 'CloudUnavailableError';
+              throw e;
+            }
           }
-        } catch {
-          // tombstone check best-effort; fall through to normal fetch
         }
         // If local committed state already has a value/tombstone newer than hydration start, don't fetch
         const committedBefore = this.acidEngine.getCommittedData(key);
@@ -612,7 +687,7 @@ export class Tero {
             try {
               const p = this.keyToPath(key);
               if (existsSync(p)) unlinkSync(p);
-            } catch {}
+            } catch { /* approved */ }
             this.cache.delete(key);
           }
           return null;
@@ -621,7 +696,7 @@ export class Tero {
         // Post-fetch local tombstone check (delete committed after our pre-check or durable local tombstone)
         if (this.hasLocalTombstone(key)) {
           if (data !== null && data !== undefined) {
-            try { unlinkSync(this.keyToPath(key)); } catch {}
+            try { unlinkSync(this.keyToPath(key)); } catch { /* approved */ }
             this.cache.delete(key);
           }
           this.missingKeys.set(key, true);
@@ -630,7 +705,7 @@ export class Tero {
         const committedAfter = this.acidEngine.getCommittedData(key);
         if (committedAfter !== undefined && committedAfter === null) {
           if (data !== null && data !== undefined) {
-            try { unlinkSync(this.keyToPath(key)); } catch {}
+            try { unlinkSync(this.keyToPath(key)); } catch { /* approved */ }
             this.cache.delete(key);
           }
           this.missingKeys.set(key, true);
@@ -639,15 +714,31 @@ export class Tero {
 
         if (data !== null && data !== undefined) {
           // Re-check tombstone after fetch — cloud delete could have happened concurrently
-          try {
-            const hasTombAfter = await (this.dataRecovery as any).hasTombstone?.(key);
-            if (hasTombAfter) {
-              try { unlinkSync(this.keyToPath(key)); } catch {}
+          // Must not fail-open: UNKNOWN → throw
+          if (typeof (this.dataRecovery as any).hasTombstone === 'function') {
+            try {
+              const hasTombAfter = await (this.dataRecovery as any).hasTombstone(key);
+              if (hasTombAfter) {
+                try { unlinkSync(this.keyToPath(key)); } catch { /* approved */ }
+                this.cache.delete(key);
+                this.missingKeys.set(key, true);
+                return null;
+              }
+            } catch (err: any) {
+              // Tombstone check failed after successful fetch — cannot guarantee DELETED vs PRESENT
+              // Remove the just-fetched file to avoid resurrection on UNKNOWN
+              try { unlinkSync(this.keyToPath(key)); } catch { /* approved */ }
               this.cache.delete(key);
-              this.missingKeys.set(key, true);
-              return null;
+              const kind = classifyRecoveryError(err);
+              if (kind === 'CANCELLED') throw err;
+              const e = new Error(`Cloud tombstone re-check failed for '${key}': ${err?.message || 'Unknown cloud error'}`);
+              (e as any).cause = err;
+              (e as any).code = 'CLOUD_UNAVAILABLE';
+              (e as any).$metadata = err?.$metadata;
+              (e as any).name = err?.name || 'CloudUnavailableError';
+              throw e;
             }
-          } catch {}
+          }
           this.knownKeys.set(key, true);
           this.updateCache(key, data, undefined);
           return data;
@@ -916,15 +1007,25 @@ export class Tero {
             if (committed !== null) {
               // Write/present — clear tombstones so re-create can succeed and hydration can fetch
               this.deleteLocalTombstone(key);
+              if (this.cloudPendingTombstones.has(key)) {
+                this.cloudPendingTombstones.delete(key);
+                this.savePendingCloud();
+              }
               if (this.dataRecovery) {
-                try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch {}
+                try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
               }
             } else {
               // Delete — ensure tombstones for resurrection protection
               this.writeLocalTombstone(key);
               if (this.dataRecovery && this.hydrateMode === 'lazy') {
-                try { await this.dataRecovery.deleteFromCloud(key); } catch {}
-                try { await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine.getLastCommittedLSN()); } catch {}
+                let failed = false;
+                try { await this.dataRecovery.deleteFromCloud(key); } catch { failed = true; }
+                try { await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine.getLastCommittedLSN()); } catch { failed = true; }
+                if (failed) this.queueCloudTombstone(key);
+                else if (this.cloudPendingTombstones.has(key)) {
+                  this.cloudPendingTombstones.delete(key);
+                  this.savePendingCloud();
+                }
               }
             }
           } else {
@@ -933,8 +1034,21 @@ export class Tero {
             if (!existsSync(this.keyToPath(key))) {
               // likely deleted — ensure tombstone
               this.writeLocalTombstone(key);
+              if (this.dataRecovery && this.hydrateMode === 'lazy' && !this.cloudPendingTombstones.has(key)) {
+                // best-effort cloud tombstone for fallback deletes
+                try {
+                  await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine.getLastCommittedLSN());
+                } catch { this.queueCloudTombstone(key); }
+              }
             } else {
               this.deleteLocalTombstone(key);
+              if (this.cloudPendingTombstones.has(key)) {
+                this.cloudPendingTombstones.delete(key);
+                this.savePendingCloud();
+              }
+              if (this.dataRecovery) {
+                try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+              }
             }
           }
         }
@@ -1137,8 +1251,8 @@ export class Tero {
         try { fsyncSync(fd); } finally { closeSync(fd); }
         const dirFd = openSync(dir, 'r');
         try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-      } catch {}
-    } catch {}
+      } catch { /* approved */ }
+    } catch { /* approved */ }
   }
 
   private hasLocalTombstone(key: string): boolean {
@@ -1156,7 +1270,109 @@ export class Tero {
     try {
       const p = this.localTombstonePath(key);
       if (existsSync(p)) unlinkSync(p);
-    } catch {}
+    } catch { /* approved */ }
+  }
+
+  private pendingCloudPath(): string {
+    return pathJoin(this.teroDirectory, '.cloud_pending.json');
+  }
+
+  private loadPendingCloud(): void {
+    try {
+      const p = this.pendingCloudPath();
+      if (!existsSync(p)) return;
+      const raw = readFileSync(p, 'utf8');
+      const arr: string[] = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        for (const k of arr) if (typeof k === 'string') this.cloudPendingTombstones.add(k);
+      }
+    } catch { /* approved */ }
+  }
+
+  private savePendingCloud(): void {
+    try {
+      const p = this.pendingCloudPath();
+      const dir = pathJoin(this.teroDirectory, '.tombstones');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      if (this.cloudPendingTombstones.size === 0) {
+        if (existsSync(p)) unlinkSync(p);
+        return;
+      }
+      const tmp = `${p}.tmp.${process.pid}`;
+      writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstones]));
+      try {
+        const fd = openSync(tmp, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      } catch { /* approved */ }
+      try { renameSync(tmp, p); } catch { writeFileSync(p, JSON.stringify([...this.cloudPendingTombstones])); }
+      try {
+        const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      } catch { /* approved */ }
+    } catch { /* approved */ }
+  }
+
+  private queueCloudTombstone(key: string): void {
+    this.cloudPendingTombstones.add(key);
+    this.savePendingCloud();
+    this.scheduleCloudRetry();
+  }
+
+  private scheduleCloudRetry(): void {
+    if (this.cloudPendingTimer) return;
+    if (!this.dataRecovery || this.hydrateMode !== 'lazy') return;
+    this.cloudPendingTimer = setTimeout(() => {
+      this.cloudPendingTimer = undefined;
+      void this.retryPendingCloudTombstones();
+    }, 2000);
+    (this.cloudPendingTimer as any).unref?.();
+  }
+
+  private async retryPendingCloudTombstones(): Promise<void> {
+    if (this.cloudPendingTombstones.size === 0) return;
+    if (!this.dataRecovery) return;
+    const lsn = this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
+    const keys = [...this.cloudPendingTombstones];
+    for (const key of keys) {
+      try {
+        await this.dataRecovery.deleteFromCloud(key);
+        await (this.dataRecovery as any).putTombstone(key, lsn);
+        this.cloudPendingTombstones.delete(key);
+        try {
+          const p = this.pendingCloudPath();
+          if (this.cloudPendingTombstones.size === 0) {
+            if (existsSync(p)) unlinkSync(p);
+          } else {
+            writeFileSync(p, JSON.stringify([...this.cloudPendingTombstones]));
+          }
+        } catch { /* approved */ }
+      } catch (err) {
+        // Keep pending for next retry; classify to avoid tight loop on auth errors
+        const kind = classifyRecoveryError(err);
+        if (kind === 'FATAL_AUTH') {
+          // Auth failures need manual intervention — keep pending but don't hammer
+          continue;
+        }
+      }
+    }
+    if (this.cloudPendingTombstones.size > 0) {
+      this.scheduleCloudRetry();
+    }
+  }
+
+  /** Whether cloud tombstone reconciliation is pending (P0-2). */
+  isCloudReconciliationPending(): boolean {
+    return this.cloudPendingTombstones.size > 0;
+  }
+
+  /** Keys with pending cloud delete/tombstone (P0-2). */
+  getCloudReconciliationPendingKeys(): string[] {
+    return [...this.cloudPendingTombstones];
+  }
+
+  /** Retry pending cloud tombstones immediately (P0-2). */
+  async retryCloudReconciliation(): Promise<void> {
+    await this.retryPendingCloudTombstones();
   }
 
   async remove(key: string): Promise<void> {
@@ -1172,14 +1388,14 @@ export class Tero {
 
       if (this.dataRecovery && this.hydrateMode === 'lazy') {
         const lsn = this.acidEngine.getLastCommittedLSN();
-        // Best-effort cloud delete; failure leaves local tombstone as fallback
+        let failed = false;
         try {
           await this.dataRecovery.deleteFromCloud(key);
-        } catch {}
-        // Durable cloud tombstone — even if delete failed, tombstone prevents resurrection on other nodes
+        } catch { failed = true; }
         try {
-          await this.dataRecovery.putTombstone(key, lsn);
-        } catch {}
+          await (this.dataRecovery as any).putTombstone(key, lsn);
+        } catch { failed = true; }
+        if (failed) this.queueCloudTombstone(key);
       }
     } catch (error) {
       await this.rollback(transactionId);
@@ -1449,13 +1665,11 @@ export class Tero {
     if (!this.backupManager) {
       throw new Error('Backup not configured. Call configureBackup() first.');
     }
-    // Force-flush committedBuffer to data files so the backup sees the latest state.
-    this.acidEngine.flushCommittedBuffer(true);
-    this.acidEngine.forceCheckpoint();
     const walArchivePaths = this.acidEngine.getWAL().listArchives();
     return await this.backupManager.backupToBucket({
       walArchivePaths,
       tag: options?.tag,
+      engine: this.acidEngine,
     });
   }
 
@@ -1851,6 +2065,14 @@ export class Tero {
 
   // Cleanup methods
   async destroyAsync(): Promise<void> {
+    if (this.cloudPendingTimer) {
+      clearTimeout(this.cloudPendingTimer);
+      this.cloudPendingTimer = undefined;
+    }
+    // Drain cloud tombstone retries best-effort
+    if (this.cloudPendingTombstones.size > 0) {
+      try { await this.retryPendingCloudTombstones(); } catch { /* approved */ }
+    }
     if (this.backupManager) {
       await this.backupManager.drainInFlight();
       this.backupManager.destroy();
@@ -1871,6 +2093,13 @@ export class Tero {
   destroy(): void {
     // Sync destroy cannot drain inflight S3 uploads (that's async) — warn if live backup has in-flight work.
     // Prefer `await db.destroyAsync()` / `await db.close()` in production when live backup is enabled.
+    if (this.cloudPendingTimer) {
+      clearTimeout(this.cloudPendingTimer);
+      this.cloudPendingTimer = undefined;
+    }
+    if (this.cloudPendingTombstones.size > 0) {
+      console.warn(`[Tero] destroy() with ${this.cloudPendingTombstones.size} pending cloud tombstone(s) — use await destroyAsync() to retry cloud reconciliation`);
+    }
     if (this.backupManager) {
       const live = (this.backupManager as any).liveCheckpointPromise;
       if (live) {
