@@ -115,6 +115,11 @@ export interface BackupConfig {
   logger?: 'silent' | BackupLogger; // Injected logger; default = silent
   /** Override bucket subprefix (takes precedence over cloudStorage.dbName). */
   bucketPrefix?: string;
+  /**
+   * Whether to delete remote files that are not present locally.
+   * Default: true for full local databases, false when running in lazy-hydration mode.
+   */
+  pruneDeleted?: boolean;
 }
 
 export interface BackupMetadata {
@@ -141,6 +146,8 @@ export class BackupManager {
   private dbPath: string;
   /** Injected or default logger (see BackupConfig.logger). */
   private log: BackupLogger;
+  private inFlightBackupToBucket?: Promise<BucketBackupResult>;
+  private inFlightPerformBackup?: Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }>;
 
   constructor(dbPath: string, config: BackupConfig) {
     this.dbPath = dbPath;
@@ -521,39 +528,54 @@ export class BackupManager {
       const remoteMap = new Map(remoteObjs.map(o => [o.key, o]));
       const localCloudKeys = new Set<string>();
 
-      // Issue 8: Diff against remote objects to only upload new or modified files
+      // Issue 8: Diff against remote objects to only upload new or modified files (MD5 vs ETag)
       await pooledMap(jsonFiles, 16, async (file) => {
         const localFilePath = join(localDir, file);
         const cloudKey = this.getCloudKey(file);
         localCloudKeys.add(cloudKey);
 
-        const stat = statSync(localFilePath);
         const remote = remoteMap.get(cloudKey);
-        // Skip upload if remote file exists with identical size and timestamp is current
-        if (remote && remote.size === stat.size && remote.lastModified.getTime() >= stat.mtimeMs - 1000) {
-          return;
+        // Skip upload if remote file exists with identical content (verified by MD5 vs ETag)
+        if (remote) {
+          if (remote.eTag) {
+            try {
+              const buf = readFileSync(localFilePath);
+              const md5 = createHash('md5').update(buf).digest('hex');
+              if (remote.eTag === md5) {
+                return;
+              }
+            } catch {
+              // fall through to upload
+            }
+          } else {
+            const stat = statSync(localFilePath);
+            if (remote.size === stat.size && remote.lastModified.getTime() >= stat.mtimeMs - 1000) {
+              return;
+            }
+          }
         }
 
         await this.uploadToCloud(localFilePath, cloudKey);
       });
 
       // Issue 2: Propagate deletes to cloud — remove remote documents not present in localDir
-      const toDelete = remoteObjs.filter(o =>
-        o.key.endsWith('.json') &&
-        !o.key.endsWith('MANIFEST.json') &&
-        !o.key.endsWith('latest.json') &&
-        !o.key.endsWith('index.json') &&
-        !o.key.endsWith('backup-metadata.json') &&
-        !o.key.includes('/wal/') &&
-        !localCloudKeys.has(o.key)
-      );
-
-      if (toDelete.length > 0) {
-        await pooledMap(toDelete, 16, async (o) => {
-          try {
-            await this.deleteObject(o.key);
-          } catch { }
+      // In lazy-hydration mode (pruneDeleted === false), cold files are not local; skip deletion.
+      if (this.config.pruneDeleted !== false) {
+        const toDelete = remoteObjs.filter(o => {
+          if (!o.key.endsWith('.json') || o.key.endsWith('.deleted')) return false;
+          if (o.key.endsWith('MANIFEST.json') || o.key.endsWith('latest.json') || o.key.endsWith('index.json') || o.key.endsWith('backup-metadata.json')) return false;
+          const rel = o.key.slice(remotePrefix.length);
+          if (rel.includes('/')) return false;
+          return !localCloudKeys.has(o.key);
         });
+
+        if (toDelete.length > 0) {
+          await pooledMap(toDelete, 16, async (o) => {
+            try {
+              await this.deleteObject(o.key);
+            } catch { }
+          });
+        }
       }
     } catch (error) {
       throw new Error(`Failed to upload individual files to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
@@ -594,6 +616,16 @@ export class BackupManager {
   }
 
   async performBackup(): Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }> {
+    if (this.inFlightPerformBackup) return this.inFlightPerformBackup;
+    this.inFlightPerformBackup = this._doPerformBackup();
+    try {
+      return await this.inFlightPerformBackup;
+    } finally {
+      this.inFlightPerformBackup = undefined;
+    }
+  }
+
+  private async _doPerformBackup(): Promise<{ success: boolean; metadata: BackupMetadata; cloudUploaded?: boolean }> {
     try {
       this.log.info(`🔄 Starting ${this.config.format} backup for ${this.dbPath}...`);
 
@@ -794,6 +826,19 @@ export class BackupManager {
     walArchivePaths?: string[];
     tag?: string;
   }): Promise<BucketBackupResult> {
+    if (this.inFlightBackupToBucket) return this.inFlightBackupToBucket;
+    this.inFlightBackupToBucket = this._doBackupToBucket(options);
+    try {
+      return await this.inFlightBackupToBucket;
+    } finally {
+      this.inFlightBackupToBucket = undefined;
+    }
+  }
+
+  private async _doBackupToBucket(options?: {
+    walArchivePaths?: string[];
+    tag?: string;
+  }): Promise<BucketBackupResult> {
     const startTime = Date.now();
     const errors: string[] = [];
     let uploadedDataFiles = 0;
@@ -811,7 +856,7 @@ export class BackupManager {
     }
 
     try {
-      // 1) Snapshot all data JSON files to bucket. POOLED with incremental diffing.
+      // 1) Snapshot all data JSON files to bucket. POOLED with incremental diffing (MD5 vs ETag).
       const jsonFiles = await this.getJsonFiles();
       const remotePrefix = this.getCloudKey('');
       const remoteObjs = await this.listPrefixWithMeta(remotePrefix);
@@ -823,9 +868,23 @@ export class BackupManager {
           const cloudKey = this.getCloudKey(file.name);
           localCloudKeys.add(cloudKey);
           const remote = remoteMap.get(cloudKey);
-          if (remote && remote.size === file.size && remote.lastModified.getTime() >= file.mtime.getTime() - 1000) {
-            // Already up to date in cloud
-            return;
+          if (remote) {
+            if (remote.eTag) {
+              try {
+                const buf = readFileSync(file.path);
+                const md5 = createHash('md5').update(buf).digest('hex');
+                if (remote.eTag === md5) {
+                  // Already up to date in cloud
+                  return;
+                }
+              } catch {
+                // fall through to upload
+              }
+            } else {
+              if (remote.size === file.size && remote.lastModified.getTime() >= file.mtime.getTime() - 1000) {
+                return;
+              }
+            }
           }
           await this.uploadToCloud(file.path, cloudKey);
           uploadedDataFiles++;
@@ -835,23 +894,24 @@ export class BackupManager {
       });
 
       // Issue 2: Propagate deletes to cloud — remove remote documents not present in local files
-      const toDelete = remoteObjs.filter(o =>
-        o.key.endsWith('.json') &&
-        !o.key.endsWith('MANIFEST.json') &&
-        !o.key.endsWith('latest.json') &&
-        !o.key.endsWith('index.json') &&
-        !o.key.endsWith('backup-metadata.json') &&
-        !o.key.includes('/wal/') &&
-        !localCloudKeys.has(o.key)
-      );
-      if (toDelete.length > 0) {
-        await pooledMap(toDelete, 16, async (o) => {
-          try {
-            await this.deleteObject(o.key);
-          } catch (error) {
-            errors.push(`delete:${o.key}:${error instanceof Error ? error.message : 'Unknown error'}`);
-          }
+      // In lazy-hydration mode (pruneDeleted === false), cold files are not local; skip deletion.
+      if (this.config.pruneDeleted !== false) {
+        const toDelete = remoteObjs.filter(o => {
+          if (!o.key.endsWith('.json') || o.key.endsWith('.deleted')) return false;
+          if (o.key.endsWith('MANIFEST.json') || o.key.endsWith('latest.json') || o.key.endsWith('index.json') || o.key.endsWith('backup-metadata.json')) return false;
+          const rel = o.key.slice(remotePrefix.length);
+          if (rel.includes('/')) return false;
+          return !localCloudKeys.has(o.key);
         });
+        if (toDelete.length > 0) {
+          await pooledMap(toDelete, 16, async (o) => {
+            try {
+              await this.deleteObject(o.key);
+            } catch (error) {
+              errors.push(`delete:${o.key}:${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+          });
+        }
       }
 
       // 2) Stream WAL archive segments the caller wants persisted.
@@ -996,13 +1056,24 @@ export class BackupManager {
     return keys;
   }
 
-  private async listPrefixWithMeta(prefix: string): Promise<Array<{ key: string; size: number; lastModified: Date }>> {
+  private async listPrefixWithMeta(prefix: string): Promise<Array<{ key: string; size: number; lastModified: Date; eTag?: string }>> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
-    const out: Array<{ key: string; size: number; lastModified: Date }> = [];
+    const out: Array<{ key: string; size: number; lastModified: Date; eTag?: string }> = [];
     let token: string | undefined;
     do {
       const resp = await this.s3Client.send(new ListObjectsV2Command({ Bucket: this.config.cloudStorage.bucket, Prefix: prefix, ContinuationToken: token }));
-      if (resp.Contents) for (const o of resp.Contents) if (o.Key) out.push({ key: o.Key, size: o.Size ?? 0, lastModified: o.LastModified ?? new Date(0) });
+      if (resp.Contents) {
+        for (const o of resp.Contents) {
+          if (o.Key) {
+            out.push({
+              key: o.Key,
+              size: o.Size ?? 0,
+              lastModified: o.LastModified ?? new Date(0),
+              eTag: (o.ETag || '').replace(/"/g, '')
+            });
+          }
+        }
+      }
       token = resp.IsTruncated ? resp.NextContinuationToken : undefined;
     } while (token);
     return out;
@@ -1119,7 +1190,9 @@ export class BackupManager {
     // content AND the replay filter — silent stale-data loss.
     const ckptLsn = engine.getWAL().getCurrentLSN();
     // (2) Flush committed data so the files we read reflect all commits ≤ ckptLsn.
-    engine.flushCommittedBuffer();
+    // Must force-flush synchronously so all entries ≤ ckptLsn are durably on disk
+    // before existsSync / readFileSync are called below (avoids false .deleted tombstones).
+    engine.flushCommittedBuffer(true);
     const posixRel = (p: string) => relative(this.dbPath, p).split(sep).join('/');
     const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number }>(latestKey);
     if (!latest) {

@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
@@ -176,6 +176,24 @@ export class DataRecovery {
                 return null;
             }
             throw new Error(`Failed to recover file from cloud: ${error?.message || 'Unknown error'}`);
+        }
+    }
+
+    /**
+     * Delete a single document file from cloud storage.
+     * Used to propagate deletes in lazy-hydration mode.
+     */
+    async deleteFromCloud(key: string): Promise<void> {
+        if (!this.s3Client || !this.config.cloudStorage) return;
+        try {
+            const cloudKey = this.getCloudKey(`${key}.json`);
+            await this.s3Client.send(new DeleteObjectCommand({
+                Bucket: this.config.cloudStorage.bucket,
+                Key: cloudKey
+            }));
+        } catch (e: any) {
+            if (this.isNotFound(e)) return;
+            throw e;
         }
     }
 
@@ -373,45 +391,27 @@ export class DataRecovery {
                 return [];
             }
 
-            // Filter for JSON files and extract keys (excluding metadata manifests, internal files, dotfiles)
-            let files = objects
-                .filter((obj: any) =>
-                    obj.Key &&
-                    obj.Key.endsWith('.json') &&
-                    !obj.Key.endsWith('MANIFEST.json') &&
-                    !obj.Key.endsWith('latest.json') &&
-                    !obj.Key.endsWith('index.json') &&
-                    !obj.Key.endsWith('backup-metadata.json') &&
-                    !obj.Key.endsWith('-metadata.json') &&
-                    !obj.Key.split('/').pop()!.startsWith('.')
-                )
+            // Filter for JSON files and extract keys (excluding metadata manifests, internal files, dotfiles, and internal folders like wal/ or nodes/)
+            const files = objects
+                .filter((obj: any) => {
+                    if (!obj.Key || !obj.Key.endsWith('.json') || obj.Key.endsWith('.deleted')) return false;
+                    if (
+                        obj.Key.endsWith('MANIFEST.json') ||
+                        obj.Key.endsWith('latest.json') ||
+                        obj.Key.endsWith('index.json') ||
+                        obj.Key.endsWith('backup-metadata.json') ||
+                        obj.Key.endsWith('-metadata.json') ||
+                        obj.Key.includes('/wal/') ||
+                        obj.Key.includes('/nodes/')
+                    ) return false;
+                    const filename = obj.Key.split('/').pop()!;
+                    return !filename.startsWith('.');
+                })
                 .map((obj: any) => {
                     const filename = obj.Key!.split('/').pop()!;
                     return filename.replace(/\.json$/, '');
                 })
                 .filter(Boolean);
-
-            // If a snapshot MANIFEST.json exists, use it as the source of truth for valid snapshot keys
-            const manifestObj = objects.find((o: any) => o.Key && o.Key.endsWith('MANIFEST.json'));
-            if (manifestObj) {
-                try {
-                    const resp: any = await this.s3Client.send(new GetObjectCommand({
-                        Bucket: this.config.cloudStorage.bucket,
-                        Key: manifestObj.Key
-                    }));
-                    if (resp.Body) {
-                        const chunks: Buffer[] = [];
-                        for await (const chunk of resp.Body as any) chunks.push(Buffer.from(chunk));
-                        const manifest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-                        if (Array.isArray(manifest.dataFiles)) {
-                            const manifestKeySet = new Set(manifest.dataFiles.map((f: string) => f.replace(/\.json$/, '')));
-                            files = files.filter(k => manifestKeySet.has(k));
-                        }
-                    }
-                } catch {
-                    // Fall back to object list if manifest cannot be read
-                }
-            }
 
             return files;
         } catch (error) {

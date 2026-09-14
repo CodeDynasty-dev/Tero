@@ -106,7 +106,7 @@ function validateDirectory(raw: string): string {
 interface TeroConfig {
   directory?: string;
   cacheSize?: number;
-  /** Max committedBuffer entries flushed to disk per tick (prevents event loop stalls). Default: 256. */
+  /** Max committedBuffer entries flushed to disk per tick (prevents event loop stalls). Default: 1000. */
   checkpointBatchSize?: number;
   /**
    * Durability / throughput trade-off knob (like SQLite's `PRAGMA synchronous`):
@@ -968,6 +968,12 @@ export class Tero {
       await this.commit(transactionId);
       this.knownKeys.delete(key);
       this.missingKeys.set(key, true);
+
+      if (this.dataRecovery && this.hydrateMode === 'lazy') {
+        try {
+          await this.dataRecovery.deleteFromCloud(key);
+        } catch { }
+      }
     } catch (error) {
       await this.rollback(transactionId);
       throw error;
@@ -1157,7 +1163,11 @@ export class Tero {
 
   configureBackup(config: BackupConfig): void {
     try {
-      this.backupManager = new BackupManager(this.teroDirectory, config);
+      const effectiveConfig = { ...config };
+      if (this.hydrateMode === 'lazy' && effectiveConfig.pruneDeleted === undefined) {
+        effectiveConfig.pruneDeleted = false;
+      }
+      this.backupManager = new BackupManager(this.teroDirectory, effectiveConfig);
     } catch (error) {
       throw new Error(`Failed to configure backup: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -1173,7 +1183,7 @@ export class Tero {
       throw new Error('Backup not configured. Call configureBackup() first.');
     }
     // Force-flush committedBuffer to data files so the backup sees the latest state.
-    this.acidEngine.flushCommittedBuffer();
+    this.acidEngine.flushCommittedBuffer(true);
     this.acidEngine.forceCheckpoint();
     return await this.backupManager.performBackup();
   }
@@ -1222,7 +1232,7 @@ export class Tero {
       throw new Error('Backup not configured. Call configureBackup() first.');
     }
     // Force-flush committedBuffer to data files so the backup sees the latest state.
-    this.acidEngine.flushCommittedBuffer();
+    this.acidEngine.flushCommittedBuffer(true);
     this.acidEngine.forceCheckpoint();
     const walArchivePaths = this.acidEngine.getWAL().listArchives();
     return await this.backupManager.backupToBucket({
@@ -1498,7 +1508,7 @@ export class Tero {
     healthy: boolean;
   }> {
     // Force-flush committedBuffer so the scan sees all committed data on disk.
-    this.acidEngine.flushCommittedBuffer();
+    this.acidEngine.flushCommittedBuffer(true);
 
     const result = {
       totalFiles: 0,

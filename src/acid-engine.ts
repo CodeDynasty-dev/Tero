@@ -1631,8 +1631,8 @@ export class ACIDStorageEngine {
             this.dataFlushTimer = undefined;
         }
 
-        // Final flush of any unflushed committed data
-        this.flushCommittedBuffer();
+        // Final flush of any unflushed committed data (force=true: drain entire buffer before teardown)
+        this.flushCommittedBuffer(true);
 
         // Clean up memory
         this.activeTransactions.clear();
