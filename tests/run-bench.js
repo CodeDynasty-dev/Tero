@@ -355,7 +355,12 @@ async function runBenchmarks() {
     for (const count of recoveryCounts) {
         const recoveryDir = `RecoveryBench_${count}`;
         if (existsSync(recoveryDir)) rmSync(recoveryDir, { recursive: true, force: true });
-        const rdb = new Tero({ directory: recoveryDir, cacheSize: 100 });
+        // NOTE: must use the SAME synchronous mode as the rest of the benchmark.
+        // Omitting it defaulted to 'full' (fsync-per-file during redo), which made
+        // the recovery suite measure full-durability cold start instead of the
+        // requested normal-mode group-commit path (100 docs: ~4.5s vs ~0.06s).
+        const recoveryCfg = { directory: recoveryDir, cacheSize: 100, synchronous: SYNCHRONOUS };
+        const rdb = new Tero(recoveryCfg);
         // Batch seed for speed
         for (let b = 0; b < count; b += 100) {
             const batch = [];
@@ -368,7 +373,7 @@ async function runBenchmarks() {
 
         // Now measure cold-start time (constructor runs crash recovery)
         const start = hrtime.bigint();
-        const freshDb = new Tero({ directory: recoveryDir, cacheSize: 100 });
+        const freshDb = new Tero(recoveryCfg);
         const ms = nanosToMs(hrtime.bigint() - start);
 
         suites.recovery[count] = { docCount: count, recoveryMs: ms };
