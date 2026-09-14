@@ -141,15 +141,20 @@ interface TeroConfig {
 
 interface HydrateConfig {
   cloudStorage: CloudStorageConfig;
-  /** 'all' overwrites local files from the bucket; 'missing' (default) only pulls files absent
-   *  locally; 'snapshot' downloads the most recent tar.gz archive first then falls back
-   *  to individual files. Snapshot mode is the Google-recommended approach — one bulk
-   *  download vs thousands of individual S3 GETs. */
-  mode?: 'all' | 'missing' | 'snapshot';
+  /**
+   * Hydration mode:
+   *   - 'gradual' | 'lazy' (default): downloads ZERO files on startup for instant boot.
+   *     Files are hydrated gradually on-demand as they are requested.
+   *   - 'eager': bulk downloads files during Tero.create() before engine init.
+   *   - 'all' | 'missing' | 'snapshot': legacy mode aliases.
+   */
+  mode?: 'gradual' | 'lazy' | 'all' | 'missing' | 'snapshot' | 'eager';
   /** Continue when a single file fails to download (default true). */
   continueOnError?: boolean;
   /** Maximum time to wait for hydration before attempting engine init (ms). */
   timeout?: number;
+  /** Optional custom S3 client for mocking/testing */
+  customS3Client?: any;
 }
 
 interface TransactionOptions {
@@ -420,12 +425,19 @@ export class Tero {
         this.enableLiveBackup(config.liveBackup);
       }
 
-      // Tiered storage: initialize manager if enabled
-      if (config?.tieredStorage?.enabled) {
-        this.tieredStorageConfig = config.tieredStorage;
+      // Tiered storage / gradual hydration: initialize manager if enabled or if hydrateOnStartup is configured
+      const tieredConfig = config?.tieredStorage ?? (config?.hydrateOnStartup ? {
+        enabled: true,
+        cloudStorage: config.hydrateOnStartup.cloudStorage,
+        autoHydrateOnRead: true,
+        customS3Client: (config.hydrateOnStartup as any).customS3Client,
+      } : undefined);
+
+      if (tieredConfig?.enabled) {
+        this.tieredStorageConfig = tieredConfig;
         this.tieredStorageManager = new TieredStorageManager({
           dbPath: this.teroDirectory,
-          config: config.tieredStorage,
+          config: tieredConfig,
           acidEngine: this.acidEngine,
           onEvictKey: (key: string) => {
             this.cache.delete(key);
@@ -439,86 +451,75 @@ export class Tero {
   }
 
   /**
-   * v2 async factory. Same as `new Tero(config)` but runs hydrate-on-startup BEFORE
-   * the ACID engine is constructed. Use this when `config.hydrateOnStartup` is set
-   * so missing/all local files are restored from the client's bucket first.
+   * v2 async factory. Instant startup: downloads NO files on startup.
+   * Hydration is gradual on-demand via tiered read-through as files are requested.
    */
   static async create(config?: TeroConfig): Promise<Tero> {
-    const hydrate = config?.hydrateOnStartup;
-    if (!hydrate) {
-      return new Tero(config);
-    }
-
-    // Ensure directory exists first so DataRecovery can stream into it.
-    // MUST use validateDirectory() — the same validation the constructor
-    // applies. The old strip-regex diverged ('my db' hydrated into 'mydb'
-    // while `new Tero` resolved the real path below), causing split-brain
-    // directories where hydrated data became invisible to the engine.
     const rawDirectory = config?.directory || 'TeroDB';
     const teroDirectory = validateDirectory(rawDirectory);
     if (!existsSync(teroDirectory)) {
       mkdirSync(teroDirectory, { recursive: true });
     }
 
-    // Pre-engine hydration: pull files from the client's bucket before engine init,
-    // so crash recovery (which runs inside the ACIDStorageEngine constructor) sees
-    // the latest durable state instead of an empty local directory.
-    const recovery = new DataRecovery({
-      cloudStorage: hydrate.cloudStorage,
-      localPath: teroDirectory,
-      mode: hydrate.mode === 'all' ? 'all' : 'missing',
-      continueOnError: hydrate.continueOnError ?? true,
-    });
+    const hydrate = config?.hydrateOnStartup;
 
-    let hydrateCancelled = false;
-    const hydrateWork = async (): Promise<void> => {
-      try {
-        const mode = hydrate.mode ?? 'missing';
-        if (hydrateCancelled) return;
-        if (mode === 'all') {
-          const r = await recovery.recoverIndividualFiles(undefined, () => hydrateCancelled);
-          if (!r.success && r.failed.length > 0) { /* continue */ }
-        } else if (mode === 'snapshot') {
+    // Gradual hydration (instant startup, zero files downloaded) is the default:
+    // Files are hydrated lazily via read-through as they are requested.
+    // Only if the caller explicitly requests eager bulk pre-download ('eager')
+    // does it execute bulk recovery before returning.
+    if (hydrate && hydrate.mode === 'eager') {
+      const recovery = new DataRecovery({
+        cloudStorage: hydrate.cloudStorage,
+        localPath: teroDirectory,
+        mode: 'missing',
+        continueOnError: hydrate.continueOnError ?? true,
+      });
+
+      let hydrateCancelled = false;
+      const hydrateWork = async (): Promise<void> => {
+        try {
           if (hydrateCancelled) return;
-          try {
-            const snapshotResult = await recovery.recoverFromArchive();
-            if (hydrateCancelled) return;
-            if (!snapshotResult.success) {
-              if (hydrateCancelled) return;
-              const r = await recovery.recoverMissingFiles(() => hydrateCancelled);
-              if (!r.success && r.failed.length > 0) { /* continue */ }
-            }
-          } catch {
-            if (hydrateCancelled) return;
-            const r = await recovery.recoverMissingFiles(() => hydrateCancelled);
-            if (!r.success && r.failed.length > 0) { /* continue */ }
-          }
-        } else {
-          const r = await recovery.recoverMissingFiles(() => hydrateCancelled);
-          if (!r.success && r.failed.length > 0) { /* continue */ }
+          await recovery.recoverMissingFiles(() => hydrateCancelled);
+        } catch {
+          // Hydration errors are non-fatal
         }
-      } catch (error) {
-        // Hydration errors are non-fatal; engine init proceeds with whatever local data exists.
+      };
+      const timeoutMs = hydrate.timeout;
+      if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+        await Promise.race([
+          hydrateWork(),
+          new Promise<void>((resolve) => {
+            const t = setTimeout(() => { hydrateCancelled = true; resolve(); }, timeoutMs);
+            (t as any).unref?.();
+          }),
+        ]);
+      } else {
+        await hydrateWork();
       }
-    };
-    const timeoutMs = hydrate.timeout;
-    if (typeof timeoutMs === 'number' && timeoutMs > 0) {
-      await Promise.race([
-        hydrateWork(),
-        new Promise<void>((resolve) => { const t = setTimeout(() => { hydrateCancelled = true; resolve(); }, timeoutMs); (t as any).unref?.(); }),
-      ]);
-    } else {
-      await hydrateWork();
     }
 
-    // Now construct the engine in the usual way — it sees current local state and
-    // runs crash recovery against the WAL for any writes between the last snapshot
-    // and the crash.
-    const instance = new Tero(config);
+    // Automatically configure tiered storage with the bucket credentials from hydrateOnStartup
+    // if not explicitly defined, ensuring gradual on-demand hydration on read.
+    const effectiveConfig: TeroConfig = {
+      ...config,
+      tieredStorage: config?.tieredStorage ?? (hydrate ? {
+        enabled: true,
+        cloudStorage: hydrate.cloudStorage,
+        autoHydrateOnRead: true,
+        customS3Client: (hydrate as any).customS3Client,
+      } : undefined)
+    };
 
-    // Keep the recovery client wired so that runtime `getWithRecovery` / `existsWithCloudCheck`
-    // can fall back to the same client bucket with no extra configuration.
-    (instance as any).dataRecovery = recovery;
+    const instance = new Tero(effectiveConfig);
+
+    if (hydrate) {
+      (instance as any).dataRecovery = new DataRecovery({
+        cloudStorage: hydrate.cloudStorage,
+        localPath: teroDirectory,
+        continueOnError: hydrate.continueOnError ?? true,
+      });
+    }
+
     return instance;
   }
 

@@ -479,6 +479,69 @@ async function runTieredTests() {
         await db.destroyAsync();
     });
 
+    // ─────────────────────────────────────────────────────────────────
+    // Test 9: Instant Startup with Zero Downloads (Gradual On-Demand Hydration)
+    // ─────────────────────────────────────────────────────────────────
+    await test('Instant Startup: Tero.create downloads NO files on startup, hydrating gradually on demand', async () => {
+        cleanup();
+        const mockS3 = new MockS3Client();
+
+        // Seed 5 documents in cloud storage
+        for (let i = 1; i <= 5; i++) {
+            mockS3.store.set(`tero-backups/TieredTestDB-9/doc_${i}.json`, {
+                body: JSON.stringify({ id: `doc_${i}`, content: `Hello ${i}` }),
+                contentType: 'application/json',
+            });
+        }
+
+        const startBoot = Date.now();
+        // Boot database using Tero.create with hydrateOnStartup
+        const db = await Tero.create({
+            directory: TEST_DIR,
+            hydrateOnStartup: {
+                cloudStorage: {
+                    provider: 'aws-s3',
+                    bucket: 'test-bucket',
+                    region: 'us-east-1',
+                    accessKeyId: 'mock',
+                    secretAccessKey: 'mock',
+                    dbName: 'TieredTestDB-9',
+                },
+                customS3Client: mockS3,
+                mode: 'gradual', // or default
+            },
+        });
+        const bootTimeMs = Date.now() - startBoot;
+
+        // Startup must be instant and download ZERO files
+        assert(bootTimeMs < 100, `startup took ${bootTimeMs}ms, expected instant (<100ms)`);
+        assert(mockS3.getCalls === 0, `expected 0 S3 get calls on startup, got ${mockS3.getCalls}`);
+
+        // Initially, zero files are in tiered storage local files count
+        const initialStats = db.getTieredStorageStats();
+        assert(initialStats.localFilesCount === 0, `expected 0 local files at boot, got ${initialStats.localFilesCount}`);
+
+        // Gradual Hydration: Request doc_1
+        const doc1 = await db.get('doc_1');
+        assert(doc1 !== null, 'doc_1 should be hydrated');
+        assert(doc1.id === 'doc_1', 'doc_1 content should match');
+        assert(mockS3.getCalls === 1, `expected 1 getCall after requesting doc_1, got ${mockS3.getCalls}`);
+
+        // Unrequested docs (doc_2 to doc_5) must NOT have been downloaded
+        const afterDoc1Stats = db.getTieredStorageStats();
+        assert(afterDoc1Stats.localFilesCount === 1, `only requested doc should be local, got ${afterDoc1Stats.localFilesCount}`);
+
+        // Request doc_3
+        const doc3 = await db.get('doc_3');
+        assert(doc3.id === 'doc_3', 'doc_3 content should match');
+        assert(mockS3.getCalls === 2, `expected 2 getCalls after requesting doc_3, got ${mockS3.getCalls}`);
+
+        const afterDoc3Stats = db.getTieredStorageStats();
+        assert(afterDoc3Stats.localFilesCount === 2, `expected 2 local files, got ${afterDoc3Stats.localFilesCount}`);
+
+        await db.close();
+    });
+
     cleanup();
 
     console.log(`\n========================================`);
