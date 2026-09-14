@@ -21,6 +21,10 @@
     "./recovery": {
       "types": "./dist/recovery.d.ts",
       "import": "./dist/recovery.js"
+    },
+    "./tiered-storage": {
+      "types": "./dist/tiered-storage.d.ts",
+      "import": "./dist/tiered-storage.js"
     }
   },
   "repository": {
@@ -40,6 +44,7 @@
     "dev": "tsc --watch",
     "test": "node run-tests.js",
     "test:production": "node tests/prod-test-suite.js",
+    "test:tiered": "node tests/tiered-storage.test.js",
     "test:s3": "node tests/s3-live-backup-test.js",
     "test:all": "npm run test && npm run test:production",
     "test:watch": "npm run test",

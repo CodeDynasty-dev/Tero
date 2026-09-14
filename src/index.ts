@@ -4,6 +4,7 @@ import { resolve as pathResolve, relative as pathRelative } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
+import { TieredStorageManager, TieredStorageConfig, TieredStorageStats } from "./tiered-storage.js";
 import QuickLRU from "quick-lru";
 
 /**
@@ -134,6 +135,8 @@ interface TeroConfig {
    * true in production; default false for backwards compatibility.
    */
   fileLock?: boolean;
+  /** Tiered storage: bucket is authoritative store, local disk is working set cache. */
+  tieredStorage?: TieredStorageConfig;
 }
 
 interface HydrateConfig {
@@ -328,6 +331,8 @@ export class Tero {
   private acidEngine: ACIDStorageEngine;
   private backupManager?: BackupManager;
   private dataRecovery?: DataRecovery;
+  private tieredStorageManager?: TieredStorageManager;
+  private tieredStorageConfig?: TieredStorageConfig;
   private committedCount: number = 0;
   private rolledBackCount: number = 0;
 
@@ -413,6 +418,20 @@ export class Tero {
           throw new Error('config.liveBackup requires config.backup with cloudStorage configured.');
         }
         this.enableLiveBackup(config.liveBackup);
+      }
+
+      // Tiered storage: initialize manager if enabled
+      if (config?.tieredStorage?.enabled) {
+        this.tieredStorageConfig = config.tieredStorage;
+        this.tieredStorageManager = new TieredStorageManager({
+          dbPath: this.teroDirectory,
+          config: config.tieredStorage,
+          acidEngine: this.acidEngine,
+          onEvictKey: (key: string) => {
+            this.cache.delete(key);
+            this.knownKeys.delete(key);
+          }
+        });
       }
     } catch (error) {
       throw new Error(`Failed to initialize Tero: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
@@ -644,7 +663,17 @@ export class Tero {
       }
       // Check cache for beforeImage so engine doesn't need disk I/O on hot writes
       const cachedEntry = this.cache.get(key);
-      const cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) ? cachedEntry.data : undefined;
+      let cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) ? cachedEntry.data : undefined;
+
+      // Tiered storage: if updating an evicted document, read-through to preserve existing fields in deepMerge
+      if (cachedData === undefined && this.tieredStorageManager &&
+          this.acidEngine.getCommittedData(key) === undefined &&
+          !existsSync(this.keyToPath(key))) {
+        const cloudData = await this.tieredStorageManager.fetchFromCloud(key);
+        if (cloudData !== null && cloudData !== undefined) {
+          cachedData = cloudData;
+        }
+      }
 
       // Engine write — returns void (sync fast path) or Promise (contended lock)
       const writeResult = this.acidEngine.write(txId, key, data, cachedData);
@@ -685,7 +714,12 @@ export class Tero {
 
       // Read from ACID engine — returns data (sync fast path) or Promise (contended lock)
       const readResult = this.acidEngine.read(txId, key);
-      const data = (readResult !== undefined && readResult instanceof Promise) ? await readResult : readResult;
+      let data = (readResult !== undefined && readResult instanceof Promise) ? await readResult : readResult;
+
+      // Tiered storage: read-through on cache/disk miss
+      if ((data === null || data === undefined) && this.tieredStorageManager) {
+        data = await this.tieredStorageManager.fetchFromCloud(key);
+      }
 
       if (data !== null && data !== undefined) {
         this.updateCache(key, data, txId);
@@ -717,8 +751,14 @@ export class Tero {
           if (entry && (entry as any).transactionId === txId) {
             (entry as any).transactionId = undefined;
           }
+          if (this.tieredStorageManager) {
+            this.tieredStorageManager.markDirty(key);
+          }
         }
         this.txTouchedKeys.delete(txId);
+        if (this.tieredStorageManager && this.tieredStorageConfig?.writeThrough) {
+          await this.tieredStorageManager.syncToCloud();
+        }
       }
       this.committedCount++;
     } catch (error) {
@@ -792,6 +832,14 @@ export class Tero {
         this.knownKeys.set(key, true); // re-pin; existed all along
         await this.rollback(transactionId);
         return false;
+      } else if (this.tieredStorageManager) {
+        // In tiered storage, check if key exists in the cloud bucket before creating
+        const cloudData = await this.tieredStorageManager.fetchFromCloud(key);
+        if (cloudData !== null && cloudData !== undefined) {
+          this.knownKeys.set(key, true);
+          await this.rollback(transactionId);
+          return false;
+        }
       }
       // Also check pendingWrites of other active tx via reading within tx
       // (write will deepMerge, but for create we need empty). The exclusive
@@ -857,12 +905,22 @@ export class Tero {
     // 3. Slow path: read directly from disk (partitioned path; atomic rename = consistent)
     const filePath = this.keyToPath(key);
     if (!existsSync(filePath)) {
+      if (this.tieredStorageManager) {
+        const cloudData = await this.tieredStorageManager.fetchFromCloud(key);
+        if (cloudData !== null && cloudData !== undefined) {
+          this.updateCache(key, cloudData, undefined);
+          return deepClone(cloudData);
+        }
+      }
       return null;
     }
 
     try {
       const content = readFileSync(filePath, 'utf-8');
       const data = content.trim() ? JSON.parse(content) : {};
+      if (this.tieredStorageManager) {
+        this.tieredStorageManager.recordAccess(key);
+      }
       this.updateCache(key, data, undefined);
       return deepClone(data);
     } catch (error) {
@@ -890,6 +948,12 @@ export class Tero {
       await this._deleteRaw(transactionId, key);
       await this.commit(transactionId);
       this.knownKeys.delete(key);
+      if (this.tieredStorageManager) {
+        this.tieredStorageManager.markDeleted(key);
+        if (this.tieredStorageConfig?.writeThrough) {
+          await this.tieredStorageManager.syncToCloud();
+        }
+      }
     } catch (error) {
       await this.rollback(transactionId);
       throw error;
@@ -1522,6 +1586,9 @@ export class Tero {
 
   // Cleanup methods
   async destroyAsync(): Promise<void> {
+    if (this.tieredStorageManager) {
+      await this.tieredStorageManager.destroy();
+    }
     if (this.backupManager) {
       await this.backupManager.drainInFlight();
       this.backupManager.destroy();
@@ -1538,6 +1605,9 @@ export class Tero {
   }
 
   destroy(): void {
+    if (this.tieredStorageManager) {
+      this.tieredStorageManager.destroy().catch(() => {});
+    }
     // Sync destroy cannot drain inflight S3 uploads (that's async) — warn if live backup has in-flight work.
     // Prefer `await db.destroyAsync()` / `await db.close()` in production when live backup is enabled.
     if (this.backupManager) {
@@ -1552,6 +1622,25 @@ export class Tero {
     }
     this.clearCache();
     this.releaseFileLock();
+  }
+
+  // Tiered Storage API
+  getTieredStorageStats(): TieredStorageStats | undefined {
+    return this.tieredStorageManager?.getStats();
+  }
+
+  async syncToCloud(): Promise<{ uploaded: number; deleted: number }> {
+    if (!this.tieredStorageManager) {
+      throw new Error('Tiered storage not configured.');
+    }
+    return await this.tieredStorageManager.syncToCloud();
+  }
+
+  evictLocalColdFiles(): number {
+    if (!this.tieredStorageManager) {
+      throw new Error('Tiered storage not configured.');
+    }
+    return this.tieredStorageManager.evictColdFiles();
   }
 
   /**
@@ -1602,4 +1691,4 @@ export class Tero {
 }
 
 // Export types for external use
-export { BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger };
+export { BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger, TieredStorageConfig, TieredStorageStats, TieredStorageManager };

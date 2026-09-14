@@ -659,6 +659,11 @@ export class LockManager {
 
         return [...new Set(suspiciousTransactions)];
     }
+
+    isKeyLocked(key: string): boolean {
+        const lockInfo = this.locks.get(key);
+        return !!(lockInfo && (lockInfo.holders.size > 0 || lockInfo.waitQueue.length > 0));
+    }
 }
 
 /**
@@ -1470,6 +1475,14 @@ export class ACIDStorageEngine {
         if (!this.committedBuffer.has(key)) return undefined;
         const committed = this.committedBuffer.get(key)!;
         return committed.op === 'write' ? committed.data : null;
+    }
+
+    isKeyLocked(key: string): boolean {
+        return this.lockManager.isKeyLocked(key);
+    }
+
+    isKeyInCommittedBuffer(key: string): boolean {
+        return this.committedBuffer.has(key);
     }
 
     /**
