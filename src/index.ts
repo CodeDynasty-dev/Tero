@@ -437,6 +437,7 @@ export class Tero {
   private keyGenerations = new Map<string, number>();
   /** Durable cloud reconciliation for deletes (P0-2) — keys needing cloud delete+tombstone, with deletion LSN */
   private cloudPendingTombstones = new Map<string, number>();
+  private cloudPendingTombstoneDeletions = new Map<string, number>();
   private cloudPendingTimer?: ReturnType<typeof setTimeout>;
   private reconciliationLocks = new Map<string, Promise<void>>();
   private reconciliationLockStorage = new AsyncLocalStorage<Set<string>>();
@@ -536,7 +537,8 @@ export class Tero {
       } catch { /* approved */ }
       // Restore pending cloud tombstones and schedule retry
       this.loadPendingCloud();
-      if (this.cloudPendingTombstones.size > 0) this.scheduleCloudRetry();
+      this.loadPendingCloudDeletions();
+      if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0) this.scheduleCloudRetry();
 
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
@@ -1040,7 +1042,15 @@ export class Tero {
                     const existsLocal2 = existsSync(this.keyToPath(key));
                     if (!existsLocal2 || committed2 === null) return;
                   }
-                  try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+                  try {
+                    await (this.dataRecovery as any).deleteTombstone?.(key);
+                    if (this.cloudPendingTombstoneDeletions.has(key)) {
+                      this.cloudPendingTombstoneDeletions.delete(key);
+                      this.savePendingCloudDeletions();
+                    }
+                  } catch {
+                    this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
+                  }
                 }
               } else {
                 // Delete — ensure tombstones for resurrection protection
@@ -1093,7 +1103,15 @@ export class Tero {
                   this.savePendingCloud();
                 }
                 if (this.dataRecovery) {
-                  try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+                  try {
+                    await (this.dataRecovery as any).deleteTombstone?.(key);
+                    if (this.cloudPendingTombstoneDeletions.has(key)) {
+                      this.cloudPendingTombstoneDeletions.delete(key);
+                      this.savePendingCloudDeletions();
+                    }
+                  } catch {
+                    this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
+                  }
                 }
               }
             }
@@ -1339,6 +1357,10 @@ export class Tero {
     return pathJoin(this.teroDirectory, '.cloud_pending.json');
   }
 
+  private pendingCloudDeletionsPath(): string {
+    return pathJoin(this.teroDirectory, '.cloud_pending_deletions.json');
+  }
+
   private loadPendingCloud(): void {
     try {
       const p = this.pendingCloudPath();
@@ -1393,6 +1415,56 @@ export class Tero {
     } catch { /* approved */ }
   }
 
+  private loadPendingCloudDeletions(): void {
+    try {
+      const p = this.pendingCloudDeletionsPath();
+      if (!existsSync(p)) return;
+      const raw = readFileSync(p, 'utf8');
+      const arr: unknown = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          if (Array.isArray(item) && typeof item[0] === 'string' && typeof item[1] === 'number') {
+            this.cloudPendingTombstoneDeletions.set(item[0], item[1]);
+          } else if (item && typeof (item as any).key === 'string' && typeof (item as any).expectedVersion === 'number') {
+            this.cloudPendingTombstoneDeletions.set((item as any).key, (item as any).expectedVersion);
+          } else if (typeof item === 'string') {
+            this.cloudPendingTombstoneDeletions.set(item, 0);
+          }
+        }
+      }
+    } catch { /* approved */ }
+  }
+
+  private savePendingCloudDeletions(): void {
+    try {
+      const p = this.pendingCloudDeletionsPath();
+      const dir = pathJoin(this.teroDirectory, '.tombstones');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      if (this.cloudPendingTombstoneDeletions.size === 0) {
+        if (existsSync(p)) unlinkSync(p);
+        return;
+      }
+      const tmp = `${p}.tmp.${process.pid}`;
+      writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()]));
+      try {
+        const fd = openSync(tmp, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      } catch {}
+      try { renameSync(tmp, p); } catch { writeFileSync(p, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()])); }
+      try {
+        const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      } catch {}
+    } catch {}
+  }
+
+  private queueCloudTombstoneDeletion(key: string, expectedVersion?: number): void {
+    const ver = expectedVersion ?? this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
+    this.cloudPendingTombstoneDeletions.set(key, ver);
+    this.savePendingCloudDeletions();
+    this.scheduleCloudRetry();
+  }
+
   private queueCloudTombstone(key: string, deletionLsn?: number): void {
     const lsn = deletionLsn ?? this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
     this.cloudPendingTombstones.set(key, lsn);
@@ -1430,9 +1502,11 @@ export class Tero {
   private scheduleCloudRetry(): void {
     if (this.cloudPendingTimer) return;
     if (!this.dataRecovery || this.hydrateMode !== 'lazy') return;
+    if (this.cloudPendingTombstones.size === 0 && this.cloudPendingTombstoneDeletions.size === 0) return;
     this.cloudPendingTimer = setTimeout(() => {
       this.cloudPendingTimer = undefined;
       void this.retryPendingCloudTombstones();
+      void this.retryPendingCloudTombstoneDeletions();
     }, 2000);
     (this.cloudPendingTimer as any).unref?.();
   }
@@ -1499,24 +1573,59 @@ export class Tero {
         }
       });
     }
-    if (this.cloudPendingTombstones.size > 0) {
+    if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0) {
+      this.scheduleCloudRetry();
+    }
+  }
+
+  private async retryPendingCloudTombstoneDeletions(): Promise<void> {
+    if (this.cloudPendingTombstoneDeletions.size === 0) return;
+    if (!this.dataRecovery) return;
+    const entries = [...this.cloudPendingTombstoneDeletions.entries()];
+    for (const [key, expectedVersion] of entries) {
+      await this.withReconciliationLock(key, async () => {
+        // Verify key is still present (recreated) before deleting tombstone
+        // If key is now deleted (hasLocalTombstone), don't delete tombstone
+        const committed = this.acidEngine.getCommittedData(key);
+        const hasLocal = this.hasLocalTombstone(key);
+        const existsLocal = existsSync(this.keyToPath(key));
+        // If key is deleted (has tombstone or committed null), don't delete cloud tombstone
+        if (hasLocal || (committed !== undefined && committed === null) || (!existsLocal && committed === undefined && this.cloudPendingTombstones.has(key))) {
+          // Key is currently deleted — cloud tombstone should remain, clear pending deletion
+          this.cloudPendingTombstoneDeletions.delete(key);
+          this.savePendingCloudDeletions();
+          return;
+        }
+        // Key is present — tombstone should be deleted
+        try {
+          await (this.dataRecovery as any).deleteTombstone?.(key);
+          this.cloudPendingTombstoneDeletions.delete(key);
+          this.savePendingCloudDeletions();
+        } catch (err) {
+          const kind = classifyRecoveryError(err);
+          if (kind === 'FATAL_AUTH') return;
+        }
+      });
+    }
+    if (this.cloudPendingTombstoneDeletions.size > 0) {
       this.scheduleCloudRetry();
     }
   }
 
   /** Whether cloud tombstone reconciliation is pending (P0-2). */
   isCloudReconciliationPending(): boolean {
-    return this.cloudPendingTombstones.size > 0;
+    return this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0;
   }
 
   /** Keys with pending cloud delete/tombstone (P0-2). */
   getCloudReconciliationPendingKeys(): string[] {
-    return [...this.cloudPendingTombstones.keys()];
+    return [...new Set([...this.cloudPendingTombstones.keys(), ...this.cloudPendingTombstoneDeletions.keys()])];
   }
 
   /** Retry pending cloud tombstones immediately (P0-2). */
   async retryCloudReconciliation(): Promise<void> {
     await this.retryPendingCloudTombstones();
+    await this.retryPendingCloudTombstoneDeletions();
   }
 
   async remove(key: string): Promise<void> {
