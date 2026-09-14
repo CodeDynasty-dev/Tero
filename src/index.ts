@@ -1,4 +1,5 @@
 import { randomBytes, createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync, renameSync } from "fs";
 import { resolve as pathResolve, relative as pathRelative, join as pathJoin } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError } from "./acid-engine.js";
@@ -438,6 +439,7 @@ export class Tero {
   private cloudPendingTombstones = new Map<string, number>();
   private cloudPendingTimer?: ReturnType<typeof setTimeout>;
   private reconciliationLocks = new Map<string, Promise<void>>();
+  private reconciliationLockStorage = new AsyncLocalStorage<Set<string>>();
 
   /**
    * Bounded LRU of known-existing keys. Replaces the unbounded Set<string>
@@ -1017,37 +1019,34 @@ export class Tero {
           // Bump generation for P0-1 in-flight hydration invalidation and P0-10 stale hydration
           this.bumpGeneration(key);
         }
-        // Handle durable tombstones for deletes/writes (P0-2) — cloud phase serialized per-key (P0 TOCTOU fix)
+        // Handle durable tombstones for deletes/writes (P0-2) — entire per-key handling serialized via reconciliation lock (P0)
         for (const key of touched) {
-          const committed = this.acidEngine.getCommittedData(key);
-          if (committed !== undefined) {
-            if (committed !== null) {
-              // Write/present — clear tombstones so re-create can succeed and hydration can fetch
-              this.deleteLocalTombstone(key);
-              if (this.cloudPendingTombstones.has(key)) {
-                this.cloudPendingTombstones.delete(key);
-                this.savePendingCloud();
-              }
-              if (this.dataRecovery) {
-                await this.withReconciliationLock(key, async () => {
-                  // Re-check still present before deleting tombstone (race with concurrent delete)
+          await this.withReconciliationLock(key, async () => {
+            const committed = this.acidEngine.getCommittedData(key);
+            if (committed !== undefined) {
+              if (committed !== null) {
+                // Write/present — clear tombstones so re-create can succeed and hydration can fetch
+                this.deleteLocalTombstone(key);
+                if (this.cloudPendingTombstones.has(key)) {
+                  this.cloudPendingTombstones.delete(key);
+                  this.savePendingCloud();
+                }
+                if (this.dataRecovery) {
+                  // Re-check still present before deleting cloud tombstone
                   const committed2 = this.acidEngine.getCommittedData(key);
                   const hasLocal2 = this.hasLocalTombstone(key);
                   if (committed2 !== undefined && committed2 === null) return;
                   if (hasLocal2) {
-                    // Local tombstone exists — key is still deleted, don't clear cloud tombstone
                     const existsLocal2 = existsSync(this.keyToPath(key));
                     if (!existsLocal2 || committed2 === null) return;
                   }
                   try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
-                });
-              }
-            } else {
-              // Delete — ensure tombstones for resurrection protection
-              this.writeLocalTombstone(key);
-              if (this.dataRecovery && this.hydrateMode === 'lazy') {
-                await this.withReconciliationLock(key, async () => {
-                  // Re-check still deleted before cloud mutation (TOCTOU fix)
+                }
+              } else {
+                // Delete — ensure tombstones for resurrection protection
+                this.writeLocalTombstone(key);
+                if (this.dataRecovery && this.hydrateMode === 'lazy') {
+                  // Re-check still deleted before cloud mutation (now inside same lock as state change)
                   const committed2 = this.acidEngine.getCommittedData(key);
                   const hasLocal2 = this.hasLocalTombstone(key);
                   const existsLocal2 = existsSync(this.keyToPath(key));
@@ -1059,24 +1058,21 @@ export class Tero {
                   }
                   let failed = false;
                   try { await this.dataRecovery!.deleteFromCloud(key); } catch { failed = true; }
-                  try { await (this.dataRecovery as any)!.putTombstone?.(key, this.acidEngine!.getLastCommittedLSN()); } catch { failed = true; }
+                  try { await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine!.getLastCommittedLSN()); } catch { failed = true; }
                   if (failed) this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN());
                   else if (this.cloudPendingTombstones.has(key)) {
                     this.cloudPendingTombstones.delete(key);
                     this.savePendingCloud();
                   }
-                });
+                }
               }
-            }
-          } else {
-            // Fallback: if no committed entry but key was in touched (e.g., already flushed),
-            // check local file existence to infer delete vs write
-            if (!existsSync(this.keyToPath(key))) {
-              // likely deleted — ensure tombstone
-              this.writeLocalTombstone(key);
-              if (this.dataRecovery && this.hydrateMode === 'lazy' && !this.cloudPendingTombstones.has(key)) {
-                await this.withReconciliationLock(key, async () => {
-                  // Re-check
+            } else {
+              // Fallback: if no committed entry but key was in touched (e.g., already flushed),
+              // check local file existence to infer delete vs write
+              if (!existsSync(this.keyToPath(key))) {
+                // likely deleted — ensure tombstone
+                this.writeLocalTombstone(key);
+                if (this.dataRecovery && this.hydrateMode === 'lazy' && !this.cloudPendingTombstones.has(key)) {
                   const committed2 = this.acidEngine.getCommittedData(key);
                   const hasLocal2 = this.hasLocalTombstone(key);
                   const existsLocal2 = existsSync(this.keyToPath(key));
@@ -1087,25 +1083,23 @@ export class Tero {
                     return;
                   }
                   try {
-                    await (this.dataRecovery as any)!.putTombstone?.(key, this.acidEngine!.getLastCommittedLSN());
+                    await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine!.getLastCommittedLSN());
                   } catch { this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN()); }
-                });
-              }
-            } else {
-              this.deleteLocalTombstone(key);
-              if (this.cloudPendingTombstones.has(key)) {
-                this.cloudPendingTombstones.delete(key);
-                this.savePendingCloud();
-              }
-              if (this.dataRecovery) {
-                await this.withReconciliationLock(key, async () => {
+                }
+              } else {
+                this.deleteLocalTombstone(key);
+                if (this.cloudPendingTombstones.has(key)) {
+                  this.cloudPendingTombstones.delete(key);
+                  this.savePendingCloud();
+                }
+                if (this.dataRecovery) {
                   try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
-                });
+                }
               }
             }
-          }
+          });
         }
-        this.txTouchedKeys.delete(txId);
+                this.txTouchedKeys.delete(txId);
       }
       this.committedCount++;
     } catch (error) {
@@ -1152,65 +1146,65 @@ export class Tero {
   // Convenience Methods (Auto-transaction)
   async create(key: string, initialData?: any): Promise<boolean> {
     this.validateKey(key);
+    return this.withReconciliationLock(key, async () => {
+      const transactionId = this._beginTransaction();
+      try {
+        // Serialize existence check under an exclusive lock — two concurrent
+        // create('sameKey') must not both succeed (TOCTOU). Acquire exclusive
+        // first, then check committed state under that lock.
+        const lockRes = this.acidEngine.acquireExclusiveLock(transactionId, key);
+        if (lockRes instanceof Promise) await lockRes;
 
-    const transactionId = this._beginTransaction();
-
-    try {
-      // Serialize existence check under an exclusive lock — two concurrent
-      // create('sameKey') must not both succeed (TOCTOU). Acquire exclusive
-      // first, then check committed state under that lock.
-      const lockRes = this.acidEngine.acquireExclusiveLock(transactionId, key);
-      if (lockRes instanceof Promise) await lockRes;
-
-      // Check existence while holding the lock (covers knownKeys, committedBuffer, disk)
-      if (this.knownKeys.has(key)) {
-        await this.rollback(transactionId);
-        return false; // already exists
-      }
-      const pending = this.acidEngine.getCommittedData(key);
-      if (pending !== undefined) {
-        if (pending !== null) {
-          this.knownKeys.set(key, true);
+        // Check existence while holding the lock (covers knownKeys, committedBuffer, disk)
+        if (this.knownKeys.has(key)) {
           await this.rollback(transactionId);
-          return false; // duplicate — already committed, not yet flushed
+          return false; // already exists
         }
-        // tombstone → logically absent, fall through to allow re-create
-      } else if (existsSync(this.keyToPath(key))) {
-        this.knownKeys.set(key, true); // re-pin; existed all along
-        await this.rollback(transactionId);
-        return false;
-      } else if (this.dataRecovery && this.hydrateMode === 'lazy') {
-        if (!this.missingKeys.has(key)) {
-          // Check tombstone first — if tombstoned, allow re-create even if .json still exists due to failed delete
-          let hasTomb = false;
-          if (typeof (this.dataRecovery as any).hasTombstone === 'function') {
-            hasTomb = await (this.dataRecovery as any).hasTombstone(key);
+        const pending = this.acidEngine.getCommittedData(key);
+        if (pending !== undefined) {
+          if (pending !== null) {
+            this.knownKeys.set(key, true);
+            await this.rollback(transactionId);
+            return false; // duplicate — already committed, not yet flushed
           }
-          if (!hasTomb) {
-            const info = await this.dataRecovery.checkFileInCloud(key);
-            if (info.exists) {
-              this.knownKeys.set(key, true);
-              await this.rollback(transactionId);
-              return false;
+          // tombstone → logically absent, fall through to allow re-create
+        } else if (existsSync(this.keyToPath(key))) {
+          this.knownKeys.set(key, true); // re-pin; existed all along
+          await this.rollback(transactionId);
+          return false;
+        } else if (this.dataRecovery && this.hydrateMode === 'lazy') {
+          if (!this.missingKeys.has(key)) {
+            // Check tombstone first — if tombstoned, allow re-create even if .json still exists due to failed delete
+            let hasTomb = false;
+            if (typeof (this.dataRecovery as any).hasTombstone === 'function') {
+              hasTomb = await (this.dataRecovery as any).hasTombstone(key);
             }
+            if (!hasTomb) {
+              const info = await this.dataRecovery.checkFileInCloud(key);
+              if (info.exists) {
+                this.knownKeys.set(key, true);
+                await this.rollback(transactionId);
+                return false;
+              }
+            }
+            this.missingKeys.set(key, true);
           }
-          this.missingKeys.set(key, true);
         }
+        // Also check pendingWrites of other active tx via reading within tx
+        // (write will deepMerge, but for create we need empty). The exclusive
+        // lock guarantees no other tx is writing this key concurrently.
+
+        await this.write(transactionId, key, initialData === undefined ? {} : initialData);
+        await this.commit(transactionId);
+        this.knownKeys.set(key, true);
+        this.missingKeys.delete(key);
+
+        return true;
+      } catch (error) {
+        try { await this.rollback(transactionId); } catch { }
+        throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
       }
-      // Also check pendingWrites of other active tx via reading within tx
-      // (write will deepMerge, but for create we need empty). The exclusive
-      // lock guarantees no other tx is writing this key concurrently.
-
-      await this.write(transactionId, key, initialData === undefined ? {} : initialData);
-      await this.commit(transactionId);
-      this.knownKeys.set(key, true);
-      this.missingKeys.delete(key);
-
-      return true;
-    } catch (error) {
-      try { await this.rollback(transactionId); } catch { }
-      throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
-    }
+    });
   }
 
   async update(key: string, data: any): Promise<void> {
@@ -1298,20 +1292,16 @@ export class Tero {
   }
 
   private writeLocalTombstone(key: string): void {
-    try {
-      const dir = pathJoin(this.teroDirectory, '.tombstones');
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      const p = this.localTombstonePath(key);
-      // Store LSN for version ordering
-      const lsn = this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
-      writeFileSync(p, JSON.stringify({ key, lsn, deletedAt: Date.now() }));
-      try {
-        const fd = openSync(p, 'r');
-        try { fsyncSync(fd); } finally { closeSync(fd); }
-        const dirFd = openSync(dir, 'r');
-        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-      } catch { /* approved */ }
-    } catch { /* approved */ }
+    const dir = pathJoin(this.teroDirectory, '.tombstones');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const p = this.localTombstonePath(key);
+    // Store LSN for version ordering
+    const lsn = this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
+    writeFileSync(p, JSON.stringify({ key, lsn, deletedAt: Date.now() }));
+    const fd = openSync(p, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    const dirFd = openSync(dir, 'r');
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   }
 
   private hasLocalTombstone(key: string): boolean {
@@ -1411,6 +1401,11 @@ export class Tero {
   }
 
   private async withReconciliationLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const store = this.reconciliationLockStorage.getStore();
+    if (store && store.has(key)) {
+      // Re-entrant: already holding lock for this key in current async context
+      return await fn();
+    }
     const prev = this.reconciliationLocks.get(key);
     if (prev) {
       try { await prev; } catch {}
@@ -1418,14 +1413,18 @@ export class Tero {
     let resolveLock!: () => void;
     const lockPromise = new Promise<void>((resolve) => { resolveLock = resolve; });
     this.reconciliationLocks.set(key, lockPromise);
-    try {
-      return await fn();
-    } finally {
-      resolveLock();
-      if (this.reconciliationLocks.get(key) === lockPromise) {
-        this.reconciliationLocks.delete(key);
+    const newStore = new Set<string>(store || []);
+    newStore.add(key);
+    return this.reconciliationLockStorage.run(newStore, async () => {
+      try {
+        return await fn();
+      } finally {
+        resolveLock();
+        if (this.reconciliationLocks.get(key) === lockPromise) {
+          this.reconciliationLocks.delete(key);
+        }
       }
-    }
+    });
   }
 
   private scheduleCloudRetry(): void {
@@ -1521,19 +1520,16 @@ export class Tero {
   }
 
   async remove(key: string): Promise<void> {
-    const transactionId = this._beginTransaction();
-
-    try {
-      await this._deleteRaw(transactionId, key);
-      await this.commit(transactionId);
-      this.knownKeys.delete(key);
-      this.missingKeys.set(key, true);
-      // Durable local tombstone prevents in-flight hydration resurrection (P0-1) and cross-restart resurrection (P0-2)
-      this.writeLocalTombstone(key);
-
-      if (this.dataRecovery && this.hydrateMode === 'lazy') {
-        await this.withReconciliationLock(key, async () => {
-          // Re-check still deleted before cloud mutation (TOCTOU fix)
+    return this.withReconciliationLock(key, async () => {
+      const transactionId = this._beginTransaction();
+      try {
+        await this._deleteRaw(transactionId, key);
+        await this.commit(transactionId);
+        this.knownKeys.delete(key);
+        this.missingKeys.set(key, true);
+        this.writeLocalTombstone(key);
+        if (this.dataRecovery && this.hydrateMode === 'lazy') {
+          // Already inside outer reconciliation lock — re-check still deleted before cloud mutation
           const committed = this.acidEngine.getCommittedData(key);
           const hasLocal = this.hasLocalTombstone(key);
           const existsLocal = existsSync(this.keyToPath(key));
@@ -1549,19 +1545,19 @@ export class Tero {
             await this.dataRecovery!.deleteFromCloud(key);
           } catch { failed = true; }
           try {
-            await (this.dataRecovery as any)!.putTombstone(key, lsn);
+            await (this.dataRecovery as any).putTombstone(key, lsn);
           } catch { failed = true; }
           if (failed) this.queueCloudTombstone(key, lsn);
           else if (this.cloudPendingTombstones.has(key)) {
             this.cloudPendingTombstones.delete(key);
             this.savePendingCloud();
           }
-        });
+        }
+      } catch (error) {
+        try { await this.rollback(transactionId); } catch {}
+        throw error;
       }
-    } catch (error) {
-      await this.rollback(transactionId);
-      throw error;
-    }
+    });
   }
 
   async delete(key: string): Promise<void> {
