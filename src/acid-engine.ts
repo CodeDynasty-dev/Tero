@@ -516,17 +516,19 @@ export class WriteAheadLog {
     /**
      * Returns the paths of all locally retained WAL archives (newest first).
      * Used by v2 backup to upload segments to the client's bucket.
+     * Strictly matches deterministic structured segments .wal.seg-<start>-<end>.
      */
     listArchives(): string[] {
         const dir = dirname(this.logPath);
         if (!existsSync(dir)) return [];
         const files = readdirSync(dir);
         return files
-            .filter(f => (f.startsWith('.wal.seg-') || f.startsWith('.wal.')) && f !== '.wal')
+            .filter(f => f.startsWith('.wal.seg-'))
             .map(f => {
-                const m = f.match(/\.seg-(\d+)-(\d+)$/);
-                return { path: join(dir, f), startLsn: m ? parseInt(m[1], 10) : 0 };
+                const m = f.match(/^\.wal\.seg-(\d+)-(\d+)$/);
+                return m ? { path: join(dir, f), startLsn: parseInt(m[1], 10) } : null;
             })
+            .filter((s): s is { path: string; startLsn: number } => s !== null)
             .sort((a, b) => b.startLsn - a.startLsn)
             .map(s => s.path);
     }
@@ -536,11 +538,12 @@ export class WriteAheadLog {
         if (!existsSync(dir)) return;
         const files = readdirSync(dir);
         const archiveFiles = files
-            .filter(f => (f.startsWith('.wal.seg-') || f.startsWith('.wal.')) && f !== '.wal')
+            .filter(f => f.startsWith('.wal.seg-'))
             .map(f => {
-                const m = f.match(/\.seg-(\d+)-(\d+)$/);
-                return { path: join(dir, f), startLsn: m ? parseInt(m[1], 10) : 0 };
+                const m = f.match(/^\.wal\.seg-(\d+)-(\d+)$/);
+                return m ? { path: join(dir, f), startLsn: parseInt(m[1], 10) } : null;
             })
+            .filter((s): s is { path: string; startLsn: number } => s !== null)
             .sort((a, b) => a.startLsn - b.startLsn); // oldest first
 
         while (archiveFiles.length > keepCount) {
@@ -578,16 +581,18 @@ export class WriteAheadLog {
     }
 
     /**
-     * Truncate (clear) the WAL entirely. Only safe when there are no active transactions
-     * AND all data has been durably persisted to data files (which happens during commit).
-     * In v2 this is also called after a successful bucket snapshot upload to bound growth.
+     * Truncate (clear) the WAL entirely.
+     * Force-flushes any buffered entries first, verifies buffer is drained,
+     * truncates .wal to 0 bytes, fsyncs file and directory, and cleans up archives.
      */
     truncateLog(): void {
-        this.writeBuffer.length = 0;
-        this.writeBufferSize = 0;
-        this.flushBuffer(); // flush any remaining entries (will be a no-op since buffer is empty)
+        this.forceFlush();
+        if (this.writeBuffer.length > 0) {
+            throw new Error('Cannot truncate WAL: unflushed entries in write buffer');
+        }
         writeFileSync(this.logPath, '');
-        if (this.synchronous === 'full') this.fsyncFile(this.logPath);
+        this.fsyncFile(this.logPath);
+        this.fsyncDir(dirname(this.logPath));
         this.dirty = false;
         this.cleanupOldArchives(0);
     }
@@ -2007,17 +2012,24 @@ export class ACIDStorageEngine {
 
     /**
      * Truncate WAL log with strict precondition checks.
+     * Enforces that no active transactions exist, no pending uncommitted writes exist,
+     * committedBuffer is drained, flushes committed buffer to disk, writes a CHECKPOINT,
+     * and safely truncates the WAL.
      */
     truncateLog(): void {
         if (this.activeTransactions.size > 0) {
             throw new Error(`Cannot truncate WAL: ${this.activeTransactions.size} active transactions in progress`);
         }
-        if (this.pendingWrites.size > 0) {
-            throw new Error(`Cannot truncate WAL: pending writes exist`);
+        for (const [txId, writes] of this.pendingWrites) {
+            if (writes.size > 0) {
+                throw new Error(`Cannot truncate WAL: pending writes exist for transaction ${txId}`);
+            }
         }
         if (this.committedBuffer.size > 0) {
             throw new Error(`Cannot truncate WAL: committed buffer not flushed (${this.committedBuffer.size} entries remaining)`);
         }
+        this.flushCommittedBuffer(true);
+        this.wal.forceFlush();
         this.wal.truncateLog();
     }
 

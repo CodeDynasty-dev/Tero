@@ -6,7 +6,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { CronJob } from "cron";
 import { gzipSync, gunzipSync } from "zlib";
 import { createHash, randomUUID } from "crypto";
-import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum } from "./acid-engine.js";
+import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum, streamLogFile } from "./acid-engine.js";
 
 /**
  * LSN padded to 16 digits so lexicographic object-key sort == numeric LSN sort.
@@ -14,16 +14,6 @@ import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryC
 function padLsn(lsn: number): string {
   return lsn.toString().padStart(16, '0');
 }
-
-/**
- * WAL operations that get shipped in segments. COMMIT/ROLLBACK markers are
- * ESSENTIAL: restore buffers WRITE/DELETE entries per transactionId and only
- * applies them when the transaction's COMMIT arrives (discarding on ROLLBACK).
- * Shipping data entries without commit markers would make every replayed
- * transaction uncommitted — i.e. restore would silently drop ALL WAL-shipped
- * writes. Only BEGIN and CHECKPOINT (pure metadata) are excluded.
- */
-const WAL_SHIPPED_OPS = new Set(['WRITE', 'DELETE', 'COMMIT', 'ROLLBACK']);
 
 /**
  * Bounded-concurrency mapper. Runs `fn` over `items` with at most `limit`
@@ -163,6 +153,50 @@ export interface BucketBackupResult {
   uploadedWALSegments: number;
   duration: number;
   errors: string[];
+}
+
+function durableWriteFile(destPath: string, content: Buffer | string): void {
+  const dir = dirname(destPath);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  const tmp = `${destPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    const fd = openSync(tmp, 'w');
+    try {
+      const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+      writeSync(fd, buf);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, destPath);
+    const dirFd = openSync(dir, 'r');
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+  } catch (err) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* approved: cleanup tmp */ }
+    throw err;
+  }
+}
+
+function safeUnlinkTombstone(destPath: string): void {
+  try {
+    if (existsSync(destPath)) {
+      unlinkSync(destPath);
+      const dir = dirname(destPath);
+      if (existsSync(dir)) {
+        const dirFd = openSync(dir, 'r');
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      }
+    }
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return;
+    throw err;
+  }
 }
 
 export class BackupManager {
@@ -1260,13 +1294,36 @@ export class BackupManager {
       const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
 
       let count = 0;
+      const manifestDataItems: Array<{ path: string; size: number; sha256: string; versionLsn: number }> = [];
       await pooledConsumeAsyncGen(engine.snapshotFiles(ckptLsn), 16, async (entry) => {
         if (entry.state === 'present' && entry.data !== undefined) {
           const filePath = partitionedPath(this.dbPath, entry.key);
-          await this.uploadBytes(`${dataPrefix}${posixRel(filePath)}`, Buffer.from(JSON.stringify(entry.data)), 'application/json');
+          const rel = posixRel(filePath);
+          const buf = Buffer.from(JSON.stringify(entry.data));
+          await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json');
           count++;
+          manifestDataItems.push({
+            path: rel,
+            size: buf.length,
+            sha256: createHash('sha256').update(buf).digest('hex'),
+            versionLsn: entry.lsn
+          });
         }
       });
+      manifestDataItems.sort((a, b) => a.path.localeCompare(b.path));
+      const dataManifestHash = createHash('sha256').update(JSON.stringify(manifestDataItems)).digest('hex');
+
+      const walKeys = (await this.listPrefix(`${this.livePrefix}wal/`)).sort();
+      const walItems = walKeys.map(k => {
+        const segName = basename(k);
+        const match = segName.match(/seg-(\d+)-(\d+)/);
+        return {
+          name: segName,
+          startLsn: match ? parseInt(match[1], 10) : 0,
+          endLsn: match ? parseInt(match[2], 10) : 0
+        };
+      });
+      const walManifestHash = createHash('sha256').update(JSON.stringify(walItems)).digest('hex');
 
       const manifestObj = {
         snapshotId: baseTs,
@@ -1275,8 +1332,8 @@ export class BackupManager {
         maxLsn: Math.max(ckptLsn, this.liveShipper?.status.lastShippedLsn ?? 0),
         createdAt: new Date().toISOString(),
         docCount: count,
-        dataManifestHash: `${baseTs}:${ckptLsn}:${count}`,
-        walManifestHash: `${this.liveShipper?.status.lastShippedLsn ?? 0}`,
+        dataManifestHash,
+        walManifestHash,
         lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0,
         lastCheckpointAt: new Date().toISOString()
       };
@@ -1292,26 +1349,56 @@ export class BackupManager {
       return { uploadedDocs: count, tombstonedDocs: 0, fullUpload: true, duration: Date.now() - start };
     }
     // INCREMENTAL checkpoint — upload ONLY dirty docs from versioned snapshot, tombstone deleted ones.
-    const dataPrefix = `${ckptPrefix}${latest.baseTs}/data/`;
     const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
-    let uploaded = 0, tombstoned = 0;
-    const dirtyEntries = Array.from(dirtySnapshot.values());
+    const dirtyEntries = [...dirtySnapshot.values()];
+    const dataPrefix = `${ckptPrefix}${latest.baseTs}/data/`;
+    let uploaded = 0;
+    let tombstoned = 0;
     const ackList: Array<{ key: string; lsn: number }> = [];
-
+    const manifestDataItems: Array<{ path: string; size: number; sha256: string; versionLsn: number; state: string }> = [];
     await pooledMap(dirtyEntries, 16, async (entry) => {
       const filePath = partitionedPath(this.dbPath, entry.key);
       const rel = posixRel(filePath);
       if (entry.state === 'present' && entry.data !== undefined) {
-        await this.uploadBytes(`${dataPrefix}${rel}`, Buffer.from(JSON.stringify(entry.data)), 'application/json');
+        const buf = Buffer.from(JSON.stringify(entry.data));
+        await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json');
         uploaded++;
         ackList.push({ key: entry.key, lsn: entry.lsn });
         try { await this.deleteObject(`${dataPrefix}${rel}.deleted`); } catch { /* approved: remote tombstone may not exist */ }
+        manifestDataItems.push({
+          path: rel,
+          size: buf.length,
+          sha256: createHash('sha256').update(buf).digest('hex'),
+          versionLsn: entry.lsn,
+          state: 'present'
+        });
       } else {
         await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
         tombstoned++;
         ackList.push({ key: entry.key, lsn: entry.lsn });
+        manifestDataItems.push({
+          path: rel,
+          size: 0,
+          sha256: createHash('sha256').update('').digest('hex'),
+          versionLsn: entry.lsn,
+          state: 'deleted'
+        });
       }
     });
+    manifestDataItems.sort((a, b) => a.path.localeCompare(b.path));
+    const dataManifestHash = createHash('sha256').update(JSON.stringify(manifestDataItems)).digest('hex');
+
+    const walKeys = (await this.listPrefix(`${this.livePrefix}wal/`)).sort();
+    const walItems = walKeys.map(k => {
+      const segName = basename(k);
+      const match = segName.match(/seg-(\d+)-(\d+)/);
+      return {
+        name: segName,
+        startLsn: match ? parseInt(match[1], 10) : 0,
+        endLsn: match ? parseInt(match[2], 10) : 0
+      };
+    });
+    const walManifestHash = createHash('sha256').update(JSON.stringify(walItems)).digest('hex');
 
     const manifestObj = {
       snapshotId: latest.baseTs,
@@ -1320,8 +1407,8 @@ export class BackupManager {
       maxLsn: Math.max(ckptLsn, this.liveShipper?.status.lastShippedLsn ?? 0),
       createdAt: new Date().toISOString(),
       docCount: uploaded,
-      dataManifestHash: `${latest.baseTs}:${ckptLsn}:${uploaded}`,
-      walManifestHash: `${this.liveShipper?.status.lastShippedLsn ?? 0}`,
+      dataManifestHash,
+      walManifestHash,
       lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0,
       lastCheckpointAt: new Date().toISOString()
     };
@@ -1422,8 +1509,11 @@ export class BackupManager {
   }
 
   private async _restoreToTargetDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
-    const pit = opts.pointInTime ?? Infinity;
-    const targetLsn = opts.targetLsn ?? Infinity;
+    if (opts.pointInTime !== undefined && opts.targetLsn !== undefined) {
+      throw new Error('Ambiguous PITR parameters: specify targetLsn XOR pointInTime, not both.');
+    }
+    const pit = opts.pointInTime;
+    const targetLsn = opts.targetLsn;
     let nodeId = opts.nodeId;
     if (!nodeId) {
       const base = this.config.cloudStorage?.pathPrefix || 'tero-backups';
@@ -1478,16 +1568,13 @@ export class BackupManager {
         const key = basename(dk).replace(/\.json$/, '');
         const dest = partitionedPath(targetDir, key);
         const body = await this.downloadBytes(dk);
-        mkdirSync(dirname(dest), { recursive: true });
-        const tmp = `${dest}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
-        writeFileSync(tmp, body);
-        renameSync(tmp, dest);
+        durableWriteFile(dest, body);
         docsRestored++;
       });
 
       for (const keyName of tombstoneKeyNames) {
         const dest = partitionedPath(targetDir, keyName);
-        try { if (existsSync(dest)) unlinkSync(dest); } catch {}
+        safeUnlinkTombstone(dest);
       }
     }
     const walKeys = (await this.listPrefix(`${prefix}wal/`))
@@ -1523,10 +1610,10 @@ export class BackupManager {
       if (!e.key) return;
       const dest = partitionedPath(targetDir, e.key);
       if (e.operation === 'WRITE') {
-        mkdirSync(dirname(dest), { recursive: true });
-        const tmp = `${dest}.tmp.${process.pid}`;
-        writeFileSync(tmp, JSON.stringify(e.afterImage ?? null)); renameSync(tmp, dest);
-      } else if (e.operation === 'DELETE') { try { unlinkSync(dest); } catch {} }
+        durableWriteFile(dest, JSON.stringify(e.afterImage ?? null));
+      } else if (e.operation === 'DELETE') {
+        safeUnlinkTombstone(dest);
+      }
       lastLsn = Math.max(lastLsn, e.lsn);
     };
     for (const wk of walKeys) {
@@ -1642,11 +1729,8 @@ class WalShipper {
     this.tickCount++;
     try {
       await this.shipArchives();
-      // getLogEntries(fromLSN) filters lsn >= fromLSN (INCLUSIVE) — pass lastLsn + 1
-      // or every tick would re-ship the final entry of the previous segment.
-      // COMMIT/ROLLBACK markers must ship too (see WAL_SHIPPED_OPS) or restore
-      // can never commit its buffered transactions.
-      const entries = this.deps.wal.getLogEntries(this.lastLsn + 1).filter(e => WAL_SHIPPED_OPS.has(e.operation));
+      // All operations (including BEGIN and CHECKPOINT) are shipped to guarantee raw LSN continuity
+      const entries = this.deps.wal.getLogEntries(this.lastLsn + 1);
       if (entries.length === 0) { this.status.state = 'healthy'; return; }
       const start = entries[0].lsn, end = entries[entries.length - 1].lsn;
       const body = gzipSync(Buffer.from(JSON.stringify(entries)), { level: 1 });
@@ -1667,19 +1751,16 @@ class WalShipper {
     const archives = this.deps.wal.listArchives();
     for (const p of archives) {
       if (this.shippedArchives.has(p)) continue;
-      // Throttle failing archives: without this, a bucket outage means every tick
-      // re-reads and re-parses up to 3MB of archive JSON per second (wasted CPU
-      // on a busy server). Retry each failing archive only every 5 ticks.
+      // Throttle failing archives: retry each failing archive only every 5 ticks.
       const retryAt = this.archiveRetryAt.get(p);
       if (retryAt !== undefined && this.tickCount < retryAt) continue;
       try {
-        const lines = readFileSync(p, 'utf8').trim().split('\n');
-        const entries: LogEntry[] = [];
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          entries.push(JSON.parse(line));
-        }
-        const fresh = entries.filter(e => WAL_SHIPPED_OPS.has(e.operation) && e.lsn > this.lastLsn);
+        const fresh: LogEntry[] = [];
+        streamLogFile(p, (entry) => {
+          if (entry.lsn > this.lastLsn) {
+            fresh.push(entry);
+          }
+        }, false);
         if (fresh.length > 0) {
           const s = fresh[0].lsn, en = fresh[fresh.length - 1].lsn;
           const body = gzipSync(Buffer.from(JSON.stringify(fresh)), { level: 1 });

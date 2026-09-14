@@ -1321,6 +1321,8 @@ export class Tero {
     cloudStorage: CloudStorageConfig;
     nodeId?: string;
     pointInTime?: number;
+    targetLsn?: number;
+    customS3Client?: any;
     /** Name of the ORIGINAL database directory in the bucket, if restoring to a
      *  new directory name (disaster-recovery / staging restores). Defaults to `directory`. */
     sourceDirectory?: string;
@@ -1329,9 +1331,9 @@ export class Tero {
     const source = validateDirectory(opts.sourceDirectory ?? opts.directory);
     // The temp manager is built with the SOURCE name so bucket prefixes resolve;
     // files are written into the sanitized TARGET directory.
-    const tempMgr = new BackupManager(source, { format: 'individual', cloudStorage: opts.cloudStorage });
+    const tempMgr = new BackupManager(source, { format: 'individual', cloudStorage: opts.cloudStorage, customS3Client: opts.customS3Client });
     try {
-      await tempMgr.restoreLiveToDirectory(sanitized, { nodeId: opts.nodeId, pointInTime: opts.pointInTime });
+      await tempMgr.restoreLiveToDirectory(sanitized, { nodeId: opts.nodeId, pointInTime: opts.pointInTime, targetLsn: opts.targetLsn });
     } finally {
       tempMgr.destroy();
     }

@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, unlinkSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, basename } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { Tero, RecoveryCorruptionError, DataCorruptionError } from '../dist/index.js';
 import {
   ACIDStorageEngine,
@@ -1003,6 +1004,319 @@ test('Invariant N: db.isDegraded() and db.getLastMaintenanceError() track status
     const db = new Tero({ directory: testDir });
     assert.equal(db.isDegraded(), false);
     assert.equal(db.getLastMaintenanceError(), null);
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant O: truncateLog() safety preconditions
+// ============================================================================
+test('Invariant O: truncateLog() enforces active transactions and pending writes preconditions', async () => {
+  const testDir = resolve('./test_invariant_o_truncate');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const db = new Tero({ directory: testDir, synchronous: 'full' });
+    await db.create('doc1', { val: 1 });
+
+    // 1) Active transaction prevents truncation
+    const tx = db.beginTransaction();
+    await tx.create('doc2', { val: 2 });
+    assert.throws(
+      () => db.acidEngine.truncateLog(),
+      /Cannot truncate WAL: \d+ active transactions in progress/
+    );
+
+    // Commit transaction so activeTransactions is 0, but committedBuffer is dirty
+    await tx.commit();
+
+    // 2) Committed buffer unflushed prevents truncation
+    assert.throws(
+      () => db.acidEngine.truncateLog(),
+      /Cannot truncate WAL: committed buffer not flushed/
+    );
+
+    // 3) Flush committed buffer to data files
+    db.acidEngine.flushCommittedBuffer(true);
+
+    // 4) With all preconditions met, truncation succeeds and leaves WAL 0 bytes
+    db.acidEngine.truncateLog();
+    const walPath = join(testDir, '.wal');
+    const stat = existsSync(walPath) ? readFileSync(walPath) : Buffer.alloc(0);
+    assert.equal(stat.length, 0, 'WAL file must be empty after truncateLog()');
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant P: Full and incremental checkpoint SHA-256 manifests
+// ============================================================================
+test('Invariant P: Full and incremental checkpoint produce deterministic SHA-256 hashes', async () => {
+  const testDir = resolve('./test_invariant_p_manifest');
+  rmSync(testDir, { recursive: true, force: true });
+
+  const s3Store = new Map();
+  const mockS3Client = {
+    send: async (command) => {
+      const name = command.constructor?.name;
+      if (name === 'PutObjectCommand') {
+        const key = command.input.Key;
+        const body = command.input.Body;
+        const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+        s3Store.set(key, { data: buf, mtime: new Date() });
+        return {};
+      }
+      if (name === 'GetObjectCommand') {
+        const item = s3Store.get(command.input.Key);
+        if (!item) {
+          const err = new Error('NoSuchKey');
+          err.name = 'NoSuchKey';
+          err.$metadata = { httpStatusCode: 404 };
+          throw err;
+        }
+        return {
+          Body: {
+            transformToString: async () => item.data.toString('utf8'),
+            async *[Symbol.asyncIterator]() { yield item.data; }
+          }
+        };
+      }
+      if (name === 'ListObjectsV2Command') {
+        const prefix = command.input.Prefix || '';
+        const contents = Array.from(s3Store.entries())
+          .filter(([k]) => k.startsWith(prefix))
+          .map(([k, v]) => ({ Key: k, LastModified: v.mtime }));
+        return { Contents: contents, IsTruncated: false };
+      }
+      if (name === 'DeleteObjectCommand') {
+        s3Store.delete(command.input.Key);
+        return {};
+      }
+      return {};
+    }
+  };
+
+  try {
+    const db = new Tero({
+      directory: testDir,
+      synchronous: 'full',
+      backup: {
+        cloudStorage: {
+          bucket: 'test-bucket',
+          region: 'us-east-1',
+          accessKeyId: 'test',
+          secretAccessKey: 'test'
+        },
+        customS3Client: mockS3Client
+      }
+    });
+    db.enableLiveBackup({ consistency: 'per-second', intervalMs: 500 });
+
+    await db.create('item_1', { name: 'Item 1' });
+    await db.create('item_2', { name: 'Item 2' });
+
+    // 1) Full checkpoint
+    const fullRes = await db.liveCheckpointToBucket();
+    assert.equal(fullRes.fullUpload, true);
+
+    const manifestKey = Array.from(s3Store.keys()).find(k => k.endsWith('MANIFEST.json'));
+    assert.ok(manifestKey, 'MANIFEST.json must exist in S3');
+    const manifestRaw = s3Store.get(manifestKey).data.toString('utf8');
+    const manifest = JSON.parse(manifestRaw);
+
+    assert.ok(/^[a-f0-9]{64}$/.test(manifest.dataManifestHash), 'dataManifestHash must be a 64-character hex SHA-256 hash');
+    assert.ok(/^[a-f0-9]{64}$/.test(manifest.walManifestHash), 'walManifestHash must be a 64-character hex SHA-256 hash');
+    const initialDataHash = manifest.dataManifestHash;
+
+    // 2) Incremental checkpoint
+    await db.update('item_1', { name: 'Item 1 Updated' });
+    const incRes = await db.liveCheckpointToBucket();
+    assert.equal(incRes.fullUpload, false);
+
+    const updatedManifestRaw = s3Store.get(manifestKey).data.toString('utf8');
+    const updatedManifest = JSON.parse(updatedManifestRaw);
+    assert.ok(/^[a-f0-9]{64}$/.test(updatedManifest.dataManifestHash), 'Incremental dataManifestHash must be a 64-char hex SHA-256 hash');
+    assert.ok(/^[a-f0-9]{64}$/.test(updatedManifest.walManifestHash), 'Incremental walManifestHash must be a 64-char hex SHA-256 hash');
+    assert.notEqual(updatedManifest.dataManifestHash, initialDataHash, 'dataManifestHash must change when data is updated');
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant Q: PITR parameter exclusivity (targetLsn XOR pointInTime)
+// ============================================================================
+test('Invariant Q: restoreLiveToDirectory rejects simultaneous targetLsn and pointInTime', async () => {
+  const testDir = resolve('./test_invariant_q_pitr');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const db = new Tero({
+      directory: testDir,
+      backup: {
+        cloudStorage: {
+          bucket: 'test-bucket',
+          region: 'us-east-1',
+          accessKeyId: 'test',
+          secretAccessKey: 'test'
+        },
+        customS3Client: { send: async () => ({}) }
+      }
+    });
+
+    await assert.rejects(
+      async () => await db.backupManager.restoreLiveToDirectory(join(testDir, 'restored'), {
+        targetLsn: 100,
+        pointInTime: Date.now()
+      }),
+      /Ambiguous PITR parameters: specify targetLsn XOR pointInTime, not both/
+    );
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant R: Cloud WAL shipping ships all operations ensuring raw LSN continuity
+// ============================================================================
+test('Invariant R: WalShipper ships all operations (BEGIN, WRITE, COMMIT, CHECKPOINT) with contiguous LSNs', async () => {
+  const testDir = resolve('./test_invariant_r_shipping');
+  rmSync(testDir, { recursive: true, force: true });
+
+  const s3Store = new Map();
+  const mockS3Client = {
+    send: async (command) => {
+      const name = command.constructor?.name;
+      if (name === 'PutObjectCommand') {
+        const key = command.input.Key;
+        const body = command.input.Body;
+        const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+        s3Store.set(key, { data: buf, mtime: new Date() });
+        return {};
+      }
+      if (name === 'GetObjectCommand') {
+        const item = s3Store.get(command.input.Key);
+        if (!item) {
+          const err = new Error('NoSuchKey');
+          err.name = 'NoSuchKey';
+          err.$metadata = { httpStatusCode: 404 };
+          throw err;
+        }
+        return {
+          Body: {
+            transformToString: async () => item.data.toString('utf8'),
+            async *[Symbol.asyncIterator]() { yield item.data; }
+          }
+        };
+      }
+      if (name === 'ListObjectsV2Command') {
+        const prefix = command.input.Prefix || '';
+        const contents = Array.from(s3Store.entries())
+          .filter(([k]) => k.startsWith(prefix))
+          .map(([k, v]) => ({ Key: k, LastModified: v.mtime }));
+        return { Contents: contents, IsTruncated: false };
+      }
+      return {};
+    }
+  };
+
+  try {
+    const db = new Tero({
+      directory: testDir,
+      synchronous: 'full',
+      backup: {
+        cloudStorage: {
+          bucket: 'test-bucket',
+          region: 'us-east-1',
+          accessKeyId: 'test',
+          secretAccessKey: 'test'
+        },
+        customS3Client: mockS3Client
+      }
+    });
+
+    // Checkpoint base
+    await db.create('doc_base', { initial: true });
+    db.enableLiveBackup({ consistency: 'per-second', intervalMs: 100 });
+    await db.liveCheckpointToBucket();
+
+    // Perform operations including transactional BEGIN, WRITE, COMMIT
+    const tx = db.beginTransaction();
+    await tx.create('doc_tx1', { val: 'tx1' });
+    await tx.commit();
+
+    // Wait for shipper tick
+    const start = Date.now();
+    while (Date.now() - start < 3000) {
+      const segKeys = Array.from(s3Store.keys()).filter(k => k.includes('/wal/seg-'));
+      if (segKeys.length > 0) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    // Check uploaded segments in S3
+    const segKeys = Array.from(s3Store.keys())
+      .filter(k => k.includes('/wal/seg-'))
+      .sort();
+
+    assert.ok(segKeys.length > 0, 'At least one WAL segment must be shipped');
+
+    const shippedOperations = new Set();
+    for (const key of segKeys) {
+      const gzipped = s3Store.get(key).data;
+      const unzipped = gunzipSync(gzipped).toString('utf8');
+      const records = JSON.parse(unzipped);
+      for (const r of records) {
+        shippedOperations.add(r.operation);
+      }
+    }
+
+    // Must have shipped BEGIN and COMMIT alongside WRITE!
+    assert.ok(shippedOperations.has('BEGIN'), 'WAL shipper must ship BEGIN operations');
+    assert.ok(shippedOperations.has('COMMIT'), 'WAL shipper must ship COMMIT operations');
+
+    // Cloud restore must successfully replay without continuity gap
+    const restoreDir = join(testDir, 'restored');
+    const restoreRes = await db.backupManager.restoreLiveToDirectory(restoreDir);
+    assert.ok(restoreRes.segmentsReplayed >= 1, 'Segments must be replayed');
+
+    // Verify restored state
+    const restoredDoc = JSON.parse(readFileSync(partitionedPath(restoreDir, 'doc_tx1'), 'utf8'));
+    assert.equal(restoredDoc.val, 'tx1');
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Invariant S: Archived WAL segment listing excludes legacy files
+// ============================================================================
+test('Invariant S: listArchives() only matches .wal.seg-<start>-<end>', async () => {
+  const testDir = resolve('./test_invariant_s_archives');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const db = new Tero({ directory: testDir });
+    // Write valid segment
+    writeFileSync(join(testDir, '.wal.seg-1-10'), 'valid segment');
+    // Write legacy non-conforming files
+    writeFileSync(join(testDir, '.wal.1700000000000'), 'legacy timestamp');
+    writeFileSync(join(testDir, '.wal.legacy'), 'legacy name');
+    writeFileSync(join(testDir, '.wal.seg-invalid'), 'invalid format');
+
+    const archives = db.acidEngine.wal.listArchives();
+    assert.deepEqual(archives.map(p => basename(p)), ['.wal.seg-1-10'], 'listArchives must strictly match .wal.seg-<start>-<end>');
+
     db.destroy();
   } finally {
     rmSync(testDir, { recursive: true, force: true });
