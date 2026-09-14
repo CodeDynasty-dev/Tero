@@ -689,49 +689,77 @@ test('Invariant I: Checkpoint acknowledges dirty keys strictly after publishing 
   try {
     const uploadedKeys = [];
     let simulateFailureBeforePublish = true;
+    const s3Store = new Map();
 
     const mockS3Client = {
-      send: async (cmd) => {
-        const key = cmd.input?.Key || '';
-        if (key) uploadedKeys.push(key);
-
+      send: async (command) => {
+        const name = command.constructor.name;
+        const key = command.input?.Key || '';
         if (simulateFailureBeforePublish && key.endsWith('latest.json')) {
           const err = new Error('Simulated S3 failure right before publishing latest.json');
           err.$metadata = { httpStatusCode: 500 };
           throw err;
         }
 
-        if (cmd.constructor.name === 'PutObjectCommand' || cmd.input?.Body) {
+        if (name === 'PutObjectCommand') {
+          if (key) uploadedKeys.push(key);
+          const body = command.input.Body || Buffer.alloc(0);
+          const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+          s3Store.set(command.input.Key, { data: buf, mtime: new Date() });
           return { ETag: '"etag-123"' };
         }
-        if (cmd.constructor.name === 'HeadObjectCommand') {
-          const err = new Error('NotFound');
-          err.name = 'NotFound';
-          err.$metadata = { httpStatusCode: 404 };
-          throw err;
+
+        if (name === 'GetObjectCommand') {
+          const item = s3Store.get(command.input.Key);
+          if (!item) {
+            const err = new Error('NoSuchKey: The specified key does not exist.');
+            err.name = 'NoSuchKey';
+            throw err;
+          }
+          return {
+            Body: {
+              transformToString: async () => item.data.toString('utf8'),
+              async *[Symbol.asyncIterator]() {
+                yield item.data;
+              }
+            }
+          };
         }
+
+        if (name === 'ListObjectsV2Command') {
+          const prefix = command.input.Prefix || '';
+          const contents = Array.from(s3Store.entries())
+            .filter(([k]) => k.startsWith(prefix))
+            .map(([k, v]) => ({ Key: k, LastModified: v.mtime }));
+          return { Contents: contents, IsTruncated: false };
+        }
+
         return {};
       }
     };
 
-    const db = new Tero({ directory: testDir, synchronous: 'full' });
+    const db = new Tero({
+      directory: testDir,
+      synchronous: 'full',
+      backup: {
+        cloudStorage: {
+          bucket: 'test-bucket',
+          region: 'us-east-1',
+          accessKeyId: 'test',
+          secretAccessKey: 'test'
+        },
+        customS3Client: mockS3Client
+      }
+    });
+    db.enableLiveBackup({ consistency: 'per-second', intervalMs: 500 });
+
     await db.create('user_1', { name: 'Alice' });
     await db.create('user_2', { name: 'Bob' });
-
-    const backup = new BackupManager(testDir, {
-      cloudStorage: {
-        bucket: 'test-bucket',
-        region: 'us-east-1',
-        accessKeyId: 'test',
-        secretAccessKey: 'test'
-      },
-      customS3Client: mockS3Client
-    });
 
     // 1) First attempt: S3 fails on latest.json upload
     simulateFailureBeforePublish = true;
     await assert.rejects(
-      async () => await backup.liveCheckpointToBucket(db.acidEngine, { forceFull: true }),
+      async () => await db.liveCheckpointToBucket(),
       /Simulated S3 failure/
     );
 
@@ -740,7 +768,7 @@ test('Invariant I: Checkpoint acknowledges dirty keys strictly after publishing 
 
     // 2) Second attempt: S3 succeeds
     simulateFailureBeforePublish = false;
-    const res = await backup.liveCheckpointToBucket(db.acidEngine, { forceFull: true });
+    const res = await db.liveCheckpointToBucket();
     assert.equal(res.fullUpload, true, 'Checkpoint must succeed');
 
     // Now dirty keys are acknowledged
@@ -753,7 +781,6 @@ test('Invariant I: Checkpoint acknowledges dirty keys strictly after publishing 
     assert.ok(latestIdx !== -1, 'latest.json must be uploaded');
     assert.ok(latestIdx > manifestIdx, 'latest.json must be published after MANIFEST.json');
 
-    backup.destroy();
     db.destroy();
   } finally {
     rmSync(testDir, { recursive: true, force: true });
@@ -771,7 +798,7 @@ test('Invariant J: Cloud restore enforces zero-gap and detects checksum/range co
   try {
     const targetDir = join(testDir, 'db_target');
 
-    // Scenario 1: Gap between base snapshot LSN (10) and first WAL segment (12)
+    const s3Store = new Map();
     const backup = new BackupManager(testDir, {
       cloudStorage: {
         bucket: 'test-bucket',
@@ -780,32 +807,44 @@ test('Invariant J: Cloud restore enforces zero-gap and detects checksum/range co
         secretAccessKey: 'test'
       },
       customS3Client: {
-        send: async (cmd) => {
-          const key = cmd.input?.Key || '';
-          const prefix = cmd.input?.Prefix || '';
-          if (prefix.includes('nodes/')) {
-            return {
-              Contents: [{ Key: `${prefix}node1/` }]
-            };
+        send: async (command) => {
+          const name = command.constructor.name;
+          if (name === 'ListObjectsV2Command') {
+            const prefix = command.input.Prefix || '';
+            const contents = Array.from(s3Store.keys())
+              .filter(k => k.startsWith(prefix))
+              .map(k => ({ Key: k }));
+            return { Contents: contents, IsTruncated: false };
           }
-          if (prefix.includes('wal/')) {
-            return {
-              Contents: [{ Key: `${prefix}seg-12-15.json.gz` }]
-            };
-          }
-          if (key.endsWith('latest.json')) {
+          if (name === 'GetObjectCommand') {
+            const item = s3Store.get(command.input.Key);
+            if (!item) {
+              const err = new Error('NoSuchKey');
+              err.name = 'NoSuchKey';
+              throw err;
+            }
             return {
               Body: {
-                transformToString: async () => JSON.stringify({
-                  baseTs: '1000',
-                  baseLsn: 10
-                })
+                transformToString: async () => item.data.toString('utf8'),
+                async *[Symbol.asyncIterator]() {
+                  yield item.data;
+                }
               }
             };
           }
           return {};
         }
       }
+    });
+
+    const prefix = backup.liveCloudPrefix('node1');
+    // Base snapshot at LSN 10
+    s3Store.set(`${prefix}checkpoint/latest.json`, {
+      data: Buffer.from(JSON.stringify({ baseTs: '1000', baseLsn: 10 }))
+    });
+    // Gap: WAL starts at LSN 12 (missing LSN 11)
+    s3Store.set(`${prefix}wal/seg-12-15.json.gz`, {
+      data: Buffer.from('')
     });
 
     await assert.rejects(

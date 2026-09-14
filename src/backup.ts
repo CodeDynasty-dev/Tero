@@ -144,6 +144,8 @@ export interface BackupConfig {
    * Default: true for full local databases, false when running in lazy-hydration mode.
    */
   pruneDeleted?: boolean;
+  /** Optional custom S3 client for mocking/testing */
+  customS3Client?: any;
 }
 
 export interface BackupMetadata {
@@ -187,6 +189,11 @@ export class BackupManager {
 
   private initializeCloudStorage(cloudConfig: CloudStorageConfig): void {
     try {
+      if (this.config.customS3Client) {
+        this.s3Client = this.config.customS3Client;
+        return;
+      }
+
       const clientConfig: any = {
         region: cloudConfig.region,
         credentials: {
@@ -1319,8 +1326,8 @@ export class BackupManager {
       lastCheckpointAt: new Date().toISOString()
     };
 
-    await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
     await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify(manifestObj, null, 2)), 'application/json');
+    await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
 
     // CRITICAL P0 ORDERING: Two-phase acknowledgment: ONLY acknowledge successfully uploaded items AFTER manifest and latest are published
     engine.acknowledgeDirtyKeys(ackList);
