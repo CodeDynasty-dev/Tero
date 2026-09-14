@@ -460,6 +460,24 @@ export class Tero {
   private cloudPendingTimer?: ReturnType<typeof setTimeout>;
   private reconciliationLocks = new Map<string, Promise<void>>();
   private reconciliationLockStorage = new AsyncLocalStorage<Set<string>>();
+  /**
+   * Re-entrancy guard for the durable pending-queue journal (P1).
+   *
+   * `savePendingCloud()` / `savePendingCloudDeletions()` are fully
+   * synchronous, and Node's single-threaded execution guarantees that two
+   * calls can never interleave at the syscall level — each
+   * write/fsync/rename sequence runs atomically w.r.t. the JS thread, which
+   * is what prevents lost queue entries and temp-file collisions across
+   * concurrently-reconciling keys (reconciliation is only locked *per key*,
+   * so different keys reconcile in parallel).
+   *
+   * This flag makes that invariant explicit and defensively aborts if a
+   * future change introduces an `await` (or an async refactor) inside the
+   * persistence path, which would break the per-call atomicity the durable
+   * reconciliation queue depends on.
+   */
+  private pendingPersistenceInFlight = false;
+
 
   /**
    * Bounded LRU of known-existing keys. Replaces the unbounded Set<string>
@@ -1406,19 +1424,36 @@ export class Tero {
     }
   }
 
+  /**
+   * fsync a directory path by opening it read-only and synchronizing its
+   * (open) descriptor. This flushes the directory's metadata (rename/unlink
+   * directory-entry changes) to disk so that file replacements and removals
+   * are durable across power loss. No-op if the directory does not exist
+   * (ENOENT) — mirrors the pattern in `ACIDStorageEngine.fsyncDir`.
+   */
+  private fsyncDirectory(dirPath: string): void {
+    let fd: number;
+    try {
+      fd = openSync(dirPath, 'r');
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   private deleteLocalTombstone(key: string): void {
     const p = this.localTombstonePath(key);
     if (!existsSync(p)) return;
 
     unlinkSync(p);
 
-    const dir = pathJoin(this.teroDirectory, '.tombstones');
-    const dirFd = openSync(dir, 'r');
-    try {
-        fsyncSync(dirFd);
-    } finally {
-        closeSync(dirFd);
-    }
+    // Durable the removal of the local tombstone file.
+    this.fsyncDirectory(pathJoin(this.teroDirectory, '.tombstones'));
 
     if (existsSync(p)) {
         throw new Error(`Failed to durably remove local tombstone for '${key}'`);
@@ -1465,20 +1500,49 @@ export class Tero {
   }
 
   private savePendingCloud(): void {
-    const p = this.pendingCloudPath();
-    const dir = pathJoin(this.teroDirectory, '.tombstones');
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    if (this.cloudPendingTombstones.size === 0) {
-      if (existsSync(p)) unlinkSync(p);
-      return;
+    if (this.pendingPersistenceInFlight) {
+      // Synchronous execution makes true re-entrancy impossible; reaching
+      // here means an `await` was introduced inside the persistence path,
+      // which would break per-call atomicity (lost entries / temp races).
+      throw new Error('savePendingCloud: re-entrant persistence detected — reconciliation journal mutex violated');
     }
-    const tmp = `${p}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstones.entries()]));
-    const fd = openSync(tmp, 'r');
-    try { fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, p);
-    const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
-    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    this.pendingPersistenceInFlight = true;
+    const parent = this.teroDirectory;
+    const p = this.pendingCloudPath();
+    try {
+      if (this.cloudPendingTombstones.size === 0) {
+        if (existsSync(p)) {
+          unlinkSync(p);
+          // P1: durably remove the drained queue file. Previously there was
+          // NO parent-directory fsync after unlink — a power loss could
+          // resurrect the emptied pending-queue file.
+          this.fsyncDirectory(parent);
+        }
+        return;
+      }
+      // P1: unique temp filename. The previous `${p}.tmp.${process.pid}` was
+      // process-static, so a stale temp file left by a crashed run could
+      // collide with / be overwritten by the next persistence attempt.
+      const tmp =
+        `${p}.tmp.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}`;
+      writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstones.entries()]));
+      try {
+        const fd = openSync(tmp, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(tmp, p);
+      } catch (err) {
+        // Clean up the orphaned temp file so it cannot accumulate on disk.
+        try { unlinkSync(tmp); } catch { /* approved */ }
+        throw err;
+      }
+      // P1: fsync the ACTUAL parent directory of the renamed pending file.
+      // Previously this fsync'd `.tombstones` — an unrelated directory that
+      // does not contain the pending file — so the pending-queue rename was
+      // not guaranteed durable across power loss.
+      this.fsyncDirectory(parent);
+    } finally {
+      this.pendingPersistenceInFlight = false;
+    }
   }
 
   private loadPendingCloudDeletions(): void {
@@ -1502,20 +1566,39 @@ export class Tero {
   }
 
   private savePendingCloudDeletions(): void {
-    const p = this.pendingCloudDeletionsPath();
-    const dir = pathJoin(this.teroDirectory, '.tombstones');
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    if (this.cloudPendingTombstoneDeletions.size === 0) {
-      if (existsSync(p)) unlinkSync(p);
-      return;
+    if (this.pendingPersistenceInFlight) {
+      throw new Error('savePendingCloudDeletions: re-entrant persistence detected — reconciliation journal mutex violated');
     }
-    const tmp = `${p}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()]));
-    const fd = openSync(tmp, 'r');
-    try { fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, p);
-    const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
-    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    this.pendingPersistenceInFlight = true;
+    const parent = this.teroDirectory;
+    const p = this.pendingCloudDeletionsPath();
+    try {
+      if (this.cloudPendingTombstoneDeletions.size === 0) {
+        if (existsSync(p)) {
+          unlinkSync(p);
+          // P1: durably remove the drained queue file (previously no
+          // parent-directory fsync after unlink).
+          this.fsyncDirectory(parent);
+        }
+        return;
+      }
+      const tmp =
+        `${p}.tmp.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}`;
+      writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()]));
+      try {
+        const fd = openSync(tmp, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(tmp, p);
+      } catch (err) {
+        try { unlinkSync(tmp); } catch { /* approved */ }
+        throw err;
+      }
+      // P1: fsync the actual parent directory of the renamed pending file
+      // (previously fsync'd the unrelated `.tombstones` directory).
+      this.fsyncDirectory(parent);
+    } finally {
+      this.pendingPersistenceInFlight = false;
+    }
   }
 
   private queueCloudTombstoneDeletion(key: string, expectedVersion?: number): void {
@@ -1615,14 +1698,10 @@ export class Tero {
           await this.dataRecovery!.deleteFromCloud(key);
           await (this.dataRecovery as any)!.putTombstone(key, currentDeletionLsn);
           this.cloudPendingTombstones.delete(key);
-          try {
-            const p = this.pendingCloudPath();
-            if (this.cloudPendingTombstones.size === 0) {
-              if (existsSync(p)) unlinkSync(p);
-            } else {
-              writeFileSync(p, JSON.stringify([...this.cloudPendingTombstones.entries()]));
-            }
-          } catch { /* approved */ }
+          // Use the atomic, durable savePendingCloud() (temp+rename+parent
+          // fsync + serialization guard) instead of a raw non-atomic
+          // writeFileSync that neither fsyncs the file nor the parent dir.
+          try { this.savePendingCloud(); } catch { /* approved */ }
         } catch (err) {
           // Keep pending for next retry; classify to avoid tight loop on auth errors
           const kind = classifyRecoveryError(err);

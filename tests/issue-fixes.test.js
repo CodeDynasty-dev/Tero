@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync, readFileSync } from 'fs';
+import { existsSync, rmSync, readFileSync, readdirSync } from 'fs';
 import { createHash } from 'crypto';
 import { resolve, join } from 'path';
 import { Tero } from '../dist/index.js';
@@ -662,4 +662,213 @@ test('Mixed Usage: listAvailableFiles sees all documents unconstrained by MANIFE
   assert.ok(files.includes('old_doc'), 'Must include old_doc');
   assert.ok(files.includes('new_doc'), 'Must include new_doc even though not in MANIFEST.json');
 });
+
+// ---------------------------------------------------------------------------
+// P1 fixes: durable pending-queue persistence
+//
+// 1. savePendingCloud()/savePendingCloudDeletions() previously fsync'd the
+//    `.tombstones` directory instead of the actual parent directory
+//    (`teroDirectory`) that holds the renamed/unlinked pending-queue file,
+//    so the queue rename was not guaranteed durable across power loss. The
+//    empty-queue unlink path had NO parent-directory fsync at all.
+//
+// 2. Persistence used a process-static temp filename (`${p}.tmp.${pid}`) with
+//    no global serialization, risking temp-file collisions and lost entries
+//    when different keys reconcile concurrently (reconciliation is only
+//    locked per key). The fix uses unique temp filenames + a re-entrancy
+//    guard that enforces the per-call atomicity invariant.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a mock S3 client whose `send` behavior is driven by a mutable `mode`
+ * object. In 'fail-put' mode PutObjectCommand throws — this forces the delete
+ * reconciliation path to call queueCloudTombstone() -> savePendingCloud(),
+ * populating the durable pending queue. Switching mode.putOk to true lets the
+ * retry drain the queue.
+ */
+function buildMockS3(mode) {
+  return {
+    async send(command) {
+      const name = command.constructor.name;
+      if (name === 'PutObjectCommand') {
+        if (!mode.putOk) {
+          const err = new Error('PutObject failed (simulated)');
+          err.name = 'InternalError';
+          throw err;
+        }
+        return {};
+      }
+      if (name === 'DeleteObjectCommand') return {};
+      if (name === 'GetObjectCommand') {
+        const err = new Error('NoSuchKey');
+        err.name = 'NoSuchKey';
+        throw err;
+      }
+      if (name === 'HeadObjectCommand') {
+        const err = new Error('NotFound');
+        err.name = 'NotFound';
+        err.$metadata = { httpStatusCode: 404 };
+        throw err;
+      }
+      if (name === 'ListObjectsV2Command') {
+        return { Contents: [], IsTruncated: false };
+      }
+      return {};
+    },
+  };
+}
+
+
+test('P1: concurrent deletes of different keys do not lose pending-queue entries (durable, correct parent dir, no stale temp files)', async () => {
+  const testDir = resolve('./test_p1_concurrent_pending_queue_db');
+  rmSync(testDir, { recursive: true, force: true });
+
+  const mode = { putOk: false };
+  const mockS3 = buildMockS3(mode);
+
+  const db = await Tero.create({
+    directory: testDir,
+    synchronous: 'full',
+    hydrateOnStartup: {
+      cloudStorage: {
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        accessKeyId: 'k',
+        secretAccessKey: 's',
+        pathPrefix: 'backups',
+        dbName: 'p1queue',
+      },
+      mode: 'lazy',
+      customS3Client: mockS3,
+    },
+  });
+
+  try {
+    const keys = Array.from({ length: 8 }, (_, i) => `p1doc_${i}`);
+
+    // Create documents first (auto-commit each). Create reconciliation calls
+    // deleteTombstone (DeleteObjectCommand) which succeeds, so creates do not
+    // queue.
+    for (const k of keys) {
+      await db.create(k, { name: k, n: 1 });
+    }
+
+    // Concurrently delete all keys. Each delete auto-commits and awaits its
+    // own per-key reconciliation. putTombstone (PutObjectCommand) fails, so
+    // every key is queued via queueCloudTombstone() -> savePendingCloud().
+    // Reconciliation locks are per-key, so these reconciliations run in
+    // parallel — exactly the race the P1 fix addresses.
+    await Promise.all(keys.map((k) => db.delete(k)));
+
+    // The durable pending-queue file lives in the PARENT directory
+    // (teroDirectory), NOT in .tombstones.
+    const pendingPath = join(testDir, '.cloud_pending.json');
+    assert.equal(existsSync(pendingPath), true, '.cloud_pending.json must be durably persisted in the parent directory');
+
+    const raw = readFileSync(pendingPath, 'utf8');
+    const arr = JSON.parse(raw);
+    const queuedKeys = new Set(arr.map((e) => (Array.isArray(e) ? e[0] : e.key)));
+    for (const k of keys) {
+      assert.equal(queuedKeys.has(k), true, `pending queue must retain entry for '${k}' — no lost entries under concurrent reconciliation`);
+    }
+
+    // No stale temp files may linger. The old process-static temp name
+    // (`.cloud_pending.json.tmp.<pid>`) must never be observed; the new unique
+    // temp files are renamed atomically and cleaned up on error.
+    const leftovers = readdirSync(testDir).filter((f) =>
+      f.startsWith('.cloud_pending.json.tmp.') || f.startsWith('.cloud_pending_deletions.json.tmp.'));
+    assert.equal(leftovers.length, 0, `no stale pending-queue temp files must remain (found: ${leftovers.join(', ')})`);
+
+    // Durability across restart: the queue file is in the correct parent dir
+    // and is reloaded on construction, so the entries survive a DB reboot.
+    await db.close();
+    const db2 = await Tero.create({
+      directory: testDir,
+      synchronous: 'full',
+      hydrateOnStartup: {
+        cloudStorage: {
+          bucket: 'test-bucket',
+          region: 'us-east-1',
+          accessKeyId: 'k',
+          secretAccessKey: 's',
+          pathPrefix: 'backups',
+          dbName: 'p1queue',
+        },
+        mode: 'lazy',
+        customS3Client: mockS3,
+      },
+    });
+
+    try {
+      assert.equal(db2.isCloudReconciliationPending(), true, 'pending reconciliation must be restored across restart');
+      const restoredKeys = new Set(db2.getCloudReconciliationPendingKeys());
+      for (const k of keys) {
+        assert.equal(restoredKeys.has(k), true, `restored pending queue must still contain '${k}' after reboot`);
+      }
+    } finally {
+      await db2.close();
+    }
+  } finally {
+    try { await db.close(); } catch {}
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+
+test('P1: drained pending queue is durably removed (parent-directory fsync after unlink)', async () => {
+  const testDir = resolve('./test_p1_drained_queue_db');
+  rmSync(testDir, { recursive: true, force: true });
+
+  const mode = { putOk: false };
+  const mockS3 = buildMockS3(mode);
+
+  const db = await Tero.create({
+    directory: testDir,
+    synchronous: 'full',
+    hydrateOnStartup: {
+      cloudStorage: {
+        bucket: 'test-bucket',
+        region: 'us-east-1',
+        accessKeyId: 'k',
+        secretAccessKey: 's',
+        pathPrefix: 'backups',
+        dbName: 'p1drain',
+      },
+      mode: 'lazy',
+      customS3Client: mockS3,
+    },
+  });
+
+  try {
+    await db.create('drain_doc', { v: 1 });
+
+    // Delete queues the tombstone because putTombstone fails.
+    await db.delete('drain_doc');
+
+    const pendingPath = join(testDir, '.cloud_pending.json');
+    assert.equal(existsSync(pendingPath), true, 'pending queue file must exist after a queued delete');
+
+    // Now let cloud writes succeed so the retry can drain the queue.
+    mode.putOk = true;
+
+    // Force an immediate retry instead of waiting for the 2s timer.
+    await db.retryCloudReconciliation();
+
+    // When the last entry drains, savePendingCloud() unlinks the queue file
+    // and (per the P1 fix) fsyncs the parent directory so the removal is
+    // durable. Previously the unlink path had NO directory fsync at all.
+    assert.equal(existsSync(pendingPath), false, 'drained pending queue file must be removed');
+
+    // No stale temp files after the drain.
+    const leftovers = readdirSync(testDir).filter((f) =>
+      f.startsWith('.cloud_pending.json.tmp.') || f.startsWith('.cloud_pending_deletions.json.tmp.'));
+    assert.equal(leftovers.length, 0, `no stale temp files after drain (found: ${leftovers.join(', ')})`);
+
+    assert.equal(db.isCloudReconciliationPending(), false, 'reconciliation must be fully drained');
+  } finally {
+    try { await db.close(); } catch {}
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
 
