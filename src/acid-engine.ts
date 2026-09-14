@@ -1021,6 +1021,17 @@ export interface RestoreMarker {
     stage: 'prepared' | 'swapped';
 }
 
+export function safeRemoveDirectory(dirPath: string): void {
+    try {
+        if (existsSync(dirPath)) {
+            rmSync(dirPath, { recursive: true, force: true });
+        }
+    } catch (err: any) {
+        if (err?.code === 'ENOENT') return;
+        throw err;
+    }
+}
+
 export function recoverPendingRestore(dbPath: string): void {
     const markerPath = `${dbPath}.restore-in-progress`;
     if (!existsSync(markerPath)) return;
@@ -1043,25 +1054,21 @@ export function recoverPendingRestore(dbPath: string): void {
     if (backupExists && !targetExists && stagingExists) {
         // backup exists + target missing + staging exists -> complete promotion
         renameSync(marker.stagingDir, marker.targetDir);
-        if (existsSync(marker.backupDir)) {
-            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
-        }
+        safeRemoveDirectory(marker.backupDir);
     } else if (targetExists && backupExists && !stagingExists) {
         // target exists + backup exists + staging missing -> promotion likely completed
-        if (existsSync(marker.backupDir)) {
-            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
-        }
+        safeRemoveDirectory(marker.backupDir);
     } else if (targetExists && backupExists && stagingExists) {
         // backup exists + target exists + staging exists -> ambiguous
         // use marker state/metadata to deterministically recover:
         if (marker.stage === 'swapped') {
             // promotion was swapping staging into target; staging and backup are discarded
-            try { rmSync(marker.stagingDir, { recursive: true, force: true }); } catch { }
-            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+            safeRemoveDirectory(marker.stagingDir);
+            safeRemoveDirectory(marker.backupDir);
         } else {
             // stage === 'prepared': original target is intact, clean up staging and backup
-            try { rmSync(marker.stagingDir, { recursive: true, force: true }); } catch { }
-            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+            safeRemoveDirectory(marker.stagingDir);
+            safeRemoveDirectory(marker.backupDir);
         }
     } else if (!targetExists && backupExists && !stagingExists) {
         // target missing + backup exists + staging missing -> rollback: restore backup to target
@@ -1071,10 +1078,10 @@ export function recoverPendingRestore(dbPath: string): void {
         renameSync(marker.stagingDir, marker.targetDir);
     } else if (targetExists) {
         if (stagingExists) {
-            try { rmSync(marker.stagingDir, { recursive: true, force: true }); } catch { }
+            safeRemoveDirectory(marker.stagingDir);
         }
         if (backupExists) {
-            try { rmSync(marker.backupDir, { recursive: true, force: true }); } catch { }
+            safeRemoveDirectory(marker.backupDir);
         }
     }
 
@@ -1089,7 +1096,11 @@ export function recoverPendingRestore(dbPath: string): void {
             if (fd !== undefined) closeSync(fd);
         }
     }
-    try { unlinkSync(markerPath); } catch { /* approved: cleanup unneeded marker */ }
+    try {
+        unlinkSync(markerPath);
+    } catch (err: any) {
+        if (err?.code !== 'ENOENT') throw err;
+    }
 }
 
 export function verifyWalSegmentContinuity(segmentPaths: string[], verifyContent: boolean = true): Array<{ path: string; startLsn: number; endLsn: number }> {
@@ -1097,7 +1108,9 @@ export function verifyWalSegmentContinuity(segmentPaths: string[], verifyContent
     for (const p of segmentPaths) {
         const base = p.split('/').pop()!;
         const match = base.match(/\.seg-(\d+)-(\d+)$/);
-        if (!match) continue;
+        if (!match) {
+            throw new RecoveryCorruptionError(p, 0, `Malformed WAL segment filename: ${base}`);
+        }
         const startLsn = parseInt(match[1], 10);
         const endLsn = parseInt(match[2], 10);
         if (startLsn > endLsn) {
@@ -1137,6 +1150,12 @@ export function verifyWalSegmentContinuity(segmentPaths: string[], verifyContent
         }
     }
     return segments;
+}
+
+export interface SnapshotHandle {
+    readonly lsn: number;
+    files(): AsyncGenerator<{ key: string; lsn: number; state: 'present' | 'deleted'; data?: JsonValue }>;
+    close(): void;
 }
 
 // ACID-compliant storage engine
@@ -1234,14 +1253,45 @@ export class ACIDStorageEngine {
     }
 
     /**
+     * Creates an isolated logical snapshot handle as of upToLsn.
+     * Enforces single-active-snapshot invariant and provides explicit close().
+     */
+    beginSnapshot(upToLsn: number): SnapshotHandle {
+        if (this.activeSnapshotLsn !== null) {
+            throw new Error(`Cannot begin concurrent snapshot at LSN ${upToLsn}: active snapshot already in progress at LSN ${this.activeSnapshotLsn}`);
+        }
+        const dirtySnapshot = this.peekDirtyKeys(upToLsn);
+        this.activeSnapshotLsn = upToLsn;
+        this.snapshotBeforeImages.clear();
+
+        let closed = false;
+        const self = this;
+
+        return {
+            lsn: upToLsn,
+            files() {
+                if (closed) throw new Error('SnapshotHandle has already been closed');
+                return self._streamSnapshotFiles(upToLsn, dirtySnapshot);
+            },
+            close() {
+                if (!closed) {
+                    closed = true;
+                    if (self.activeSnapshotLsn === upToLsn) {
+                        self.activeSnapshotLsn = null;
+                        self.snapshotBeforeImages.clear();
+                    }
+                }
+            }
+        };
+    }
+
+    /**
      * Streams a version-consistent logical snapshot of the database as of upToLsn.
      * Fully protected against concurrent writes via Copy-On-Write snapshotBeforeImages.
      */
     snapshotFiles(upToLsn: number): AsyncGenerator<{ key: string; lsn: number; state: 'present' | 'deleted'; data?: JsonValue }> {
-        const dirtySnapshot = this.peekDirtyKeys(upToLsn);
-        this.activeSnapshotLsn = upToLsn;
-        this.snapshotBeforeImages.clear();
-        return this._streamSnapshotFiles(upToLsn, dirtySnapshot);
+        const handle = this.beginSnapshot(upToLsn);
+        return handle.files();
     }
 
     private async *_streamSnapshotFiles(upToLsn: number, dirtySnapshot: Map<string, DirtyEntry>): AsyncGenerator<{ key: string; lsn: number; state: 'present' | 'deleted'; data?: JsonValue }> {

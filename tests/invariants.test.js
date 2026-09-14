@@ -629,6 +629,14 @@ test('Invariant H: verifyWalSegmentContinuity enforces contiguous LSN sequence a
       () => verifyWalSegmentContinuity([badStart], true),
       (err) => err.code === 'RECOVERY_CORRUPTION'
     );
+
+    // Reject malformed segment filename (e.g. .wal.seg-corrupted)
+    const malformedSeg = join(testDir, '.wal.seg-corrupted');
+    writeFileSync(malformedSeg, 'corrupted');
+    assert.throws(
+      () => verifyWalSegmentContinuity([malformedSeg]),
+      (err) => err.code === 'RECOVERY_CORRUPTION'
+    );
   } finally {
     rmSync(testDir, { recursive: true, force: true });
   }
@@ -1322,4 +1330,51 @@ test('Invariant S: listArchives() only matches .wal.seg-<start>-<end>', async ()
     rmSync(testDir, { recursive: true, force: true });
   }
 });
+
+// ============================================================================
+// Invariant T: SnapshotHandle lifecycle and rejection of concurrent snapshots
+// ============================================================================
+test('Invariant T: beginSnapshot creates isolated SnapshotHandle and rejects concurrent snapshots', async () => {
+  const testDir = resolve('./test_invariant_t_snapshot');
+  rmSync(testDir, { recursive: true, force: true });
+
+  try {
+    const db = new Tero({ directory: testDir, synchronous: 'full' });
+    await db.create('doc_1', { name: 'One' });
+    await db.create('doc_2', { name: 'Two' });
+
+    const lsn = db.acidEngine.getLastCommittedLSN();
+    const handle = db.acidEngine.beginSnapshot(lsn);
+    assert.equal(handle.lsn, lsn);
+
+    // Concurrent snapshot attempt while handle is active must throw
+    assert.throws(
+      () => db.acidEngine.beginSnapshot(lsn),
+      /Cannot begin concurrent snapshot/
+    );
+    assert.throws(
+      () => db.acidEngine.snapshotFiles(lsn),
+      /Cannot begin concurrent snapshot/
+    );
+
+    // Consume files from the snapshot
+    const files = [];
+    for await (const file of handle.files()) {
+      files.push(file.key);
+    }
+    assert.ok(files.includes('doc_1'));
+    assert.ok(files.includes('doc_2'));
+
+    // After closing handle, another snapshot can be initiated cleanly
+    handle.close();
+    const secondHandle = db.acidEngine.beginSnapshot(lsn);
+    assert.ok(secondHandle);
+    secondHandle.close();
+
+    db.destroy();
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
 

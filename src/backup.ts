@@ -6,7 +6,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { CronJob } from "cron";
 import { gzipSync, gunzipSync } from "zlib";
 import { createHash, randomUUID } from "crypto";
-import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum, streamLogFile } from "./acid-engine.js";
+import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum, streamLogFile, safeRemoveDirectory } from "./acid-engine.js";
 
 /**
  * LSN padded to 16 digits so lexicographic object-key sort == numeric LSN sort.
@@ -1482,15 +1482,19 @@ export class BackupManager {
       fsyncParent();
 
       if (existsSync(backupDir)) {
-        try { rmSync(backupDir, { recursive: true, force: true }); } catch {}
+        safeRemoveDirectory(backupDir);
       }
 
-      unlinkSync(markerPath);
+      try {
+        unlinkSync(markerPath);
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') throw err;
+      }
       fsyncParent();
 
       return result;
     } catch (error) {
-      try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+      safeRemoveDirectory(stagingDir);
       throw error;
     }
   }
