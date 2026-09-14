@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync, readFileSync, readdirSync } from 'fs';
+import { existsSync, rmSync, readFileSync, readdirSync, chmodSync } from 'fs';
 import { createHash } from 'crypto';
 import { resolve, join } from 'path';
 import { Tero } from '../dist/index.js';
@@ -871,4 +871,74 @@ test('P1: drained pending queue is durably removed (parent-directory fsync after
   }
 });
 
+// ---------------------------------------------------------------------------
+// P1 fix: failed local-tombstone removal must not queue a cloud tombstone
+// deletion (which the cloud-deletion retry worker self-cancels while a local
+// tombstone exists). Instead it queues a durable local-tombstone removal;
+// the retry worker unlinks the local tombstone first, and only then proceeds
+// to the cloud tombstone deletion.
+// ---------------------------------------------------------------------------
+
+test('P1: failed local tombstone removal is retried via a dedicated durable queue, then proceeds to cloud tombstone deletion', async () => {
+  const testDir = resolve('./test_p1_local_tombstone_removal_db');
+  rmSync(testDir, { recursive: true, force: true });
+
+  const db = new Tero({ directory: testDir, synchronous: 'full' });
+  const tombDir = join(testDir, '.tombstones');
+  const tombPath = () => join(tombDir, `${createHash('sha256').update('local_removal_doc').digest('hex')}.deleted`);
+  const localPendingPath = join(testDir, '.local_tombstone_deletions.json');
+
+  try {
+    // A document that is created, then deleted (leaving a local tombstone).
+    await db.create('local_removal_doc', { v: 1 });
+    await db.delete('local_removal_doc');
+    assert.equal(existsSync(tombPath()), true, 'local tombstone must exist after delete');
+
+    // Make the tombstone directory read-only so the next unlink fails
+    // (EPERM/EACCES) — simulating a permanent-ish local tombstone removal
+    // failure inside a committed recreate.
+    chmodSync(tombDir, 0o555);
+
+    // Recreate the document. The logical commit succeeds (the tombstone is
+    // logically absent, so re-create is allowed), but the post-commit local
+    // tombstone unlink now FAILS. The P1 fix must queue a LOCAL tombstone
+    // removal — NOT a cloud tombstone deletion.
+    const created = await db.create('local_removal_doc', { v: 2 });
+    assert.equal(created, true, 'recreate must commit successfully even though local tombstone removal failed');
+
+    // A dedicated durable local-removal queue must exist with the entry.
+    assert.equal(existsSync(localPendingPath), true, '.local_tombstone_deletions.json must be durably persisted');
+    const queued = JSON.parse(readFileSync(localPendingPath, 'utf8'));
+    const queuedKeys = new Set(Array.isArray(queued) ? queued.map((e) => Array.isArray(e) ? e[0] : e.key) : Object.keys(queued));
+    assert.equal(queuedKeys.has('local_removal_doc'), true, 'local tombstone removal must be queued');
+
+    // The local tombstone must STILL exist (unlink failed), and it must NOT
+    // have been routed to the cloud-deletion queue (which would self-cancel).
+    assert.equal(existsSync(tombPath()), true, 'failed unlink must leave the local tombstone in place for the retry worker');
+    assert.equal(existsSync(join(testDir, '.cloud_pending_deletions.json')), false,
+      'a failed local tombstone removal must NOT be queued as a cloud tombstone deletion');
+
+    // No stale temp files.
+    const tmpLeftovers = readdirSync(testDir).filter((f) => f.startsWith('.local_tombstone_deletions.json.tmp.'));
+    assert.equal(tmpLeftovers.length, 0, `no stale temp files (found: ${tmpLeftovers.join(', ')})`);
+
+    // Make the tombstone directory writable again so the retry can succeed.
+    chmodSync(tombDir, 0o755);
+
+    // The retry worker retries the local unlink, then proceeds.
+    await db.retryCloudReconciliation();
+
+    // Local tombstone removed and the durable queue drained.
+    assert.equal(existsSync(tombPath()), false, 'retry worker must remove the local tombstone once unlink succeeds');
+    assert.equal(existsSync(localPendingPath), false, 'drained local-removal queue file must be removed');
+    assert.equal(db.isCloudReconciliationPending(), false, 'reconciliation must be fully drained');
+
+    const leftovers = readdirSync(testDir).filter((f) => f.startsWith('.local_tombstone_deletions.json.tmp.'));
+    assert.equal(leftovers.length, 0, `no stale temp files after drain (found: ${leftovers.join(', ')})`);
+  } finally {
+    try { chmodSync(tombDir, 0o755); } catch {}
+    try { await db.close(); } catch {}
+    rmSync(testDir, { recursive: true, force: true });
+  }
+});
 

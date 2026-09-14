@@ -457,6 +457,21 @@ export class Tero {
   /** Durable cloud reconciliation for deletes (P0-2) — keys needing cloud delete+tombstone, with deletion LSN */
   private cloudPendingTombstones = new Map<string, number>();
   private cloudPendingTombstoneDeletions = new Map<string, number>();
+  /**
+   * Durable pending local-tombstone-removal retries (P1). When a committed
+   * recreate/write cannot unlink the old local tombstone (EBUSY, EPERM, …),
+   * the key is queued here — NOT in cloudPendingTombstoneDeletions. The retry
+   * worker first retries the local unlink+fsync, and only once that succeeds
+   * does it proceed to the cloud tombstone deletion.
+   *
+   * Previously the code queued a cloud tombstone deletion, but the
+   * cloud-deletion retry worker explicitly refuses to process entries while a
+   * local tombstone still exists (hasLocal guard) — so the queue was
+   * self-cancelling in exactly the failure state it was created to recover,
+   * leaving an undeletable local tombstone forever and preventing the cloud
+   * tombstone from ever being deleted.
+   */
+  private pendingLocalTombstoneRemovals = new Map<string, number>();
   private cloudPendingTimer?: ReturnType<typeof setTimeout>;
   private reconciliationLocks = new Map<string, Promise<void>>();
   private reconciliationLockStorage = new AsyncLocalStorage<Set<string>>();
@@ -601,6 +616,7 @@ export class Tero {
       // Restore pending cloud reconciliation *after* dataRecovery exists so schedule can run
       this.loadPendingCloud();
       this.loadPendingCloudDeletions();
+      this.loadPendingLocalTombstoneRemovals();
       // Fallback: reconstruct pending from local tombstones if queue file was lost (ENOSPC case)
       try {
         const tombDir = pathJoin(this.teroDirectory, '.tombstones');
@@ -612,7 +628,7 @@ export class Tero {
               const content = readFileSync(pathJoin(tombDir, f), 'utf8');
               const obj = JSON.parse(content);
               if (obj.key && typeof obj.key === 'string' && typeof obj.lsn === 'number') {
-                if (!this.cloudPendingTombstones.has(obj.key) && !this.cloudPendingTombstoneDeletions.has(obj.key)) {
+                if (!this.cloudPendingTombstones.has(obj.key) && !this.cloudPendingTombstoneDeletions.has(obj.key) && !this.pendingLocalTombstoneRemovals.has(obj.key)) {
                   if (this.dataRecovery) {
                     this.cloudPendingTombstones.set(obj.key, obj.lsn);
                   }
@@ -625,7 +641,7 @@ export class Tero {
           }
         }
       } catch {}
-      if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0) this.scheduleCloudRetry();
+      if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0 || this.pendingLocalTombstoneRemovals.size > 0) this.scheduleCloudRetry();
     } catch (error) {
       if (error instanceof RecoveryCorruptionError || error instanceof DataCorruptionError) {
         throw error;
@@ -1099,8 +1115,14 @@ export class Tero {
                 try {
                   this.deleteLocalTombstone(key);
                 } catch (e) {
-                  // Local tombstone removal failed — queue cloud deletion retry and keep local file for next attempt
-                  this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
+                  // P1: Local tombstone removal failed — queue a LOCAL
+                  // tombstone-removal retry, NOT a cloud tombstone deletion.
+                  // The cloud-deletion retry worker refuses to process entries
+                  // while a local tombstone exists, so queuing a cloud
+                  // deletion here would be self-cancelling. The local-removal
+                  // retry worker will unlink the tombstone first, then proceed
+                  // to the cloud tombstone deletion.
+                  this.queueLocalTombstoneRemoval(key, this.acidEngine!.getLastCommittedLSN());
                   return;
                 }
                 if (this.cloudPendingTombstones.has(key)) {
@@ -1185,7 +1207,9 @@ export class Tero {
                 try {
                   this.deleteLocalTombstone(key);
                 } catch {
-                  this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
+                  // P1: queue a local tombstone-removal retry, not a cloud
+                  // deletion (see comment in the committed !== null branch).
+                  this.queueLocalTombstoneRemoval(key, this.acidEngine!.getLastCommittedLSN());
                   return;
                 }
                 if (this.cloudPendingTombstones.has(key)) {
@@ -1601,6 +1625,71 @@ export class Tero {
     }
   }
 
+  private pendingLocalTombstoneRemovalsPath(): string {
+    return pathJoin(this.teroDirectory, '.local_tombstone_deletions.json');
+  }
+
+  private loadPendingLocalTombstoneRemovals(): void {
+    try {
+      const p = this.pendingLocalTombstoneRemovalsPath();
+      if (!existsSync(p)) return;
+      const raw = readFileSync(p, 'utf8');
+      const arr: unknown = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          if (Array.isArray(item) && typeof item[0] === 'string' && typeof item[1] === 'number') {
+            this.pendingLocalTombstoneRemovals.set(item[0], item[1]);
+          } else if (item && typeof (item as any).key === 'string' && typeof (item as any).lsn === 'number') {
+            this.pendingLocalTombstoneRemovals.set((item as any).key, (item as any).lsn);
+          }
+        }
+      } else if (arr && typeof arr === 'object') {
+        for (const [k, v] of Object.entries(arr as Record<string, unknown>)) {
+          if (typeof v === 'number') this.pendingLocalTombstoneRemovals.set(k, v);
+        }
+      }
+    } catch { /* approved */ }
+  }
+
+  private savePendingLocalTombstoneRemovals(): void {
+    if (this.pendingPersistenceInFlight) {
+      throw new Error('savePendingLocalTombstoneRemovals: re-entrant persistence detected — reconciliation journal mutex violated');
+    }
+    this.pendingPersistenceInFlight = true;
+    const parent = this.teroDirectory;
+    const p = this.pendingLocalTombstoneRemovalsPath();
+    try {
+      if (this.pendingLocalTombstoneRemovals.size === 0) {
+        if (existsSync(p)) {
+          unlinkSync(p);
+          this.fsyncDirectory(parent);
+        }
+        return;
+      }
+      const tmp =
+        `${p}.tmp.${process.pid}.${Date.now()}.${randomBytes(6).toString('hex')}`;
+      writeFileSync(tmp, JSON.stringify([...this.pendingLocalTombstoneRemovals.entries()]));
+      try {
+        const fd = openSync(tmp, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(tmp, p);
+      } catch (err) {
+        try { unlinkSync(tmp); } catch { /* approved */ }
+        throw err;
+      }
+      this.fsyncDirectory(parent);
+    } finally {
+      this.pendingPersistenceInFlight = false;
+    }
+  }
+
+  private queueLocalTombstoneRemoval(key: string, lsn?: number): void {
+    const ver = lsn ?? this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
+    this.pendingLocalTombstoneRemovals.set(key, ver);
+    this.savePendingLocalTombstoneRemovals();
+    this.scheduleCloudRetry();
+  }
+
   private queueCloudTombstoneDeletion(key: string, expectedVersion?: number): void {
     const ver = expectedVersion ?? this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
     this.cloudPendingTombstoneDeletions.set(key, ver);
@@ -1644,14 +1733,80 @@ export class Tero {
 
   private scheduleCloudRetry(): void {
     if (this.cloudPendingTimer) return;
-    if (!this.dataRecovery || this.hydrateMode !== 'lazy') return;
-    if (this.cloudPendingTombstones.size === 0 && this.cloudPendingTombstoneDeletions.size === 0) return;
+    // Local tombstone-removal retries are meaningful even without cloud
+    // recovery — a stuck local tombstone resurrects the key into missingKeys
+    // on every restart and blocks cloud tombstone deletion.
+    const hasLocalPending = this.pendingLocalTombstoneRemovals.size > 0;
+    if (!hasLocalPending && (!this.dataRecovery || this.hydrateMode !== 'lazy')) return;
+    if (this.cloudPendingTombstones.size === 0 && this.cloudPendingTombstoneDeletions.size === 0 && !hasLocalPending) return;
     this.cloudPendingTimer = setTimeout(() => {
       this.cloudPendingTimer = undefined;
+      void this.retryPendingLocalTombstoneRemovals();
       void this.retryPendingCloudTombstones();
       void this.retryPendingCloudTombstoneDeletions();
     }, 2000);
     (this.cloudPendingTimer as any).unref?.();
+  }
+
+  /**
+   * Retry pending local tombstone removals (P1).
+   *
+   * For each key, first retries the local unlink + parent-dir fsync. Only once
+   * that succeeds does it proceed to the cloud tombstone deletion (which the
+   * cloud-deletion retry worker cannot do while a local tombstone exists).
+   * If the key was re-deleted in the meantime, the local tombstone should
+   * stay — the pending removal is cancelled.
+   */
+  private async retryPendingLocalTombstoneRemovals(): Promise<void> {
+    if (this.pendingLocalTombstoneRemovals.size === 0) return;
+    const entries = [...this.pendingLocalTombstoneRemovals.entries()];
+    for (const [key, lsn] of entries) {
+      await this.withReconciliationLock(key, async () => {
+        // If the key was re-deleted after the recreate that queued this
+        // removal, the local tombstone should stay — cancel the pending
+        // removal. (committed === null or undefined-with-local-tombstone
+        // both indicate the key is currently deleted.)
+        const committed = this.acidEngine.getCommittedData(key);
+        if (committed === undefined || committed === null) {
+          this.pendingLocalTombstoneRemovals.delete(key);
+          try { this.savePendingLocalTombstoneRemovals(); } catch { /* approved */ }
+          return;
+        }
+        // Retry the local tombstone removal (unlink + parent-dir fsync).
+        try {
+          this.deleteLocalTombstone(key);
+        } catch {
+          // Still cannot remove — keep pending for next retry.
+          return;
+        }
+        // Local tombstone removed — clear pending, then proceed to cloud
+        // tombstone deletion. Also clear any stale cloudPendingTombstone-
+        // Deletions entry that may have been queued for this key.
+        this.pendingLocalTombstoneRemovals.delete(key);
+        try { this.savePendingLocalTombstoneRemovals(); } catch { /* approved */ }
+        if (this.cloudPendingTombstones.has(key)) {
+          this.cloudPendingTombstones.delete(key);
+          try { this.savePendingCloud(); } catch { /* approved */ }
+        }
+        if (this.dataRecovery) {
+          try {
+            await (this.dataRecovery as any).deleteTombstone?.(key);
+            if (this.cloudPendingTombstoneDeletions.has(key)) {
+              this.cloudPendingTombstoneDeletions.delete(key);
+              try { this.savePendingCloudDeletions(); } catch { /* approved */ }
+            }
+          } catch {
+            // Cloud tombstone deletion failed — queue it now that the local
+            // tombstone is gone (the cloud-deletion retry worker can process
+            // it because hasLocal is now false).
+            this.queueCloudTombstoneDeletion(key, lsn);
+          }
+        }
+      });
+    }
+    if (this.pendingLocalTombstoneRemovals.size > 0) {
+      this.scheduleCloudRetry();
+    }
   }
 
   private async retryPendingCloudTombstones(): Promise<void> {
@@ -1753,16 +1908,17 @@ export class Tero {
 
   /** Whether cloud tombstone reconciliation is pending (P0-2). */
   isCloudReconciliationPending(): boolean {
-    return this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0;
+    return this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0 || this.pendingLocalTombstoneRemovals.size > 0;
   }
 
   /** Keys with pending cloud delete/tombstone (P0-2). */
   getCloudReconciliationPendingKeys(): string[] {
-    return [...new Set([...this.cloudPendingTombstones.keys(), ...this.cloudPendingTombstoneDeletions.keys()])];
+    return [...new Set([...this.cloudPendingTombstones.keys(), ...this.cloudPendingTombstoneDeletions.keys(), ...this.pendingLocalTombstoneRemovals.keys()])];
   }
 
   /** Retry pending cloud tombstones immediately (P0-2). */
   async retryCloudReconciliation(): Promise<void> {
+    await this.retryPendingLocalTombstoneRemovals();
     await this.retryPendingCloudTombstones();
     await this.retryPendingCloudTombstoneDeletions();
   }
