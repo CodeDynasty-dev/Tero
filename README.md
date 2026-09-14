@@ -213,9 +213,9 @@ Tero instance (one per process)
 
 ```javascript
 try {
-  await db.create('user', invalidData, { validate: true, strict: true });
+  await db.create('user', data);
 } catch (error) {
-  else if (error.message.includes('already exists'))     { /* duplicate key */ }
+  if (error.message.includes('already exists')) { /* duplicate key */ }
 }
 ```
 

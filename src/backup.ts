@@ -504,15 +504,57 @@ export class BackupManager {
     try {
       const fs = await import('fs/promises');
       const files = await fs.readdir(localDir);
-      const jsonFiles = files.filter(file => file.endsWith('.json'));
+      // Issue 3: Filter out metadata and internal files
+      const jsonFiles = files.filter(file =>
+        file.endsWith('.json') &&
+        !file.endsWith('-metadata.json') &&
+        file !== 'backup-metadata.json' &&
+        file !== 'MANIFEST.json' &&
+        file !== 'latest.json' &&
+        file !== 'index.json' &&
+        !file.startsWith('.')
+      );
 
-      // Bounded concurrency — same reason as uploadDirectoryToCloud.
+      // List existing remote objects under this DB's prefix for incremental diff & delete propagation
+      const remotePrefix = this.getCloudKey('');
+      const remoteObjs = await this.listPrefixWithMeta(remotePrefix);
+      const remoteMap = new Map(remoteObjs.map(o => [o.key, o]));
+      const localCloudKeys = new Set<string>();
+
+      // Issue 8: Diff against remote objects to only upload new or modified files
       await pooledMap(jsonFiles, 16, async (file) => {
         const localFilePath = join(localDir, file);
-        // Use direct key-based cloud storage: each JSON file is stored with its key as the cloud key
         const cloudKey = this.getCloudKey(file);
+        localCloudKeys.add(cloudKey);
+
+        const stat = statSync(localFilePath);
+        const remote = remoteMap.get(cloudKey);
+        // Skip upload if remote file exists with identical size and timestamp is current
+        if (remote && remote.size === stat.size && remote.lastModified.getTime() >= stat.mtimeMs - 1000) {
+          return;
+        }
+
         await this.uploadToCloud(localFilePath, cloudKey);
       });
+
+      // Issue 2: Propagate deletes to cloud — remove remote documents not present in localDir
+      const toDelete = remoteObjs.filter(o =>
+        o.key.endsWith('.json') &&
+        !o.key.endsWith('MANIFEST.json') &&
+        !o.key.endsWith('latest.json') &&
+        !o.key.endsWith('index.json') &&
+        !o.key.endsWith('backup-metadata.json') &&
+        !o.key.includes('/wal/') &&
+        !localCloudKeys.has(o.key)
+      );
+
+      if (toDelete.length > 0) {
+        await pooledMap(toDelete, 16, async (o) => {
+          try {
+            await this.deleteObject(o.key);
+          } catch { }
+        });
+      }
     } catch (error) {
       throw new Error(`Failed to upload individual files to cloud: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -769,20 +811,48 @@ export class BackupManager {
     }
 
     try {
-      // 1) Snapshot all data JSON files to bucket. POOLED — the old sequential
-      //    await-per-file loop made a 50k-doc backup take ~12 minutes at ~15ms
-      //    per PUT; 16 in flight brings it under a minute. Per-item errors are
-      //    collected (not fatal), matching the previous best-effort semantics.
+      // 1) Snapshot all data JSON files to bucket. POOLED with incremental diffing.
       const jsonFiles = await this.getJsonFiles();
+      const remotePrefix = this.getCloudKey('');
+      const remoteObjs = await this.listPrefixWithMeta(remotePrefix);
+      const remoteMap = new Map(remoteObjs.map(o => [o.key, o]));
+      const localCloudKeys = new Set<string>();
+
       await pooledMap(jsonFiles, 16, async (file) => {
         try {
           const cloudKey = this.getCloudKey(file.name);
+          localCloudKeys.add(cloudKey);
+          const remote = remoteMap.get(cloudKey);
+          if (remote && remote.size === file.size && remote.lastModified.getTime() >= file.mtime.getTime() - 1000) {
+            // Already up to date in cloud
+            return;
+          }
           await this.uploadToCloud(file.path, cloudKey);
           uploadedDataFiles++;
         } catch (error) {
           errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
         }
       });
+
+      // Issue 2: Propagate deletes to cloud — remove remote documents not present in local files
+      const toDelete = remoteObjs.filter(o =>
+        o.key.endsWith('.json') &&
+        !o.key.endsWith('MANIFEST.json') &&
+        !o.key.endsWith('latest.json') &&
+        !o.key.endsWith('index.json') &&
+        !o.key.endsWith('backup-metadata.json') &&
+        !o.key.includes('/wal/') &&
+        !localCloudKeys.has(o.key)
+      );
+      if (toDelete.length > 0) {
+        await pooledMap(toDelete, 16, async (o) => {
+          try {
+            await this.deleteObject(o.key);
+          } catch (error) {
+            errors.push(`delete:${o.key}:${error instanceof Error ? error.message : 'Unknown error'}`);
+          }
+        });
+      }
 
       // 2) Stream WAL archive segments the caller wants persisted.
       const walPaths = options?.walArchivePaths ?? [];
@@ -811,7 +881,7 @@ export class BackupManager {
         };
         const manifestKey = `${this.config.cloudStorage.pathPrefix || 'tero-backups'}/${this.getDbName()}/MANIFEST.json`;
         await this.uploadBuffer(
-          JSON.stringify(manifest, null, 2),
+          JSON.stringify(manifest),
           manifestKey,
           'application/json'
         );
@@ -926,13 +996,13 @@ export class BackupManager {
     return keys;
   }
 
-  private async listPrefixWithMeta(prefix: string): Promise<Array<{ key: string; lastModified: Date }>> {
+  private async listPrefixWithMeta(prefix: string): Promise<Array<{ key: string; size: number; lastModified: Date }>> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
-    const out: Array<{ key: string; lastModified: Date }> = [];
+    const out: Array<{ key: string; size: number; lastModified: Date }> = [];
     let token: string | undefined;
     do {
       const resp = await this.s3Client.send(new ListObjectsV2Command({ Bucket: this.config.cloudStorage.bucket, Prefix: prefix, ContinuationToken: token }));
-      if (resp.Contents) for (const o of resp.Contents) if (o.Key) out.push({ key: o.Key, lastModified: o.LastModified ?? new Date(0) });
+      if (resp.Contents) for (const o of resp.Contents) if (o.Key) out.push({ key: o.Key, size: o.Size ?? 0, lastModified: o.LastModified ?? new Date(0) });
       token = resp.IsTruncated ? resp.NextContinuationToken : undefined;
     } while (token);
     return out;
@@ -1214,9 +1284,9 @@ export class BackupManager {
         mkdirSync(dirname(dest), { recursive: true });
         const tmp = `${dest}.tmp.${process.pid}`;
         // Match the engine's data-file format exactly (atomicWriteFile uses
-        // JSON.stringify(data, null, 2)) so restored files are byte-identical
+        // compact JSON.stringify(data)) so restored files are byte-identical
         // to engine-written ones.
-        writeFileSync(tmp, JSON.stringify(e.afterImage ?? null, null, 2)); renameSync(tmp, dest);
+        writeFileSync(tmp, JSON.stringify(e.afterImage ?? null)); renameSync(tmp, dest);
       } else if (e.operation === 'DELETE') { try { unlinkSync(dest); } catch {} }
       lastLsn = Math.max(lastLsn, e.lsn);
     };

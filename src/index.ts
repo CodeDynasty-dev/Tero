@@ -106,6 +106,8 @@ function validateDirectory(raw: string): string {
 interface TeroConfig {
   directory?: string;
   cacheSize?: number;
+  /** Max committedBuffer entries flushed to disk per tick (prevents event loop stalls). Default: 256. */
+  checkpointBatchSize?: number;
   /**
    * Durability / throughput trade-off knob (like SQLite's `PRAGMA synchronous`):
    *   - 'full'   (default): fsync the WAL on every commit. Max durability, ~15–60 ops/s
@@ -414,7 +416,7 @@ export class Tero {
       const syncMode: SynchronousMode = synchronous ?? 'full';
       const syncInterval: number = commitIntervalMs ?? 10;
       const dataFlushInterval: number = dataFlushIntervalMs ?? 50;
-      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval);
+      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval, config?.checkpointBatchSize);
 
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
@@ -670,10 +672,7 @@ export class Tero {
     return typeof id === 'string' ? id : id.getId();
   }
 
-  async write(transactionId: string | Transaction, key: string, data: any, options?: {
-    validate?: boolean;
-    strict?: boolean;
-  }): Promise<void> {
+  async write(transactionId: string | Transaction, key: string, data: any): Promise<void> {
     try {
       const txId = this._txId(transactionId);
       this.validateKey(key);
@@ -690,6 +689,7 @@ export class Tero {
       if (byteLen > MAX_DOCUMENT_SIZE) {
         throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB) — got ${(byteLen / (1024 * 1024)).toFixed(2)}MB`);
       }
+
       // Check cache for beforeImage so engine doesn't need disk I/O on hot writes
       const cachedEntry = this.cache.get(key);
       let cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) ? cachedEntry.data : undefined;
@@ -1688,4 +1688,20 @@ export class Tero {
 }
 
 // Export types for external use
-export { BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, HydrationMode, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger };
+export {
+  BackupConfig,
+  BackupMetadata,
+  BucketBackupResult,
+  CloudStorageConfig,
+  RecoveryConfig,
+  RecoveryResult,
+  FileRecoveryInfo,
+  HydrateConfig,
+  HydrationMode,
+  TeroConfig,
+  LiveBackupOptions,
+  LiveBackupStatus,
+  LiveCheckpointResult,
+  RestoreLiveResult,
+  BackupLogger
+};

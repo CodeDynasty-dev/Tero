@@ -430,7 +430,33 @@ export class LockManager {
         }>;
     }> = new Map();
 
+    private waitingOn: Map<string, Set<string>> = new Map(); // waiterTxId -> Set<holderTxId>
     private readonly DEADLOCK_TIMEOUT = 30000; // 30 seconds
+
+    private hasCycle(fromTx: string, targetTx: string, visited = new Set<string>()): boolean {
+        if (fromTx === targetTx) return true;
+        visited.add(fromTx);
+        const nextTxs = this.waitingOn.get(fromTx);
+        if (nextTxs) {
+            for (const next of nextTxs) {
+                if (next === targetTx) return true;
+                if (!visited.has(next)) {
+                    if (this.hasCycle(next, targetTx, visited)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private cleanTxGraph(transactionId: string): void {
+        this.waitingOn.delete(transactionId);
+        for (const [waiter, holders] of this.waitingOn.entries()) {
+            holders.delete(transactionId);
+            if (holders.size === 0) {
+                this.waitingOn.delete(waiter);
+            }
+        }
+    }
 
     /**
      * Acquire a lock. Returns `true` synchronously when the lock is granted
@@ -479,16 +505,47 @@ export class LockManager {
             return true;
         }
 
-        // Shared→exclusive upgrade is handled via the wait queue. The
-        // previous fast path deleted the holder before re-checking
-        // canGrantLock and lost the shared lock when the upgrade blocked.
-        // Keep the shared lock held while waiting — processWaitQueue will
-        // promote atomically when holders drain.
+        // Deadlock detection before queueing:
+        // 1. Identify all blocking holders
+        const blockingHolders = new Set<string>();
+        for (const h of lockInfo.holders) {
+            if (h !== transactionId) {
+                blockingHolders.add(h);
+            }
+        }
+
+        // 2. Check for cycle in wait-for graph
+        for (const holder of blockingHolders) {
+            if (this.hasCycle(holder, transactionId)) {
+                return Promise.reject(new Error(`Deadlock detected: transaction '${transactionId}' cannot acquire lock on key '${key}'`));
+            }
+        }
+
+        // 3. Shared→exclusive upgrade deadlock: if another shared holder is already waiting for exclusive upgrade
+        if (isHolder && lockType === 'exclusive') {
+            const hasOtherUpgradeWaiter = lockInfo.waitQueue.some(
+                (req: any) => req.type === 'exclusive' && lockInfo.holders.has(req.transactionId) && req.transactionId !== transactionId
+            );
+            if (hasOtherUpgradeWaiter) {
+                return Promise.reject(new Error(`Deadlock detected: multiple transactions upgrading to exclusive lock on key '${key}'`));
+            }
+        }
+
+        // Record wait-for edges in graph
+        let currentWaiting = this.waitingOn.get(transactionId);
+        if (!currentWaiting) {
+            currentWaiting = new Set();
+            this.waitingOn.set(transactionId, currentWaiting);
+        }
+        for (const h of blockingHolders) {
+            currentWaiting.add(h);
+        }
 
         // Slow path: lock is contended — allocate Promise + timer and wait in queue
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 this.removeLockRequest(key, transactionId);
+                this.cleanTxGraph(transactionId);
                 reject(new Error(`Lock acquisition timeout for key '${key}' in transaction '${transactionId}'`));
             }, this.DEADLOCK_TIMEOUT);
 
@@ -497,10 +554,12 @@ export class LockManager {
                 type: lockType,
                 resolve: () => {
                     clearTimeout(timeout);
+                    this.cleanTxGraph(transactionId);
                     resolve();
                 },
                 reject: (error: Error) => {
                     clearTimeout(timeout);
+                    this.cleanTxGraph(transactionId);
                     reject(error);
                 }
             });
@@ -628,6 +687,7 @@ export class LockManager {
                 }
             }
         }
+        this.cleanTxGraph(transactionId);
     }
 
     releaseAllLocks(transactionId: string): void {
@@ -645,19 +705,20 @@ export class LockManager {
                 return true;
             });
         }
+        this.cleanTxGraph(transactionId);
     }
 
     detectDeadlock(): string[] {
-        // Simple deadlock detection - can be enhanced with wait-for graph
-        const suspiciousTransactions: string[] = [];
-
-        for (const [key, lockInfo] of this.locks.entries()) {
-            if (lockInfo.waitQueue.length > 5) { // Arbitrary threshold
-                suspiciousTransactions.push(...lockInfo.waitQueue.map(req => req.transactionId));
+        const deadlocked = new Set<string>();
+        for (const [waiter, holders] of this.waitingOn.entries()) {
+            for (const h of holders) {
+                if (this.hasCycle(h, waiter)) {
+                    deadlocked.add(waiter);
+                    break;
+                }
             }
         }
-
-        return [...new Set(suspiciousTransactions)];
+        return [...deadlocked];
     }
 
     isKeyLocked(key: string): boolean {
@@ -747,6 +808,8 @@ export class ACIDStorageEngine {
         waitingLocks: Set<string>; // keys this tx is queued waiting on
     }> = new Map();
 
+    private finishedTransactions: Map<string, 'committed' | 'aborted'> = new Map();
+
     /**
      * In-memory pending-writes index per active transaction. This is the performant
      * replacement for the previous per-op full-WAL re-read + filter. Each write/read
@@ -816,11 +879,13 @@ export class ACIDStorageEngine {
     }
 
     private synchronous: SynchronousMode;
+    private checkpointBatchSize: number;
 
-    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50) {
+    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50, checkpointBatchSize: number = 1000) {
         this.dbPath = dbPath;
         this.synchronous = synchronous;
         this.DATA_FLUSH_INTERVAL_MS = dataFlushIntervalMs;
+        this.checkpointBatchSize = checkpointBatchSize > 0 ? checkpointBatchSize : 1000;
         this.wal = new WriteAheadLog(dbPath, synchronous, commitIntervalMs);
         this.lockManager = new LockManager();
         this.initializeStorage();
@@ -933,7 +998,7 @@ export class ACIDStorageEngine {
 
         try {
             const filePath = partitionedPath(this.dbPath, entry.key!);
-            this.atomicWriteFile(filePath, JSON.stringify(entry.afterImage, null, 2));
+            this.atomicWriteFile(filePath, JSON.stringify(entry.afterImage));
         } catch (error: any) {
             if (error?.code === 'ENOSPC') throw error;
         }
@@ -966,11 +1031,11 @@ export class ACIDStorageEngine {
                     }
                 } else {
                     // Restore previous content
-                    this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage, null, 2));
+                    this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
                 }
             } else if (entry.operation === 'DELETE' && entry.beforeImage) {
                 // Restore deleted file
-                this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage, null, 2));
+                this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
             }
         } catch (error: any) {
             if (error?.code === 'ENOSPC') throw error;
@@ -1309,53 +1374,57 @@ export class ACIDStorageEngine {
             throw new Error(`Invalid transaction: ${transactionId}`);
         }
 
+        // 1. Write WAL COMMIT record. If this throws, transaction can safely rollback.
         try {
-            // Write commit log entry
             this.wal.writeLog({
                 operation: 'COMMIT',
                 transactionId
             });
-
-            // DEFERRED data-file writes: move committed data to committedBuffer
-            const pendingTx = this.pendingWrites.get(transactionId);
-            if (pendingTx) {
-                for (const [key, op] of pendingTx.entries()) {
-                    if (op.op === 'write' && op.afterImage !== undefined && op.afterImage !== null) {
-                        this.committedBuffer.set(key, { data: op.afterImage, op: 'write' });
-                    } else if (op.op === 'delete') {
-                        this.committedBuffer.set(key, { data: null, op: 'delete' });
-                    }
-                    // Mark dirty for incremental cloud checkpoints (O(1), no I/O)
-                    this.dirtyKeys.add(key);
-                }
-            }
-
-            // Update transaction status
-            transaction.status = 'committed';
-
-            // Release only the locks this tx held or was waiting on
-            this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks, transaction.waitingLocks);
-
-            // Cleanup in-memory state
-            this.pendingWrites.delete(transactionId);
-            this.activeTransactions.delete(transactionId);
-
-            // Bound WAL growth: periodically rotate when no active transactions are left.
-            // MUST flush committedBuffer before archiving — otherwise the
-            // archive truncates .wal while deferred writes are still only in
-            // memory; a crash before the 50ms timer would lose them and
-            // recovery (which reads only .wal) would not replay them.
-            this.commitCount++;
-            if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
-                this.getActiveTransactions().length === 0) {
-                this.flushCommittedBuffer(true);
-                this.wal.rotateLog();
-            }
-
         } catch (error) {
-            // Sync rollback on commit failure
             try { this.rollbackTransaction(transactionId); } catch { }
             throw new Error(`Commit failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+
+        // 2. Point of no return: WAL COMMIT is durable. Irrevocably committed.
+        // NEVER attempt rollback after this point.
+        transaction.status = 'committed';
+
+        // DEFERRED data-file writes: move committed data to committedBuffer
+        const pendingTx = this.pendingWrites.get(transactionId);
+        if (pendingTx) {
+            for (const [key, op] of pendingTx.entries()) {
+                if (op.op === 'write' && op.afterImage !== undefined && op.afterImage !== null) {
+                    this.committedBuffer.set(key, { data: op.afterImage, op: 'write' });
+                } else if (op.op === 'delete') {
+                    this.committedBuffer.set(key, { data: null, op: 'delete' });
+                }
+                // Mark dirty for incremental cloud checkpoints (O(1), no I/O)
+                this.dirtyKeys.add(key);
+            }
+        }
+
+        // Release only the locks this tx held or was waiting on
+        this.lockManager.releaseLocksForTx(transactionId, transaction.heldLocks, transaction.waitingLocks);
+
+        // Cleanup in-memory state
+        this.pendingWrites.delete(transactionId);
+        this.activeTransactions.delete(transactionId);
+        this.finishedTransactions.set(transactionId, 'committed');
+        if (this.finishedTransactions.size > 1000) {
+            const first = this.finishedTransactions.keys().next().value;
+            if (first) this.finishedTransactions.delete(first);
+        }
+
+        // Bound WAL growth: periodically rotate when no active transactions are left.
+        this.commitCount++;
+        if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
+            this.getActiveTransactions().length === 0) {
+            try {
+                this.flushCommittedBuffer(true);
+                this.wal.rotateLog();
+            } catch {
+                // Post-commit maintenance failure must not invalidate the commit
+            }
         }
     }
 
@@ -1384,6 +1453,11 @@ export class ACIDStorageEngine {
         // Cleanup in-memory state
         this.pendingWrites.delete(transactionId);
         this.activeTransactions.delete(transactionId);
+        this.finishedTransactions.set(transactionId, 'aborted');
+        if (this.finishedTransactions.size > 1000) {
+            const first = this.finishedTransactions.keys().next().value;
+            if (first) this.finishedTransactions.delete(first);
+        }
     }
 
     private deepMerge(target: any, source: any): any {
@@ -1418,8 +1492,10 @@ export class ACIDStorageEngine {
     // Utility methods
     getTransactionStatus(transactionId: string): 'active' | 'committed' | 'aborted' | 'not_found' {
         const tx = this.activeTransactions.get(transactionId);
-        if (!tx) return 'not_found';
-        return tx.status;
+        if (tx) return tx.status;
+        const finished = this.finishedTransactions.get(transactionId);
+        if (finished) return finished;
+        return 'not_found';
     }
 
     /**
@@ -1486,22 +1562,28 @@ export class ACIDStorageEngine {
     }
 
     /**
-     * Force-flush the committedBuffer to data files. Called by the background timer
-     * and by forceCheckpoint(). Writes each buffered entry to its data file using
-     * the atomic temp→rename pattern, then clears the buffer.
+     * Flush the committedBuffer to data files. Called by the background timer
+     * and by forceCheckpoint(). Writes buffered entries to data files using
+     * the atomic temp→rename pattern. When unforced, processes in chunks to prevent
+     * event loop starvation under sustained heavy write loads.
      */
-    flushCommittedBuffer(forceFsync = false): void {
+    flushCommittedBuffer(forceFsync = false, maxBatch?: number): void {
         if (this.committedBuffer.size === 0) return;
 
         const syncNeeded = forceFsync || this.synchronous === 'full';
         const touchedDirs = new Set<string>();
+        const limit = maxBatch !== undefined ? maxBatch : (forceFsync ? Infinity : this.checkpointBatchSize);
 
+        let count = 0;
         for (const [key, entry] of this.committedBuffer) {
+            if (count >= limit) break;
+            count++;
+
             const filePath = partitionedPath(this.dbPath, key);
             touchedDirs.add(dirname(filePath));
             if (entry.op === 'write') {
                 try {
-                    this.atomicWriteFile(filePath, JSON.stringify(entry.data, null, 2), syncNeeded);
+                    this.atomicWriteFile(filePath, JSON.stringify(entry.data), syncNeeded);
                 } catch {
                     // best-effort — WAL redo will handle on crash
                 }
@@ -1512,13 +1594,23 @@ export class ACIDStorageEngine {
                     // ignore
                 }
             }
+            this.committedBuffer.delete(key);
         }
+
         if (syncNeeded) {
             for (const dir of touchedDirs) {
                 try { this.fsyncDir(dir); } catch {}
             }
         }
-        this.committedBuffer.clear();
+
+        // If entries remain in buffer, yield event loop and continue draining on next tick
+        if (this.committedBuffer.size > 0 && !forceFsync) {
+            setImmediate(() => {
+                if (this.committedBuffer.size > 0) {
+                    this.flushCommittedBuffer(false);
+                }
+            });
+        }
     }
 
     destroy(): void {
