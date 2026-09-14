@@ -284,29 +284,48 @@ export class Transaction {
   async create(key: string, initialData?: any): Promise<void> {
     this._checkActive();
     // Acquire exclusive lock BEFORE existence check to close TOCTOU
-    // (two concurrent create('same') both passed exists() before either held the lock)
+    let acquiredHere = false;
     const lockRes = (this.db as any).acidEngine.acquireExclusiveLock(this.id, key);
     if (lockRes instanceof Promise) await lockRes;
-    if (this.db.exists(key)) throw new Error(`Document '${key}' already exists`);
-    // Cloud-aware duplicate detection while holding exclusive lock (P1) — same as Tero.create
-    const dbAny: any = this.db as any;
-    if (dbAny.dataRecovery && dbAny.hydrateMode === 'lazy') {
-      if (!dbAny.missingKeys.has(key)) {
-        // Check tombstone first — if tombstoned, allow re-create
-        let hasTomb = false;
-        if (typeof dbAny.dataRecovery.hasTombstone === 'function') {
-          hasTomb = await dbAny.dataRecovery.hasTombstone(key);
+    acquiredHere = true;
+    try {
+      if (this.db.exists(key)) throw new Error(`Document '${key}' already exists`);
+      // Cloud-aware duplicate detection while holding exclusive lock (P1) — same as Tero.create
+      const dbAny: any = this.db as any;
+      if (dbAny.dataRecovery && dbAny.hydrateMode === 'lazy') {
+        if (!dbAny.missingKeys.has(key)) {
+          // Check tombstone first — if tombstoned, allow re-create
+          let hasTomb = false;
+          if (typeof dbAny.dataRecovery.hasTombstone === 'function') {
+            hasTomb = await dbAny.dataRecovery.hasTombstone(key);
+          }
+          if (!hasTomb) {
+            const info = await dbAny.dataRecovery.checkFileInCloud(key);
+            if (info.exists) throw new Error(`Document '${key}' already exists in cloud`);
+          }
         }
-        if (!hasTomb) {
-          const info = await dbAny.dataRecovery.checkFileInCloud(key);
-          if (info.exists) throw new Error(`Document '${key}' already exists in cloud`);
-        }
+      }
+      await this.db._writeRaw(this.id, key, initialData === undefined ? {} : initialData);
+      // Only after successful _writeRaw, cache the negative lookup for future creates
+      // (if _writeRaw fails, don't pollute missingKeys)
+      if (dbAny.dataRecovery && dbAny.hydrateMode === 'lazy') {
         dbAny.missingKeys.set(key, true);
       }
+      this.opCount++;
+      this.operationsLog.push({ key, operation: 'create' });
+    } catch (err) {
+      if (acquiredHere) {
+        try { (this.db as any).acidEngine.lockManager.releaseLock(key, this.id); } catch {}
+        try {
+          const tx = (this.db as any).acidEngine.activeTransactions.get(this.id);
+          if (tx) {
+            tx.heldLocks.delete(key);
+            tx.waitingLocks.delete(key);
+          }
+        } catch {}
+      }
+      throw err;
     }
-    await this.db._writeRaw(this.id, key, initialData === undefined ? {} : initialData);
-    this.opCount++;
-    this.operationsLog.push({ key, operation: 'create' });
   }
 
   async update(key: string, data: any): Promise<void> {
@@ -1023,39 +1042,52 @@ export class Tero {
   }
 
   async commit(transactionId: string | Transaction): Promise<void> {
+    const txId = this._txId(transactionId);
+    // O(1) active check — was O(N) via getActiveTransactions().includes()
+    if (!this.acidEngine.isTransactionActive(txId)) {
+      throw new Error(`Transaction ${txId} not found or not active`);
+    }
+
+    // --- Logical commit: point of no return ---
+    // Once this succeeds the transaction is irrevocably committed in the WAL.
+    // Post-commit reconciliation (local tombstone fsync, cloud tombstone) must
+    // NOT turn a committed transaction into a visible failure.
     try {
-      const txId = this._txId(transactionId);
-      // O(1) active check — was O(N) via getActiveTransactions().includes()
-      if (!this.acidEngine.isTransactionActive(txId)) {
-        throw new Error(`Transaction ${txId} not found or not active`);
-      }
-
-      // Sync call — commitTransaction is now synchronous (no awaits on happy path)
       this.acidEngine.commitTransaction(txId);
+    } catch (error) {
+      throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
+    }
 
-      // PROMOTE cache entries tagged with this transaction to "committed" state.
-      // O(touched) via the tracked set.
-      const touched = this.txTouchedKeys.get(txId);
-      if (touched) {
-        for (const key of touched) {
-          const entry = this.cache.get(key);
-          if (entry && (entry as any).transactionId === txId) {
-            (entry as any).transactionId = undefined;
-          }
-          // Bump generation for P0-1 in-flight hydration invalidation and P0-10 stale hydration
-          this.bumpGeneration(key);
+    // PROMOTE cache entries tagged with this transaction to "committed" state.
+    // O(touched) via the tracked set.
+    const touched = this.txTouchedKeys.get(txId);
+    if (touched) {
+      for (const key of touched) {
+        const entry = this.cache.get(key);
+        if (entry && (entry as any).transactionId === txId) {
+          (entry as any).transactionId = undefined;
         }
-        // Handle durable tombstones for deletes/writes (P0-2) — entire per-key handling serialized via reconciliation lock (P0)
-        for (const key of touched) {
+        // Bump generation for P0-1 in-flight hydration invalidation and P0-10 stale hydration
+        this.bumpGeneration(key);
+      }
+      // Post-commit reconciliation — durable but best-effort, never fails the logical commit
+      for (const key of touched) {
+        try {
           await this.withReconciliationLock(key, async () => {
             const committed = this.acidEngine.getCommittedData(key);
             if (committed !== undefined) {
               if (committed !== null) {
                 // Write/present — clear tombstones so re-create can succeed and hydration can fetch
-                this.deleteLocalTombstone(key);
+                try {
+                  this.deleteLocalTombstone(key);
+                } catch (e) {
+                  // Local tombstone removal failed — queue cloud deletion retry and keep local file for next attempt
+                  this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
+                  return;
+                }
                 if (this.cloudPendingTombstones.has(key)) {
                   this.cloudPendingTombstones.delete(key);
-                  this.savePendingCloud();
+                  try { this.savePendingCloud(); } catch {}
                 }
                 if (this.dataRecovery) {
                   // Re-check still present before deleting cloud tombstone
@@ -1070,7 +1102,7 @@ export class Tero {
                     await (this.dataRecovery as any).deleteTombstone?.(key);
                     if (this.cloudPendingTombstoneDeletions.has(key)) {
                       this.cloudPendingTombstoneDeletions.delete(key);
-                      this.savePendingCloudDeletions();
+                      try { this.savePendingCloudDeletions(); } catch {}
                     }
                   } catch {
                     this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
@@ -1078,7 +1110,13 @@ export class Tero {
                 }
               } else {
                 // Delete — ensure tombstones for resurrection protection
-                this.writeLocalTombstone(key);
+                try {
+                  this.writeLocalTombstone(key);
+                } catch (e) {
+                  // Local tombstone creation failed — queue cloud tombstone and keep pending
+                  this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN());
+                  return;
+                }
                 if (this.dataRecovery && this.hydrateMode === 'lazy') {
                   // Re-check still deleted before cloud mutation (now inside same lock as state change)
                   const committed2 = this.acidEngine.getCommittedData(key);
@@ -1087,7 +1125,7 @@ export class Tero {
                   const stillDeleted = hasLocal2 || (committed2 !== undefined && committed2 === null) || (!existsLocal2 && committed2 === undefined);
                   if (!stillDeleted) {
                     this.cloudPendingTombstones.delete(key);
-                    this.savePendingCloud();
+                    try { this.savePendingCloud(); } catch {}
                     return;
                   }
                   let failed = false;
@@ -1096,7 +1134,7 @@ export class Tero {
                   if (failed) this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN());
                   else if (this.cloudPendingTombstones.has(key)) {
                     this.cloudPendingTombstones.delete(key);
-                    this.savePendingCloud();
+                    try { this.savePendingCloud(); } catch {}
                   }
                 }
               }
@@ -1105,7 +1143,12 @@ export class Tero {
               // check local file existence to infer delete vs write
               if (!existsSync(this.keyToPath(key))) {
                 // likely deleted — ensure tombstone
-                this.writeLocalTombstone(key);
+                try {
+                  this.writeLocalTombstone(key);
+                } catch {
+                  this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN());
+                  return;
+                }
                 if (this.dataRecovery && this.hydrateMode === 'lazy' && !this.cloudPendingTombstones.has(key)) {
                   const committed2 = this.acidEngine.getCommittedData(key);
                   const hasLocal2 = this.hasLocalTombstone(key);
@@ -1113,7 +1156,7 @@ export class Tero {
                   const stillDeleted = hasLocal2 || (committed2 !== undefined && committed2 === null) || (!existsLocal2 && committed2 === undefined);
                   if (!stillDeleted) {
                     this.cloudPendingTombstones.delete(key);
-                    this.savePendingCloud();
+                    try { this.savePendingCloud(); } catch {}
                     return;
                   }
                   try {
@@ -1121,17 +1164,22 @@ export class Tero {
                   } catch { this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN()); }
                 }
               } else {
-                this.deleteLocalTombstone(key);
+                try {
+                  this.deleteLocalTombstone(key);
+                } catch {
+                  this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
+                  return;
+                }
                 if (this.cloudPendingTombstones.has(key)) {
                   this.cloudPendingTombstones.delete(key);
-                  this.savePendingCloud();
+                  try { this.savePendingCloud(); } catch {}
                 }
                 if (this.dataRecovery) {
                   try {
                     await (this.dataRecovery as any).deleteTombstone?.(key);
                     if (this.cloudPendingTombstoneDeletions.has(key)) {
                       this.cloudPendingTombstoneDeletions.delete(key);
-                      this.savePendingCloudDeletions();
+                      try { this.savePendingCloudDeletions(); } catch {}
                     }
                   } catch {
                     this.queueCloudTombstoneDeletion(key, this.acidEngine!.getLastCommittedLSN());
@@ -1140,13 +1188,14 @@ export class Tero {
               }
             }
           });
+        } catch (e) {
+          // Post-commit reconciliation failure must not fail the logical commit
+          console.warn(`[Tero] post-commit reconciliation failed for '${key}': ${e instanceof Error ? e.message : String(e)}`);
         }
-                this.txTouchedKeys.delete(txId);
       }
-      this.committedCount++;
-    } catch (error) {
-      throw new Error(`Failed to commit transaction: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
+      this.txTouchedKeys.delete(txId);
     }
+    this.committedCount++;
   }
 
   async rollback(transactionId: string | Transaction): Promise<void> {
