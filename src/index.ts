@@ -535,11 +535,6 @@ export class Tero {
           }
         }
       } catch { /* approved */ }
-      // Restore pending cloud tombstones and schedule retry
-      this.loadPendingCloud();
-      this.loadPendingCloudDeletions();
-      if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0) this.scheduleCloudRetry();
-
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
         this.configureBackup(config.backup);
@@ -565,6 +560,35 @@ export class Tero {
           customS3Client: config.hydrateOnStartup.customS3Client,
         });
       }
+
+      // Restore pending cloud reconciliation *after* dataRecovery exists so schedule can run
+      this.loadPendingCloud();
+      this.loadPendingCloudDeletions();
+      // Fallback: reconstruct pending from local tombstones if queue file was lost (ENOSPC case)
+      try {
+        const tombDir = pathJoin(this.teroDirectory, '.tombstones');
+        if (existsSync(tombDir)) {
+          const files = readdirSync(tombDir);
+          for (const f of files) {
+            if (!f.endsWith('.deleted')) continue;
+            try {
+              const content = readFileSync(pathJoin(tombDir, f), 'utf8');
+              const obj = JSON.parse(content);
+              if (obj.key && typeof obj.key === 'string' && typeof obj.lsn === 'number') {
+                if (!this.cloudPendingTombstones.has(obj.key) && !this.cloudPendingTombstoneDeletions.has(obj.key)) {
+                  if (this.dataRecovery) {
+                    this.cloudPendingTombstones.set(obj.key, obj.lsn);
+                  }
+                }
+              }
+            } catch {}
+          }
+          if (this.cloudPendingTombstones.size > 0) {
+            try { this.savePendingCloud(); } catch {}
+          }
+        }
+      } catch {}
+      if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0) this.scheduleCloudRetry();
     } catch (error) {
       if (error instanceof RecoveryCorruptionError || error instanceof DataCorruptionError) {
         throw error;
@@ -1393,26 +1417,20 @@ export class Tero {
   }
 
   private savePendingCloud(): void {
-    try {
-      const p = this.pendingCloudPath();
-      const dir = pathJoin(this.teroDirectory, '.tombstones');
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      if (this.cloudPendingTombstones.size === 0) {
-        if (existsSync(p)) unlinkSync(p);
-        return;
-      }
-      const tmp = `${p}.tmp.${process.pid}`;
-      writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstones.entries()]));
-      try {
-        const fd = openSync(tmp, 'r');
-        try { fsyncSync(fd); } finally { closeSync(fd); }
-      } catch { /* approved */ }
-      try { renameSync(tmp, p); } catch { writeFileSync(p, JSON.stringify([...this.cloudPendingTombstones.entries()])); }
-      try {
-        const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
-        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-      } catch { /* approved */ }
-    } catch { /* approved */ }
+    const p = this.pendingCloudPath();
+    const dir = pathJoin(this.teroDirectory, '.tombstones');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (this.cloudPendingTombstones.size === 0) {
+      if (existsSync(p)) unlinkSync(p);
+      return;
+    }
+    const tmp = `${p}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstones.entries()]));
+    const fd = openSync(tmp, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, p);
+    const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   }
 
   private loadPendingCloudDeletions(): void {
@@ -1436,26 +1454,20 @@ export class Tero {
   }
 
   private savePendingCloudDeletions(): void {
-    try {
-      const p = this.pendingCloudDeletionsPath();
-      const dir = pathJoin(this.teroDirectory, '.tombstones');
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      if (this.cloudPendingTombstoneDeletions.size === 0) {
-        if (existsSync(p)) unlinkSync(p);
-        return;
-      }
-      const tmp = `${p}.tmp.${process.pid}`;
-      writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()]));
-      try {
-        const fd = openSync(tmp, 'r');
-        try { fsyncSync(fd); } finally { closeSync(fd); }
-      } catch {}
-      try { renameSync(tmp, p); } catch { writeFileSync(p, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()])); }
-      try {
-        const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
-        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-      } catch {}
-    } catch {}
+    const p = this.pendingCloudDeletionsPath();
+    const dir = pathJoin(this.teroDirectory, '.tombstones');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (this.cloudPendingTombstoneDeletions.size === 0) {
+      if (existsSync(p)) unlinkSync(p);
+      return;
+    }
+    const tmp = `${p}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify([...this.cloudPendingTombstoneDeletions.entries()]));
+    const fd = openSync(tmp, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, p);
+    const dirFd = openSync(pathJoin(this.teroDirectory, '.tombstones'), 'r');
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   }
 
   private queueCloudTombstoneDeletion(key: string, expectedVersion?: number): void {
