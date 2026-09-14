@@ -1294,11 +1294,22 @@ export class BackupManager {
       const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
 
       let count = 0;
-      const manifestDataItems: Array<{ path: string; size: number; sha256: string; versionLsn: number }> = [];
+      let tombstoned = 0;
+      const manifestDataItems: Array<{ path: string; size: number; sha256: string; versionLsn: number; state: string }> = [];
       await pooledConsumeAsyncGen(engine.snapshotFiles(ckptLsn), 16, async (entry) => {
-        if (entry.state === 'present' && entry.data !== undefined) {
-          const filePath = partitionedPath(this.dbPath, entry.key);
-          const rel = posixRel(filePath);
+        const filePath = partitionedPath(this.dbPath, entry.key);
+        const rel = posixRel(filePath);
+        if (entry.state === 'deleted') {
+          await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
+          tombstoned++;
+          manifestDataItems.push({
+            path: rel,
+            size: 0,
+            sha256: createHash('sha256').update(Buffer.alloc(0)).digest('hex'),
+            versionLsn: entry.lsn,
+            state: 'deleted'
+          });
+        } else if (entry.state === 'present' && entry.data !== undefined) {
           const buf = Buffer.from(JSON.stringify(entry.data));
           await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json');
           count++;
@@ -1306,7 +1317,8 @@ export class BackupManager {
             path: rel,
             size: buf.length,
             sha256: createHash('sha256').update(buf).digest('hex'),
-            versionLsn: entry.lsn
+            versionLsn: entry.lsn,
+            state: 'present'
           });
         }
       });
@@ -1343,10 +1355,11 @@ export class BackupManager {
       await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString() }, null, 2)), 'application/json');
 
       // CRITICAL P0 ORDERING: Acknowledge ONLY AFTER latest and manifest are published!
+      // Every acknowledged dirty entry now has a durable representation (present file or .deleted tombstone)
       engine.acknowledgeDirtyKeys(dirtySnapshot.values());
 
       this.liveCheckpoints++;
-      return { uploadedDocs: count, tombstonedDocs: 0, fullUpload: true, duration: Date.now() - start };
+      return { uploadedDocs: count, tombstonedDocs: tombstoned, fullUpload: true, duration: Date.now() - start };
     }
     // INCREMENTAL checkpoint — upload ONLY dirty docs from versioned snapshot, tombstone deleted ones.
     const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);

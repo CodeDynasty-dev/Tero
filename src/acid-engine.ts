@@ -1325,11 +1325,13 @@ export class ACIDStorageEngine {
                                         continue;
                                     }
 
-                                    // 2. If key was dirty <= upToLsn, use dirtySnapshot
+                                    // 2. If key was dirty <= upToLsn, use dirtySnapshot (present or deleted)
                                     if (dirtySnapshot.has(key)) {
                                         const d = dirtySnapshot.get(key)!;
                                         if (d.state === 'present') {
                                             yield { key, lsn: d.lsn, state: 'present', data: d.data };
+                                        } else {
+                                            yield { key, lsn: d.lsn, state: 'deleted' };
                                         }
                                         continue;
                                     }
@@ -1374,6 +1376,8 @@ export class ACIDStorageEngine {
                         }
                     } else if (d.state === 'present') {
                         yield { key, lsn: d.lsn, state: 'present', data: d.data };
+                    } else {
+                        yield { key, lsn: d.lsn, state: 'deleted' };
                     }
                 }
             }
