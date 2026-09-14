@@ -80,7 +80,7 @@ async function phaseKill() {
   rmSync(dir, { recursive: true, force: true });
 
   // Worker script: writes N docs with full durability, then loops forever so parent can kill mid-commit
-  const workerPath = resolve('local_tests/.chaos-worker.tmp.js');
+  const workerPath = resolve('tests/.chaos-worker.tmp.js');
   const workerCode = `
 import { Tero } from '../dist/index.js';
 const dir = process.argv[2];

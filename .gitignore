@@ -26,3 +26,5 @@ P0_InitialRetry
 .lock
 ChaosKillDB
 RecoveryBench**
+ChaosSoakDB
+test_**

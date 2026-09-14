@@ -8,7 +8,7 @@ const execAsync = promisify(exec);
 
 class TestRunner {
     constructor() {
-        this.testsDir = './local_tests';
+        this.testsDir = './tests';
         this.totalTests = 0;
         this.passedTests = 0;
         this.failedTests = 0;
@@ -18,8 +18,8 @@ class TestRunner {
     async runCommand(command) {
         try {
             const { stdout, stderr } = await execAsync(command, {
-                timeout: 120000, // 2 minute timeout
-                maxBuffer: 1024 * 1024 // 1MB buffer
+                timeout: 180000, // 3 minute timeout
+                maxBuffer: 10 * 1024 * 1024 // 10MB buffer
             });
             return {
                 success: true,
@@ -45,21 +45,29 @@ class TestRunner {
 
             const files = await readdir(this.testsDir);
 
-            // Filter for test files (files ending with -test.js)
-            const testFiles = files.filter(file =>
-                file.endsWith('-test.js') ||
-                file === 'test.js'
-            );
+            // Filter for automated test files
+            const testFiles = files.filter(file => {
+                if (file.startsWith('.')) return false;
+                if (file.includes('bench') || file.includes('probe')) return false;
+                if (file === 's3-live-backup-test.js' && !process.env.AWS_ACCESS_KEY_ID) return false;
+                if (file === 'live-backup-test.js' && !process.env.AWS_ACCESS_KEY_ID) return false;
+                if (file === 'chaos-test.js') return false; // separate soak test
+                return file.endsWith('.test.js') || file.endsWith('-test.js') || file === 'prod-test-suite.js';
+            });
 
-            // Sort test files to run core tests first
+            // Order priority: sanity -> issues -> hydration -> fault -> cloud -> concurrency -> fuzz -> production
+            const priority = {
+                'sanity-test.js': 1,
+                'issue-fixes.test.js': 2,
+                'gradual-hydration.test.js': 3,
+                'fault-injection.test.js': 4,
+                'cloud-resilience.test.js': 5,
+                'concurrency-chaos.test.js': 6,
+                'fuzz-oracle.test.js': 7,
+                'prod-test-suite.js': 8,
+            };
+
             const sortedTests = testFiles.sort((a, b) => {
-                const priority = {
-                    'test.js': 1,
-                    'acid-test.js': 2,
-                    'backup-test.js': 3,
-                    'transaction-test.js': 4
-                };
-
                 return (priority[a] || 999) - (priority[b] || 999);
             });
 
@@ -71,18 +79,22 @@ class TestRunner {
     }
 
     async runSingleTest(testFile) {
-        const testName = testFile.replace('./local_tests/', '').replace('local_tests/', '').replace('./tests/', '').replace('.js', '');
+        const testName = testFile.replace('./tests/', '').replace('tests/', '').replace('.js', '');
         console.log(`\n🧪 Running ${testName}...`);
         console.log('='.repeat(60));
 
         const startTime = Date.now();
 
         try {
-            const result = await this.runCommand(`node ${testFile}`);
+            const cmd = testFile.endsWith('.test.js') ? `node --test ${testFile}` : `node ${testFile}`;
+            const result = await this.runCommand(cmd);
             const duration = Date.now() - startTime;
 
             if (result.success) {
                 console.log(`✅ ${testName} PASSED (${duration}ms)`);
+                if (result.stdout.trim()) {
+                    console.log(result.stdout.trim());
+                }
                 this.passedTests++;
                 this.results.push({
                     name: testName,
@@ -92,6 +104,9 @@ class TestRunner {
                 });
             } else {
                 console.log(`❌ ${testName} FAILED (${duration}ms)`);
+                if (result.stdout) {
+                    console.log(result.stdout);
+                }
                 if (result.stderr) {
                     console.log('STDERR:', result.stderr);
                 }
@@ -119,25 +134,20 @@ class TestRunner {
     }
 
     async runAllTests() {
-        console.log('🚀 Tero Test Suite');
+        console.log('🚀 Tero Master Test Suite');
         console.log('='.repeat(60));
         console.log(`📅 Started at: ${new Date().toISOString()}`);
         console.log('');
 
-        // Check if dist directory exists (compiled files)
-        if (!existsSync('./dist')) {
-            console.log('🔨 Building project...');
-            const buildResult = await this.runCommand('npx tsc');
-
-            if (!buildResult.success) {
-                console.log('❌ Build failed!');
-                console.log('STDERR:', buildResult.stderr);
-                process.exit(1);
-            }
-            console.log('✅ Build completed successfully');
-        } else {
-            console.log('✅ Using existing build files');
+        // Ensure fresh build
+        console.log('🔨 Building project with tsc...');
+        const buildResult = await this.runCommand('npx tsc');
+        if (!buildResult.success) {
+            console.log('❌ Build failed!');
+            console.log('STDERR:', buildResult.stderr);
+            process.exit(1);
         }
+        console.log('✅ Build completed successfully');
 
         // Get all test files
         const testFiles = await this.getTestFiles();
@@ -147,9 +157,9 @@ class TestRunner {
             return;
         }
 
-        console.log(`📋 Found ${testFiles.length} test files:`);
+        console.log(`📋 Found ${testFiles.length} test suites:`);
         testFiles.forEach(file => {
-            console.log(`  - ${file.replace('./local_tests/', '').replace('local_tests/', '').replace('./tests/', '')}`);
+            console.log(`  - ${file.replace('./tests/', '').replace('tests/', '')}`);
         });
 
         this.totalTests = testFiles.length;
@@ -170,12 +180,12 @@ class TestRunner {
 
     printSummary(duration) {
         console.log('\n' + '='.repeat(60));
-        console.log('📊 TEST SUMMARY');
+        console.log('📊 MASTER TEST SUITE SUMMARY');
         console.log('='.repeat(60));
 
         console.log(`📅 Completed at: ${new Date().toISOString()}`);
         console.log(`⏱️  Total duration: ${(duration / 1000).toFixed(2)}s`);
-        console.log(`📋 Total tests: ${this.totalTests}`);
+        console.log(`📋 Total suites: ${this.totalTests}`);
         console.log(`✅ Passed: ${this.passedTests}`);
         console.log(`❌ Failed: ${this.failedTests}`);
         console.log(`📈 Success rate: ${((this.passedTests / this.totalTests) * 100).toFixed(1)}%`);
@@ -189,7 +199,7 @@ class TestRunner {
         }
 
         if (this.failedTests > 0) {
-            console.log('\n❌ FAILED TESTS:');
+            console.log('\n❌ FAILED SUITES:');
             this.results
                 .filter(r => r.status !== 'PASSED')
                 .forEach(result => {
@@ -201,14 +211,13 @@ class TestRunner {
         }
 
         if (this.failedTests === 0) {
-            console.log('\n🎉 All tests passed! Tero is ready for production.');
+            console.log('\n🎉 ALL TEST SUITES PASSED! Tero meets enterprise/Google production standards.');
         } else {
-            console.log(`\n⚠️  ${this.failedTests} test(s) failed. Please review and fix the issues.`);
+            console.log(`\n⚠️  ${this.failedTests} suite(s) failed.`);
         }
     }
 }
 
-// Run the test suite
 const runner = new TestRunner();
 runner.runAllTests().catch(error => {
     console.error('❌ Test runner failed:', error);

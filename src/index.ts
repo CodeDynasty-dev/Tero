@@ -1528,7 +1528,8 @@ export class Tero {
         const key = file.replace('.json', '');
         result.totalFiles++;
         try {
-          const data = await this.get(key);
+          const raw = readFileSync(filePath, 'utf8');
+          const data = JSON.parse(raw);
           if (data === null || data === false) {
             result.missingFiles.push(key);
             result.healthy = false;

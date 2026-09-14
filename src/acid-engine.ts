@@ -188,6 +188,14 @@ export class WriteAheadLog {
                     }
                 }
             }
+            if (partial.trim()) {
+                try {
+                    const entry: LogEntry = JSON.parse(partial);
+                    if (this.verifyChecksum(entry)) visitor(entry);
+                } catch {
+                    // skip corrupted / partial entries
+                }
+            }
         } finally {
             closeSync(fd);
         }
@@ -506,17 +514,22 @@ export class LockManager {
         }
 
         // Deadlock detection before queueing:
-        // 1. Identify all blocking holders
-        const blockingHolders = new Set<string>();
+        // 1. Identify all blocking transactions (holders + existing waiters ahead in FIFO queue)
+        const blockingTxs = new Set<string>();
         for (const h of lockInfo.holders) {
             if (h !== transactionId) {
-                blockingHolders.add(h);
+                blockingTxs.add(h);
+            }
+        }
+        for (const req of lockInfo.waitQueue) {
+            if (req.transactionId !== transactionId) {
+                blockingTxs.add(req.transactionId);
             }
         }
 
         // 2. Check for cycle in wait-for graph
-        for (const holder of blockingHolders) {
-            if (this.hasCycle(holder, transactionId)) {
+        for (const blocker of blockingTxs) {
+            if (this.hasCycle(blocker, transactionId)) {
                 return Promise.reject(new Error(`Deadlock detected: transaction '${transactionId}' cannot acquire lock on key '${key}'`));
             }
         }
@@ -537,8 +550,8 @@ export class LockManager {
             currentWaiting = new Set();
             this.waitingOn.set(transactionId, currentWaiting);
         }
-        for (const h of blockingHolders) {
-            currentWaiting.add(h);
+        for (const blocker of blockingTxs) {
+            currentWaiting.add(blocker);
         }
 
         // Slow path: lock is contended — allocate Promise + timer and wait in queue
@@ -645,6 +658,7 @@ export class LockManager {
             lockInfo.type = 'shared';
             for (const request of sharedRequests) {
                 lockInfo.holders.add(request.transactionId);
+                this.waitingOn.delete(request.transactionId);
                 request.resolve();
             }
         } else {
@@ -653,7 +667,23 @@ export class LockManager {
             lockInfo.type = 'exclusive';
             lockInfo.holders.clear();
             lockInfo.holders.add(request.transactionId);
+            this.waitingOn.delete(request.transactionId);
             request.resolve();
+        }
+
+        // Update waitingOn for all remaining waiters in the queue:
+        // they are now waiting on the new holder(s)
+        for (const queued of lockInfo.waitQueue) {
+            let waiterSet = this.waitingOn.get(queued.transactionId);
+            if (!waiterSet) {
+                waiterSet = new Set();
+                this.waitingOn.set(queued.transactionId, waiterSet);
+            }
+            for (const h of lockInfo.holders) {
+                if (h !== queued.transactionId) {
+                    waiterSet.add(h);
+                }
+            }
         }
     }
 
