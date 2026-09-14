@@ -1448,36 +1448,48 @@ export class ACIDStorageEngine {
         const committedTransactions = new Set<string>();
         const abortedTransactions = new Set<string>();
 
-        // Phase 1: streaming analysis — determine which transactions committed or aborted
+        // Single pass over the WAL: build the commit/abort sets AND buffer the
+        // write/delete records needed for redo/undo. Streaming the log only once
+        // (instead of once per phase) avoids re-reading, re-parsing, and
+        // re-checksumming every segment for each phase. Safe because redo runs
+        // in strict WAL order and undo runs reverse-LSN — both are preserved by
+        // replaying the buffered records in memory.
+        const replay: LogEntry[] = [];
         this.wal.streamAllLogEntries((entry) => {
             if (entry.operation === 'COMMIT') {
                 committedTransactions.add(entry.transactionId);
                 if (entry.lsn > this.lastCommittedLSN) {
                     this.lastCommittedLSN = entry.lsn;
                 }
-            } else if (entry.operation === 'ROLLBACK') {
+                return;
+            }
+            if (entry.operation === 'ROLLBACK') {
                 abortedTransactions.add(entry.transactionId);
+                return;
+            }
+            // Keep only data records (BEGIN/CHECKPOINT, etc. aren't needed for
+            // redo/undo).
+            if (entry.operation === 'WRITE' || entry.operation === 'DELETE') {
+                replay.push(entry);
             }
         });
 
-        // Phase 2: redo + collect uncommitted ops per transaction
+        // Phase 2 (in-memory replay): redo committed ops in WAL order, and
+        // collect undo entries for crashed (uncommitted, unaborted) transactions.
         const undoByTx = new Map<string, LogEntry[]>();
-        this.wal.streamAllLogEntries((entry) => {
-            if (entry.operation === 'WRITE' && committedTransactions.has(entry.transactionId)) {
-                this.redoOperation(entry);
-            } else if (entry.operation === 'DELETE' && committedTransactions.has(entry.transactionId)) {
-                this.redoDelete(entry);
-            } else if (
-                (entry.operation === 'WRITE' || entry.operation === 'DELETE') &&
-                !committedTransactions.has(entry.transactionId) &&
-                !abortedTransactions.has(entry.transactionId) &&
-                entry.key
-            ) {
+        for (const entry of replay) {
+            if (committedTransactions.has(entry.transactionId)) {
+                if (entry.operation === 'WRITE') {
+                    this.redoOperation(entry);
+                } else if (entry.operation === 'DELETE') {
+                    this.redoDelete(entry);
+                }
+            } else if (!abortedTransactions.has(entry.transactionId) && entry.key) {
                 let arr = undoByTx.get(entry.transactionId);
                 if (!arr) { arr = []; undoByTx.set(entry.transactionId, arr); }
                 arr.push(entry);
             }
-        });
+        }
 
         // Phase 3: reverse undo — per-transaction reverse WAL order, globally LSN-descending
         const allUndoEntries: LogEntry[] = [];
