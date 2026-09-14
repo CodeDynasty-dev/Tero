@@ -437,6 +437,7 @@ export class Tero {
   /** Durable cloud reconciliation for deletes (P0-2) — keys needing cloud delete+tombstone, with deletion LSN */
   private cloudPendingTombstones = new Map<string, number>();
   private cloudPendingTimer?: ReturnType<typeof setTimeout>;
+  private reconciliationLocks = new Map<string, Promise<void>>();
 
   /**
    * Bounded LRU of known-existing keys. Replaces the unbounded Set<string>
@@ -1016,7 +1017,7 @@ export class Tero {
           // Bump generation for P0-1 in-flight hydration invalidation and P0-10 stale hydration
           this.bumpGeneration(key);
         }
-        // Handle durable tombstones for deletes/writes (P0-2)
+        // Handle durable tombstones for deletes/writes (P0-2) — cloud phase serialized per-key (P0 TOCTOU fix)
         for (const key of touched) {
           const committed = this.acidEngine.getCommittedData(key);
           if (committed !== undefined) {
@@ -1028,20 +1029,43 @@ export class Tero {
                 this.savePendingCloud();
               }
               if (this.dataRecovery) {
-                try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+                await this.withReconciliationLock(key, async () => {
+                  // Re-check still present before deleting tombstone (race with concurrent delete)
+                  const committed2 = this.acidEngine.getCommittedData(key);
+                  const hasLocal2 = this.hasLocalTombstone(key);
+                  if (committed2 !== undefined && committed2 === null) return;
+                  if (hasLocal2) {
+                    // Local tombstone exists — key is still deleted, don't clear cloud tombstone
+                    const existsLocal2 = existsSync(this.keyToPath(key));
+                    if (!existsLocal2 || committed2 === null) return;
+                  }
+                  try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+                });
               }
             } else {
               // Delete — ensure tombstones for resurrection protection
               this.writeLocalTombstone(key);
               if (this.dataRecovery && this.hydrateMode === 'lazy') {
-                let failed = false;
-                try { await this.dataRecovery.deleteFromCloud(key); } catch { failed = true; }
-                try { await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine.getLastCommittedLSN()); } catch { failed = true; }
-                if (failed) this.queueCloudTombstone(key, this.acidEngine.getLastCommittedLSN());
-                else if (this.cloudPendingTombstones.has(key)) {
-                  this.cloudPendingTombstones.delete(key);
-                  this.savePendingCloud();
-                }
+                await this.withReconciliationLock(key, async () => {
+                  // Re-check still deleted before cloud mutation (TOCTOU fix)
+                  const committed2 = this.acidEngine.getCommittedData(key);
+                  const hasLocal2 = this.hasLocalTombstone(key);
+                  const existsLocal2 = existsSync(this.keyToPath(key));
+                  const stillDeleted = hasLocal2 || (committed2 !== undefined && committed2 === null) || (!existsLocal2 && committed2 === undefined);
+                  if (!stillDeleted) {
+                    this.cloudPendingTombstones.delete(key);
+                    this.savePendingCloud();
+                    return;
+                  }
+                  let failed = false;
+                  try { await this.dataRecovery!.deleteFromCloud(key); } catch { failed = true; }
+                  try { await (this.dataRecovery as any)!.putTombstone?.(key, this.acidEngine!.getLastCommittedLSN()); } catch { failed = true; }
+                  if (failed) this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN());
+                  else if (this.cloudPendingTombstones.has(key)) {
+                    this.cloudPendingTombstones.delete(key);
+                    this.savePendingCloud();
+                  }
+                });
               }
             }
           } else {
@@ -1051,10 +1075,21 @@ export class Tero {
               // likely deleted — ensure tombstone
               this.writeLocalTombstone(key);
               if (this.dataRecovery && this.hydrateMode === 'lazy' && !this.cloudPendingTombstones.has(key)) {
-                // best-effort cloud tombstone for fallback deletes
-                try {
-                  await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine.getLastCommittedLSN());
-                } catch { this.queueCloudTombstone(key, this.acidEngine.getLastCommittedLSN()); }
+                await this.withReconciliationLock(key, async () => {
+                  // Re-check
+                  const committed2 = this.acidEngine.getCommittedData(key);
+                  const hasLocal2 = this.hasLocalTombstone(key);
+                  const existsLocal2 = existsSync(this.keyToPath(key));
+                  const stillDeleted = hasLocal2 || (committed2 !== undefined && committed2 === null) || (!existsLocal2 && committed2 === undefined);
+                  if (!stillDeleted) {
+                    this.cloudPendingTombstones.delete(key);
+                    this.savePendingCloud();
+                    return;
+                  }
+                  try {
+                    await (this.dataRecovery as any)!.putTombstone?.(key, this.acidEngine!.getLastCommittedLSN());
+                  } catch { this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN()); }
+                });
               }
             } else {
               this.deleteLocalTombstone(key);
@@ -1063,7 +1098,9 @@ export class Tero {
                 this.savePendingCloud();
               }
               if (this.dataRecovery) {
-                try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+                await this.withReconciliationLock(key, async () => {
+                  try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch { /* approved */ }
+                });
               }
             }
           }
@@ -1317,9 +1354,28 @@ export class Tero {
       const p = this.pendingCloudPath();
       if (!existsSync(p)) return;
       const raw = readFileSync(p, 'utf8');
-      const arr: string[] = JSON.parse(raw);
+      const arr: unknown = JSON.parse(raw);
       if (Array.isArray(arr)) {
-        for (const k of arr) if (typeof k === 'string') this.cloudPendingTombstones.set(k, 0);
+        for (const item of arr) {
+          if (typeof item === 'string') {
+            // legacy pending entry; recover LSN from local tombstone
+            let lsn = 0;
+            try {
+              const content = readFileSync(this.localTombstonePath(item), 'utf8');
+              const obj = JSON.parse(content);
+              if (typeof obj.lsn === 'number') lsn = obj.lsn;
+            } catch {}
+            this.cloudPendingTombstones.set(item, lsn);
+          } else if (Array.isArray(item) && typeof item[0] === 'string' && typeof item[1] === 'number') {
+            this.cloudPendingTombstones.set(item[0], item[1]);
+          } else if (item && typeof (item as any).key === 'string' && typeof (item as any).deletionLsn === 'number') {
+            this.cloudPendingTombstones.set((item as any).key, (item as any).deletionLsn);
+          }
+        }
+      } else if (arr && typeof arr === 'object') {
+        for (const [k, v] of Object.entries(arr as Record<string, unknown>)) {
+          if (typeof v === 'number') this.cloudPendingTombstones.set(k, v);
+        }
       }
     } catch { /* approved */ }
   }
@@ -1354,6 +1410,24 @@ export class Tero {
     this.scheduleCloudRetry();
   }
 
+  private async withReconciliationLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.reconciliationLocks.get(key);
+    if (prev) {
+      try { await prev; } catch {}
+    }
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => { resolveLock = resolve; });
+    this.reconciliationLocks.set(key, lockPromise);
+    try {
+      return await fn();
+    } finally {
+      resolveLock();
+      if (this.reconciliationLocks.get(key) === lockPromise) {
+        this.reconciliationLocks.delete(key);
+      }
+    }
+  }
+
   private scheduleCloudRetry(): void {
     if (this.cloudPendingTimer) return;
     if (!this.dataRecovery || this.hydrateMode !== 'lazy') return;
@@ -1369,60 +1443,62 @@ export class Tero {
     if (!this.dataRecovery) return;
     const entries = [...this.cloudPendingTombstones.entries()];
     for (const [key, deletionLsn] of entries) {
-      // Verify key is still deleted before publishing stale tombstone (P0)
-      const committed = this.acidEngine.getCommittedData(key);
-      const hasLocal = this.hasLocalTombstone(key);
-      const existsLocal = existsSync(this.keyToPath(key));
-      if (committed !== undefined && committed !== null) {
-        // Recreated — stale tombstone, clear pending
-        this.cloudPendingTombstones.delete(key);
-        this.savePendingCloud();
-        continue;
-      }
-      if (!hasLocal && committed === undefined && existsLocal) {
-        // File exists and no tombstone — recreated
-        this.cloudPendingTombstones.delete(key);
-        this.savePendingCloud();
-        continue;
-      }
-      let currentDeletionLsn = deletionLsn;
-      if (hasLocal) {
-        try {
-          const content = readFileSync(this.localTombstonePath(key), 'utf8');
-          const obj = JSON.parse(content);
-          if (typeof obj.lsn === 'number' && obj.lsn !== deletionLsn) {
-            currentDeletionLsn = obj.lsn;
-            this.cloudPendingTombstones.set(key, currentDeletionLsn);
-            this.savePendingCloud();
-          }
-        } catch {}
-      }
-      const stillDeleted = hasLocal || (committed !== undefined && committed === null) || (!existsLocal && committed === undefined);
-      if (!stillDeleted) {
-        this.cloudPendingTombstones.delete(key);
-        this.savePendingCloud();
-        continue;
-      }
-      try {
-        await this.dataRecovery.deleteFromCloud(key);
-        await (this.dataRecovery as any).putTombstone(key, currentDeletionLsn);
-        this.cloudPendingTombstones.delete(key);
-        try {
-          const p = this.pendingCloudPath();
-          if (this.cloudPendingTombstones.size === 0) {
-            if (existsSync(p)) unlinkSync(p);
-          } else {
-            writeFileSync(p, JSON.stringify([...this.cloudPendingTombstones.entries()]));
-          }
-        } catch { /* approved */ }
-      } catch (err) {
-        // Keep pending for next retry; classify to avoid tight loop on auth errors
-        const kind = classifyRecoveryError(err);
-        if (kind === 'FATAL_AUTH') {
-          // Auth failures need manual intervention — keep pending but don't hammer
-          continue;
+      await this.withReconciliationLock(key, async () => {
+        // Verify key is still deleted before publishing stale tombstone (P0) — atomic with cloud mutation
+        const committed = this.acidEngine.getCommittedData(key);
+        const hasLocal = this.hasLocalTombstone(key);
+        const existsLocal = existsSync(this.keyToPath(key));
+        if (committed !== undefined && committed !== null) {
+          // Recreated — stale tombstone, clear pending
+          this.cloudPendingTombstones.delete(key);
+          this.savePendingCloud();
+          return;
         }
-      }
+        if (!hasLocal && committed === undefined && existsLocal) {
+          // File exists and no tombstone — recreated
+          this.cloudPendingTombstones.delete(key);
+          this.savePendingCloud();
+          return;
+        }
+        let currentDeletionLsn = deletionLsn;
+        if (hasLocal) {
+          try {
+            const content = readFileSync(this.localTombstonePath(key), 'utf8');
+            const obj = JSON.parse(content);
+            if (typeof obj.lsn === 'number' && obj.lsn !== deletionLsn) {
+              currentDeletionLsn = obj.lsn;
+              this.cloudPendingTombstones.set(key, currentDeletionLsn);
+              this.savePendingCloud();
+            }
+          } catch {}
+        }
+        const stillDeleted = hasLocal || (committed !== undefined && committed === null) || (!existsLocal && committed === undefined);
+        if (!stillDeleted) {
+          this.cloudPendingTombstones.delete(key);
+          this.savePendingCloud();
+          return;
+        }
+        try {
+          await this.dataRecovery!.deleteFromCloud(key);
+          await (this.dataRecovery as any)!.putTombstone(key, currentDeletionLsn);
+          this.cloudPendingTombstones.delete(key);
+          try {
+            const p = this.pendingCloudPath();
+            if (this.cloudPendingTombstones.size === 0) {
+              if (existsSync(p)) unlinkSync(p);
+            } else {
+              writeFileSync(p, JSON.stringify([...this.cloudPendingTombstones.entries()]));
+            }
+          } catch { /* approved */ }
+        } catch (err) {
+          // Keep pending for next retry; classify to avoid tight loop on auth errors
+          const kind = classifyRecoveryError(err);
+          if (kind === 'FATAL_AUTH') {
+            // Auth failures need manual intervention — keep pending but don't hammer
+            return;
+          }
+        }
+      });
     }
     if (this.cloudPendingTombstones.size > 0) {
       this.scheduleCloudRetry();
@@ -1456,15 +1532,31 @@ export class Tero {
       this.writeLocalTombstone(key);
 
       if (this.dataRecovery && this.hydrateMode === 'lazy') {
-        const lsn = this.acidEngine.getLastCommittedLSN();
-        let failed = false;
-        try {
-          await this.dataRecovery.deleteFromCloud(key);
-        } catch { failed = true; }
-        try {
-          await (this.dataRecovery as any).putTombstone(key, lsn);
-        } catch { failed = true; }
-        if (failed) this.queueCloudTombstone(key, this.acidEngine.getLastCommittedLSN());
+        await this.withReconciliationLock(key, async () => {
+          // Re-check still deleted before cloud mutation (TOCTOU fix)
+          const committed = this.acidEngine.getCommittedData(key);
+          const hasLocal = this.hasLocalTombstone(key);
+          const existsLocal = existsSync(this.keyToPath(key));
+          const stillDeleted = hasLocal || (committed !== undefined && committed === null) || (!existsLocal && committed === undefined);
+          if (!stillDeleted) {
+            this.cloudPendingTombstones.delete(key);
+            this.savePendingCloud();
+            return;
+          }
+          const lsn = this.acidEngine!.getLastCommittedLSN();
+          let failed = false;
+          try {
+            await this.dataRecovery!.deleteFromCloud(key);
+          } catch { failed = true; }
+          try {
+            await (this.dataRecovery as any)!.putTombstone(key, lsn);
+          } catch { failed = true; }
+          if (failed) this.queueCloudTombstone(key, lsn);
+          else if (this.cloudPendingTombstones.has(key)) {
+            this.cloudPendingTombstones.delete(key);
+            this.savePendingCloud();
+          }
+        });
       }
     } catch (error) {
       await this.rollback(transactionId);
