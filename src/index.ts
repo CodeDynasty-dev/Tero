@@ -507,9 +507,15 @@ export class Tero {
       }
 
       try {
-        await recovery.recoverMissingFiles(() => abortController.signal.aborted);
-      } catch {
-        // Hydration errors are non-fatal on boot
+        const result = await recovery.recoverMissingFiles({ abortSignal: abortController.signal });
+        if (!result.success && hydrate.continueOnError === false) {
+          throw new Error(`Eager hydration failed: ${result.failed.length} file(s) failed to recover`);
+        }
+      } catch (err) {
+        if (hydrate.continueOnError === false) {
+          throw err;
+        }
+        /* approved: hydration errors tolerated when continueOnError is true */
       } finally {
         if (timer) clearTimeout(timer);
       }
@@ -634,7 +640,7 @@ export class Tero {
       throw new Error(`Key exceeds maximum length of ${Tero.MAX_KEY_LENGTH} characters (got ${key.length})`);
     }
     // Sanitize key to prevent path traversal, hidden files, and illegal chars
-    if (key.includes('..') || key.includes('/') || key.includes('\\') || key.includes('\0') || key === '.' || key.startsWith('.')) {
+    if (key === '.' || key === '..' || key.includes('/') || key.includes('\\') || key.includes('\0') || key.startsWith('.')) {
       throw new Error('Key contains invalid characters');
     }
   }
@@ -1425,8 +1431,9 @@ export class Tero {
    * Options:
    *   - fallbackToCloud: boolean (default true) — set false to skip cloud fetch
    *   - mode: 'missing' (default) — only fetch if missing locally; 'all' — always overwrite from cloud
+   *   - throwOnRecoveryError: boolean (default false) — re-throw cloud/recovery errors instead of returning null
    */
-  async getWithRecovery(key: string, options?: { fallbackToCloud?: boolean; mode?: 'missing' | 'all' }): Promise<any | null> {
+  async getWithRecovery(key: string, options?: { fallbackToCloud?: boolean; mode?: 'missing' | 'all'; throwOnRecoveryError?: boolean }): Promise<any | null> {
     try {
       this.validateKey(key);
     } catch (error) {
@@ -1448,11 +1455,8 @@ export class Tero {
       return null;
     }
 
-    // 3) Best-effort cloud fetch. If it fails for any reason (auth, network, timeout,
-    // no such key), we don't crash the local read path — `getWithRecovery` is a
-    // convenience GET that prefers local, falls back opportunistically. Separate
-    // methods (`recoverFromCloud`, `recoverAllFromCloud`) surface real cloud errors
-    // for the control plane / observability path to display.
+    // 3) Cloud fetch. If throwOnRecoveryError is true, any fatal/cloud error is rethrown.
+    // Otherwise, best-effort fallback returns null.
     try {
       const recovered = await this.dataRecovery.recoverSingleFile(key);
       if (!recovered) {
@@ -1463,8 +1467,19 @@ export class Tero {
       this.cache.delete(key);
       return await this.get(key);
     } catch (error) {
+      if (options?.throwOnRecoveryError) {
+        throw error;
+      }
       return null;
     }
+  }
+
+  /**
+   * Strict version of getWithRecovery that throws any recovery/cloud error (auth, network, corruption)
+   * instead of swallowing and returning null.
+   */
+  async getWithRecoveryStrict(key: string, options?: { fallbackToCloud?: boolean; mode?: 'missing' | 'all' }): Promise<any | null> {
+    return this.getWithRecovery(key, { ...options, throwOnRecoveryError: true });
   }
 
   /**
@@ -1669,6 +1684,21 @@ export class Tero {
     this.missingKeys.clear();
     this.clearCache();
     this.releaseFileLock();
+  }
+
+  /**
+   * Returns true if the database encountered a non-fatal maintenance error
+   * (such as background checkpoint or archive failure) and is running in degraded mode.
+   */
+  isDegraded(): boolean {
+    return this.acidEngine?.isDegraded() ?? false;
+  }
+
+  /**
+   * Returns the most recent background maintenance error, if any.
+   */
+  getLastMaintenanceError(): Error | null {
+    return this.acidEngine?.getLastMaintenanceError() ?? null;
   }
 
   /**

@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync, rmSync } from "fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync, rmSync, writeSync } from "fs";
 import { join, basename, relative, dirname, sep } from "path";
 import { create as tarCreate } from "tar";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
@@ -6,7 +6,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import { CronJob } from "cron";
 import { gzipSync, gunzipSync } from "zlib";
 import { createHash, randomUUID } from "crypto";
-import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions } from "./acid-engine.js";
+import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum } from "./acid-engine.js";
 
 /**
  * LSN padded to 16 digits so lexicographic object-key sort == numeric LSN sort.
@@ -42,6 +42,30 @@ async function pooledMap<T, R>(items: T[], limit: number, fn: (item: T) => Promi
   });
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * Bounded-concurrency consumer for AsyncIterables (such as engine.snapshotFiles).
+ * Ensures at most `concurrency` items are concurrently processed, keeping
+ * memory strictly bounded O(concurrency) instead of O(total items).
+ */
+async function pooledConsumeAsyncGen<T>(
+  gen: AsyncIterable<T>,
+  concurrency: number,
+  fn: (item: T) => Promise<void>
+): Promise<void> {
+  const executing = new Set<Promise<void>>();
+  for await (const item of gen) {
+    const p: Promise<void> = fn(item).then(
+      () => { executing.delete(p); },
+      (err) => { executing.delete(p); throw err; }
+    );
+    executing.add(p);
+    if (executing.size >= concurrency) {
+      await Promise.race(executing);
+    }
+  }
+  await Promise.all(executing);
 }
 
 export interface LiveBackupStatus {
@@ -1228,27 +1252,35 @@ export class BackupManager {
       const dataPrefix = `${ckptPrefix}${baseTs}/data/`;
       const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
 
-      const uploadQueue: Array<{ rel: string; content: Buffer }> = [];
-      for await (const entry of engine.snapshotFiles(ckptLsn)) {
+      let count = 0;
+      await pooledConsumeAsyncGen(engine.snapshotFiles(ckptLsn), 16, async (entry) => {
         if (entry.state === 'present' && entry.data !== undefined) {
           const filePath = partitionedPath(this.dbPath, entry.key);
-          uploadQueue.push({
-            rel: posixRel(filePath),
-            content: Buffer.from(JSON.stringify(entry.data))
-          });
+          await this.uploadBytes(`${dataPrefix}${posixRel(filePath)}`, Buffer.from(JSON.stringify(entry.data)), 'application/json');
+          count++;
         }
-      }
-
-      await pooledMap(uploadQueue, 16, async (item) => {
-        await this.uploadBytes(`${dataPrefix}${item.rel}`, item.content, 'application/json');
       });
-      const count = uploadQueue.length;
 
-      // Acknowledge ONLY dirty keys covered by this snapshot
-      engine.acknowledgeDirtyKeys(dirtySnapshot.values());
+      const manifestObj = {
+        snapshotId: baseTs,
+        nodeId: this.liveNodeId,
+        baseLsn: ckptLsn,
+        maxLsn: Math.max(ckptLsn, this.liveShipper?.status.lastShippedLsn ?? 0),
+        createdAt: new Date().toISOString(),
+        docCount: count,
+        dataManifestHash: `${baseTs}:${ckptLsn}:${count}`,
+        walManifestHash: `${this.liveShipper?.status.lastShippedLsn ?? 0}`,
+        lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0,
+        lastCheckpointAt: new Date().toISOString()
+      };
 
       await this.uploadBytes(`${ckptPrefix}${baseTs}/index.json`, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, createdAt: new Date().toISOString(), docCount: count }, null, 2)), 'application/json');
+      await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify(manifestObj, null, 2)), 'application/json');
       await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString() }, null, 2)), 'application/json');
+
+      // CRITICAL P0 ORDERING: Acknowledge ONLY AFTER latest and manifest are published!
+      engine.acknowledgeDirtyKeys(dirtySnapshot.values());
+
       this.liveCheckpoints++;
       return { uploadedDocs: count, tombstonedDocs: 0, fullUpload: true, duration: Date.now() - start };
     }
@@ -1274,11 +1306,25 @@ export class BackupManager {
       }
     });
 
-    // Two-phase acknowledgment: ONLY acknowledge successfully uploaded items
-    engine.acknowledgeDirtyKeys(ackList);
+    const manifestObj = {
+      snapshotId: latest.baseTs,
+      nodeId: this.liveNodeId,
+      baseLsn: ckptLsn,
+      maxLsn: Math.max(ckptLsn, this.liveShipper?.status.lastShippedLsn ?? 0),
+      createdAt: new Date().toISOString(),
+      docCount: uploaded,
+      dataManifestHash: `${latest.baseTs}:${ckptLsn}:${uploaded}`,
+      walManifestHash: `${this.liveShipper?.status.lastShippedLsn ?? 0}`,
+      lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0,
+      lastCheckpointAt: new Date().toISOString()
+    };
 
     await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
-    await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify({ nodeId: this.liveNodeId, updatedAt: new Date().toISOString(), lastShippedLsn: this.liveShipper?.status.lastShippedLsn ?? 0, lastCheckpointAt: new Date().toISOString() }, null, 2)), 'application/json');
+    await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify(manifestObj, null, 2)), 'application/json');
+
+    // CRITICAL P0 ORDERING: Two-phase acknowledgment: ONLY acknowledge successfully uploaded items AFTER manifest and latest are published
+    engine.acknowledgeDirtyKeys(ackList);
+
     this.liveCheckpoints++;
     return { uploadedDocs: uploaded, tombstonedDocs: tombstoned, fullUpload: false, duration: Date.now() - start };
   }
@@ -1301,16 +1347,6 @@ export class BackupManager {
     try {
       const result = await this._restoreToTargetDirectory(stagingDir, opts);
 
-      // Write marker before initiating directory swap
-      writeFileSync(markerPath, JSON.stringify({
-        id: restoreId,
-        targetDir,
-        stagingDir,
-        backupDir,
-        createdAt: Date.now(),
-        stage: 'prepared'
-      }, null, 2));
-
       const parentDir = dirname(targetDir);
       const fsyncParent = () => {
         if (existsSync(parentDir)) {
@@ -1318,22 +1354,35 @@ export class BackupManager {
           try { fsyncSync(fd); } finally { closeSync(fd); }
         }
       };
-      fsyncParent();
+
+      const writeAndFsyncMarker = (stage: 'prepared' | 'swapped') => {
+        const markerContent = JSON.stringify({
+          id: restoreId,
+          targetDir,
+          stagingDir,
+          backupDir,
+          createdAt: Date.now(),
+          stage
+        }, null, 2);
+        const fd = openSync(markerPath, 'w');
+        try {
+          writeSync(fd, markerContent);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        fsyncParent();
+      };
+
+      // Write marker before initiating directory swap
+      writeAndFsyncMarker('prepared');
 
       if (existsSync(targetDir)) {
         renameSync(targetDir, backupDir);
         fsyncParent();
       }
 
-      writeFileSync(markerPath, JSON.stringify({
-        id: restoreId,
-        targetDir,
-        stagingDir,
-        backupDir,
-        createdAt: Date.now(),
-        stage: 'swapped'
-      }, null, 2));
-      fsyncParent();
+      writeAndFsyncMarker('swapped');
 
       renameSync(stagingDir, targetDir);
       fsyncParent();
@@ -1435,14 +1484,29 @@ export class BackupManager {
       }
     }
     const walKeys = (await this.listPrefix(`${prefix}wal/`))
-      .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) > (baseLsn ?? 0) : false; }).sort();
+      .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) > (baseLsn ?? 0) : false; })
+      .sort((a, b) => {
+        const ma = a.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
+        const mb = b.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
+        return parseInt(ma[1], 10) - parseInt(mb[1], 10);
+      });
 
     let prevEnd = -1;
-    for (const wk of walKeys) {
+    for (let i = 0; i < walKeys.length; i++) {
+      const wk = walKeys[i];
       const m = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
-      const s = parseInt(m[1]), e = parseInt(m[2]);
-      if (prevEnd >= 0 && s - prevEnd - 1 > 50) {
-        this.log.warn(`⚠️  Live-backup WAL gap: ${s - prevEnd - 1} LSNs missing between shipped segments (bucket outage longer than local WAL retention?). Writes in the gap may be unrecoverable.`);
+      const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+      if (s > e) {
+        throw new RecoveryCorruptionError(wk, 0, `Invalid segment range in cloud WAL: startLsn (${s}) > endLsn (${e})`);
+      }
+      if (i === 0) {
+        if (baseLsn !== undefined && baseLsn !== null && baseLsn > 0 && s > baseLsn + 1) {
+          throw new RecoveryCorruptionError(wk, 0, `WAL continuity gap between base checkpoint (${baseLsn}) and first cloud WAL segment (${s})`);
+        }
+      } else if (prevEnd >= 0) {
+        if (s !== prevEnd + 1) {
+          throw new RecoveryCorruptionError(wk, 0, `WAL segment gap in cloud restore: expected ${prevEnd + 1}, found ${s}`);
+        }
       }
       prevEnd = Math.max(prevEnd, e);
     }
@@ -1459,25 +1523,53 @@ export class BackupManager {
       lastLsn = Math.max(lastLsn, e.lsn);
     };
     for (const wk of walKeys) {
+      const m = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
+      const segStart = parseInt(m[1], 10), segEnd = parseInt(m[2], 10);
+      let entries: LogEntry[];
       try {
-        const entries: LogEntry[] = JSON.parse(gunzipSync(await this.downloadBytes(wk)).toString('utf8'));
-        for (const e of entries) {
-          if (e.timestamp > pit) continue;
-          if (e.lsn > targetLsn) continue;
-          if (e.lsn <= (baseLsn ?? 0)) continue;
-          if (e.operation === 'WRITE' || e.operation === 'DELETE') {
-            if (!e.transactionId) { apply(e); continue; }
-            if (!pending.has(e.transactionId)) pending.set(e.transactionId, []);
-            pending.get(e.transactionId)!.push(e);
-          } else if (e.operation === 'COMMIT') {
-            for (const w of pending.get(e.transactionId) ?? []) apply(w);
-            pending.delete(e.transactionId);
-          } else if (e.operation === 'ROLLBACK') { pending.delete(e.transactionId); }
+        const raw = gunzipSync(await this.downloadBytes(wk)).toString('utf8');
+        entries = JSON.parse(raw);
+        if (!Array.isArray(entries)) {
+          throw new Error('Cloud WAL segment is not an array of entries');
         }
-        segmentsReplayed++;
-      } catch (e) {
-        throw new Error(`Corrupt WAL segment ${wk} during live restore: ${e instanceof Error ? e.message : e}`);
+      } catch (err: any) {
+        throw new RecoveryCorruptionError(wk, 0, `Corrupt cloud WAL segment ${wk}: ${err?.message || err}`);
       }
+
+      if (entries.length === 0) {
+        throw new RecoveryCorruptionError(wk, 0, `Empty cloud WAL segment with declared range ${segStart}-${segEnd}`);
+      }
+      if (entries[0].lsn !== segStart) {
+        throw new RecoveryCorruptionError(wk, 0, `Cloud WAL segment start LSN mismatch: declared ${segStart}, actual first record ${entries[0].lsn}`);
+      }
+      if (entries[entries.length - 1].lsn !== segEnd) {
+        throw new RecoveryCorruptionError(wk, 0, `Cloud WAL segment end LSN mismatch: declared ${segEnd}, actual last record ${entries[entries.length - 1].lsn}`);
+      }
+
+      let prevRecordLsn = -1;
+      for (const e of entries) {
+        if (prevRecordLsn !== -1 && e.lsn <= prevRecordLsn) {
+          throw new RecoveryCorruptionError(wk, 0, `Non-monotonic record LSN in cloud WAL segment: expected > ${prevRecordLsn}, got ${e.lsn}`, e.lsn);
+        }
+        prevRecordLsn = e.lsn;
+
+        if (!verifyLogEntryChecksum(e)) {
+          throw new RecoveryCorruptionError(wk, 0, `Checksum mismatch in cloud WAL segment for entry LSN ${e.lsn}`, e.lsn);
+        }
+
+        if (pit !== undefined && e.timestamp > pit) continue;
+        if (targetLsn !== undefined && e.lsn > targetLsn) continue;
+        if (e.lsn <= (baseLsn ?? 0)) continue;
+        if (e.operation === 'WRITE' || e.operation === 'DELETE') {
+          if (!e.transactionId) { apply(e); continue; }
+          if (!pending.has(e.transactionId)) pending.set(e.transactionId, []);
+          pending.get(e.transactionId)!.push(e);
+        } else if (e.operation === 'COMMIT') {
+          for (const w of pending.get(e.transactionId) ?? []) apply(w);
+          pending.delete(e.transactionId);
+        } else if (e.operation === 'ROLLBACK') { pending.delete(e.transactionId); }
+      }
+      segmentsReplayed++;
     }
     return { nodeId, docsRestored, segmentsReplayed, baseLsn, lastLsn };
   }

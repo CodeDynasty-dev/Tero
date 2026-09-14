@@ -1,5 +1,5 @@
 import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync, renameSync, unlinkSync, writeFileSync, writeSync } from "fs";
 import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
 import { CloudStorageConfig } from "./backup.js";
@@ -7,7 +7,7 @@ import { partitionedPath, DataCorruptionError } from "./acid-engine.js";
 
 export const MAX_DOCUMENT_SIZE = 10 * 1024 * 1024; // 10MB limit
 
-export type RecoveryErrorKind = 'NOT_FOUND' | 'RETRYABLE_NETWORK' | 'FATAL_AUTH' | 'CANCELLED' | 'FATAL_CORRUPTION';
+export type RecoveryErrorKind = 'NOT_FOUND' | 'RETRYABLE_NETWORK' | 'FATAL_AUTH' | 'CANCELLED' | 'FATAL_CORRUPTION' | 'FATAL_UNKNOWN';
 
 export function classifyRecoveryError(error: any): RecoveryErrorKind {
     if (
@@ -32,7 +32,21 @@ export function classifyRecoveryError(error: any): RecoveryErrorKind {
     if (error instanceof DataCorruptionError || error?.name === 'DataCorruptionError' || error?.code === 'DATA_CORRUPTION') {
         return 'FATAL_CORRUPTION';
     }
-    return 'RETRYABLE_NETWORK';
+    const code = error?.code;
+    if (
+        (typeof status === 'number' && (status === 429 || (status >= 500 && status < 600))) ||
+        code === 'ECONNRESET' ||
+        code === 'ETIMEDOUT' ||
+        code === 'ENOTFOUND' ||
+        code === 'EAI_AGAIN' ||
+        code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        error?.name === 'TimeoutError' ||
+        error?.name === 'RequestTimeout' ||
+        error?.name === 'ServiceUnavailable'
+    ) {
+        return 'RETRYABLE_NETWORK';
+    }
+    return 'FATAL_UNKNOWN';
 }
 
 export interface RecoveryConfig {
@@ -148,8 +162,12 @@ export class DataRecovery {
                 return { key, exists: false };
             }
             // Re-surface real errors (auth/network/permission) so callers can distinguish
-            // "not in cloud" from "couldn't reach cloud".
-            throw new Error(`Failed to check file in cloud: ${error?.message || 'Unknown error'}`);
+            // "not in cloud" from "couldn't reach cloud", preserving metadata for classifyRecoveryError.
+            const err = new Error(`Failed to check file in cloud: ${error?.message || 'Unknown error'}`);
+            (err as any).$metadata = error?.$metadata;
+            (err as any).name = error?.name;
+            (err as any).code = error?.code;
+            throw err;
         }
     }
 
@@ -169,7 +187,7 @@ export class DataRecovery {
                 Key: cloudKey
             });
 
-            const response = await this.s3Client.send(getCommand);
+            const response = await this.s3Client.send(getCommand, { abortSignal: options?.abortSignal });
             if (!response.Body) {
                 return null;
             }
@@ -212,13 +230,27 @@ export class DataRecovery {
                 mkdirSync(localDir, { recursive: true });
             }
 
-            // Write atomically to avoid partial reads on crash
+            // Write atomically and durably to avoid partial reads on crash
             const tempFilePath = `${localFilePath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
             try {
-                writeFileSync(tempFilePath, content, 'utf-8');
+                const fd = openSync(tempFilePath, 'w');
+                try {
+                    writeSync(fd, Buffer.from(content, 'utf-8'));
+                    fsyncSync(fd);
+                } finally {
+                    closeSync(fd);
+                }
                 renameSync(tempFilePath, localFilePath);
+
+                // Durably persist directory entry
+                const dirFd = openSync(localDir, 'r');
+                try {
+                    fsyncSync(dirFd);
+                } finally {
+                    closeSync(dirFd);
+                }
             } catch (writeErr) {
-                try { if (existsSync(tempFilePath)) unlinkSync(tempFilePath); } catch { }
+                try { if (existsSync(tempFilePath)) unlinkSync(tempFilePath); } catch { /* approved: cleanup temp file */ }
                 throw writeErr;
             }
 
@@ -325,13 +357,9 @@ export class DataRecovery {
             }
 
             // Recover each file. We catch real (non-404) errors here so a single
-            // auth/network hiccup doesn't abort the whole batch — they go into `failed`
-            // and the caller can decide whether to retry.
-            //
-            // Parallel S3 GETs in batches of `concurrency` (default 10). A single-key
-            // sequential download takes ~30ms HTTP RTT to S3/R2; 50,000 keys sequentially
-            // takes 25 minutes (1,500 seconds). Batched parallelism reduces this to
-            // ~25ms × (50,000 / 10) ≈ 125 seconds (~2 min) and can be tuned higher.
+            // auth/network hiccup doesn't abort the whole batch when continueOnError is true —
+            // they go into `failed` and the caller can decide whether to retry.
+            // When continueOnError is false, fatal errors (auth, corruption, unknown) throw immediately.
             const concurrency = this.config.concurrency ?? 10;
             for (let i = 0; i < keys.length; i += concurrency) {
                 if (isCancelled?.()) break;
@@ -348,11 +376,26 @@ export class DataRecovery {
                 );
                 for (const r of results) {
                     if (r.status === 'fulfilled') {
-                        const { key, success } = r.value;
-                        if (success) recovered.push(key);
-                        else failed.push(key);
+                        const { key, success, error } = r.value as any;
+                        if (success) {
+                            recovered.push(key);
+                        } else {
+                            failed.push(key);
+                            if (error && !this.config.continueOnError) {
+                                const kind = classifyRecoveryError(error);
+                                if (kind === 'FATAL_AUTH' || kind === 'FATAL_CORRUPTION' || kind === 'FATAL_UNKNOWN') {
+                                    throw error;
+                                }
+                            }
+                        }
                     } else {
                         failed.push((r.reason as any)?.key || 'unknown');
+                        if (!this.config.continueOnError) {
+                            const kind = classifyRecoveryError(r.reason);
+                            if (kind === 'FATAL_AUTH' || kind === 'FATAL_CORRUPTION' || kind === 'FATAL_UNKNOWN') {
+                                throw r.reason;
+                            }
+                        }
                     }
                 }
             }
@@ -367,6 +410,10 @@ export class DataRecovery {
                 duration
             };
         } catch (error) {
+            const kind = classifyRecoveryError(error);
+            if (!this.config.continueOnError && (kind === 'FATAL_AUTH' || kind === 'FATAL_CORRUPTION' || kind === 'FATAL_UNKNOWN')) {
+                throw error;
+            }
             const duration = Date.now() - startTime;
 
             return {
@@ -379,36 +426,52 @@ export class DataRecovery {
         }
     }
 
-    async listAvailableArchives(): Promise<string[]> {
+    async *iterateAvailableArchives(options?: { abortSignal?: AbortSignal }): AsyncGenerator<{ name: string; key: string; lastModified?: Date }, void, unknown> {
         const prefix = this.getCloudKey('');
-        const objects: any[] = [];
         let token: string | undefined;
         try {
             do {
-                const response: any = await this.s3Client.send(new ListObjectsV2Command({
-                    Bucket: this.config.cloudStorage.bucket,
-                    Prefix: prefix,
-                    MaxKeys: 1000,
-                    ContinuationToken: token
-                }));
-                if (response.Contents) objects.push(...response.Contents);
+                options?.abortSignal?.throwIfAborted();
+                let response: any;
+                try {
+                    response = await this.s3Client.send(new ListObjectsV2Command({
+                        Bucket: this.config.cloudStorage.bucket,
+                        Prefix: prefix,
+                        MaxKeys: 1000,
+                        ContinuationToken: token
+                    }), { abortSignal: options?.abortSignal });
+                } catch (error: any) {
+                    if (this.isNotFound(error)) return;
+                    throw error;
+                }
+                if (response.Contents) {
+                    for (const obj of response.Contents) {
+                        options?.abortSignal?.throwIfAborted();
+                        if (obj.Key && obj.Key.endsWith('.tar.gz')) {
+                            yield {
+                                name: obj.Key.split('/').pop()!,
+                                key: obj.Key,
+                                lastModified: obj.LastModified
+                            };
+                        }
+                    }
+                }
                 token = response.IsTruncated ? response.NextContinuationToken : undefined;
             } while (token);
         } catch (error: any) {
-            if (this.isNotFound(error)) return [];
+            if (this.isNotFound(error)) return;
             throw error;
         }
+    }
 
-        if (objects.length === 0) return [];
-
-        return objects
-            .filter((obj: any) => obj.Key && obj.Key.endsWith('.tar.gz'))
-            .sort((a: any, b: any) => {
-                const dateA = a.LastModified?.getTime() || 0;
-                const dateB = b.LastModified?.getTime() || 0;
-                return dateB - dateA;
-            })
-            .map((obj: any) => obj.Key!.split('/').pop()!)
+    async listAvailableArchives(options?: { abortSignal?: AbortSignal }): Promise<string[]> {
+        const archives: Array<{ name: string; lastModified?: Date }> = [];
+        for await (const arch of this.iterateAvailableArchives(options)) {
+            archives.push(arch);
+        }
+        return archives
+            .sort((a, b) => (b.lastModified?.getTime() || 0) - (a.lastModified?.getTime() || 0))
+            .map(a => a.name)
             .filter(Boolean);
     }
 
@@ -425,7 +488,7 @@ export class DataRecovery {
                         Prefix: prefix,
                         MaxKeys: 1000,
                         ContinuationToken: token
-                    }));
+                    }), { abortSignal: options?.abortSignal });
                 } catch (error: any) {
                     if (this.isNotFound(error)) return;
                     throw error;
@@ -484,10 +547,15 @@ export class DataRecovery {
      * Recover only files that exist in the cloud but are missing locally.
      * Returns the standard RecoveryResult. Used by v2 hydrate-on-startup (mode='missing').
      */
-    async recoverMissingFiles(isCancelled?: () => boolean): Promise<RecoveryResult> {
+    async recoverMissingFiles(isCancelledOrOptions?: (() => boolean) | { abortSignal?: AbortSignal }): Promise<RecoveryResult> {
         const startTime = Date.now();
+        const isCancelled = typeof isCancelledOrOptions === 'function'
+            ? isCancelledOrOptions
+            : () => isCancelledOrOptions?.abortSignal?.aborted ?? false;
+        const abortSignal = typeof isCancelledOrOptions === 'object' ? isCancelledOrOptions?.abortSignal : undefined;
+
         try {
-            const missing = await this.listMissingLocally();
+            const missing = await this.listMissingLocally({ abortSignal });
             if (missing.length === 0) {
                 return {
                     success: true,
@@ -501,6 +569,10 @@ export class DataRecovery {
             result.duration = Date.now() - startTime;
             return result;
         } catch (error) {
+            const kind = classifyRecoveryError(error);
+            if (!this.config.continueOnError && (kind === 'FATAL_AUTH' || kind === 'FATAL_CORRUPTION' || kind === 'FATAL_UNKNOWN')) {
+                throw error;
+            }
             return {
                 success: false,
                 recovered: [],

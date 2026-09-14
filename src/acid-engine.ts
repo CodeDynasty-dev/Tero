@@ -1,11 +1,16 @@
 import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync, rmSync } from "fs";
 import { join, dirname } from "path";
 import { randomBytes } from "crypto";
+import { StringDecoder } from "string_decoder";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonArray = JsonValue[];
 export type JsonObject = { [key: string]: JsonValue };
 export type JsonValue = JsonPrimitive | JsonObject | JsonArray;
+
+export function padLsn(lsn: number): string {
+    return String(lsn).padStart(12, '0');
+}
 
 export class RecoveryCorruptionError extends Error {
     code = 'RECOVERY_CORRUPTION';
@@ -34,11 +39,16 @@ export class DataCorruptionError extends Error {
 }
 
 export function cloneJson<T>(value: T): T {
-    if (value === null || typeof value !== 'object') {
-        if (typeof value === 'function' || typeof value === 'symbol') {
-            throw new TypeError(`Cannot serialize non-JSON value of type ${typeof value}`);
+    if (value === null) return value;
+    if (typeof value === 'boolean' || typeof value === 'string') return value;
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new TypeError(`Cannot serialize non-finite number: ${value}`);
         }
         return value;
+    }
+    if (typeof value === 'bigint' || typeof value === 'function' || typeof value === 'symbol' || typeof value === 'undefined') {
+        throw new TypeError(`Cannot serialize non-JSON value of type ${typeof value}`);
     }
     if (Array.isArray(value)) {
         const arr = new Array(value.length);
@@ -47,16 +57,24 @@ export function cloneJson<T>(value: T): T {
         }
         return arr as unknown as T;
     }
+    if (typeof value !== 'object') {
+        throw new TypeError(`Cannot serialize non-JSON value of type ${typeof value}`);
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== null && proto !== Object.prototype) {
+        throw new TypeError(`Cannot serialize non-plain object of type ${value?.constructor?.name || typeof value}`);
+    }
     const copy: any = {};
     for (const k of Object.keys(value)) {
         if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
-        const v = (value as any)[k];
-        if (typeof v === 'function' || typeof v === 'symbol') {
-            throw new TypeError(`Cannot serialize non-JSON property '${k}' of type ${typeof v}`);
-        }
-        copy[k] = cloneJson(v);
+        copy[k] = cloneJson((value as any)[k]);
     }
     return copy as T;
+}
+
+export function verifyLogEntryChecksum(entry: LogEntry): boolean {
+    const { checksum, ...entryWithoutChecksum } = entry;
+    return fnv1a64(JSON.stringify(entryWithoutChecksum)) === checksum;
 }
 
 export interface DirtyEntry {
@@ -99,6 +117,86 @@ function fnv1a64(str: string): string {
     }
     // Combine into 16-char hex (two 32-bit halves)
     return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+export function streamLogFile(filePath: string, visitor: (entry: LogEntry) => void, allowTornTail = true): { firstLsn: number | null; lastLsn: number | null; count: number } {
+    if (!existsSync(filePath)) return { firstLsn: null, lastLsn: null, count: 0 };
+    let fd: number;
+    try {
+        fd = openSync(filePath, 'r');
+    } catch (err: any) {
+        if (err?.code === 'ENOENT') return { firstLsn: null, lastLsn: null, count: 0 };
+        throw err;
+    }
+    const decoder = new StringDecoder('utf8');
+    const buf = Buffer.alloc(65536);
+    let partial = '';
+    let currentOffset = 0;
+    let lastLsn = -1;
+    let firstLsn: number | null = null;
+    let count = 0;
+
+    try {
+        let bytesRead: number;
+        while ((bytesRead = readSync(fd, buf, 0, buf.length, null)) > 0) {
+            const chunk = partial + decoder.write(buf.subarray(0, bytesRead));
+            const lines = chunk.split('\n');
+            partial = lines.pop() || '';
+            for (const line of lines) {
+                const recordOffset = currentOffset;
+                currentOffset += Buffer.byteLength(line, 'utf8') + 1;
+                if (!line.trim()) continue;
+
+                let entry: LogEntry;
+                try {
+                    entry = JSON.parse(line);
+                } catch (e: any) {
+                    throw new RecoveryCorruptionError(filePath, recordOffset, `Invalid JSON record: ${e?.message || 'parse error'}`);
+                }
+
+                if (!verifyLogEntryChecksum(entry)) {
+                    throw new RecoveryCorruptionError(filePath, recordOffset, 'Checksum mismatch', entry.lsn);
+                }
+
+                if (lastLsn !== -1 && entry.lsn <= lastLsn) {
+                    throw new RecoveryCorruptionError(filePath, recordOffset, `Non-monotonic LSN: expected > ${lastLsn}, got ${entry.lsn}`, entry.lsn);
+                }
+                lastLsn = entry.lsn;
+                if (firstLsn === null) firstLsn = entry.lsn;
+                count++;
+
+                visitor(entry);
+            }
+        }
+
+        partial += decoder.end();
+        if (partial.trim()) {
+            const recordOffset = currentOffset;
+            try {
+                const entry: LogEntry = JSON.parse(partial);
+                if (verifyLogEntryChecksum(entry)) {
+                    if (lastLsn !== -1 && entry.lsn <= lastLsn) {
+                        throw new RecoveryCorruptionError(filePath, recordOffset, `Non-monotonic LSN: expected > ${lastLsn}, got ${entry.lsn}`, entry.lsn);
+                    }
+                    lastLsn = entry.lsn;
+                    if (firstLsn === null) firstLsn = entry.lsn;
+                    count++;
+                    visitor(entry);
+                } else if (!allowTornTail) {
+                    throw new RecoveryCorruptionError(filePath, recordOffset, 'Checksum mismatch on unterminated final fragment', entry.lsn);
+                }
+            } catch (err: any) {
+                if (err instanceof RecoveryCorruptionError) throw err;
+                if (!allowTornTail) {
+                    throw new RecoveryCorruptionError(filePath, recordOffset, `Invalid JSON on unterminated final fragment: ${err?.message || 'parse error'}`);
+                }
+            }
+        }
+    } finally {
+        closeSync(fd);
+    }
+
+    return { firstLsn, lastLsn: lastLsn === -1 ? null : lastLsn, count };
 }
 
 // Write-Ahead Log (WAL) implementation
@@ -208,6 +306,38 @@ export class WriteAheadLog {
     }
 
     private recoverFromLog(): void {
+        const dir = dirname(this.logPath);
+        if (existsSync(dir)) {
+            const files = readdirSync(dir).filter(f => f.startsWith('.wal.seg-'));
+            if (files.length > 0) {
+                const segPaths = files.map(f => join(dir, f));
+                const verified = verifyWalSegmentContinuity(segPaths, true);
+                if (verified.length > 0) {
+                    const lastSeg = verified[verified.length - 1];
+                    let activeFirstLsn: number | null = null;
+                    let activeMaxLsn = lastSeg.endLsn;
+                    this.streamLogEntries((entry) => {
+                        if (activeFirstLsn === null) activeFirstLsn = entry.lsn;
+                        if (entry.lsn > activeMaxLsn) activeMaxLsn = entry.lsn;
+                    });
+                    if (activeFirstLsn !== null) {
+                        if (activeFirstLsn !== lastSeg.endLsn + 1) {
+                            throw new RecoveryCorruptionError(
+                                this.logPath,
+                                0,
+                                `WAL continuity gap between archive and active log: archive ended at ${lastSeg.endLsn}, active log starts at ${activeFirstLsn}`,
+                                activeFirstLsn
+                            );
+                        }
+                        this.currentLSN = activeMaxLsn + 1;
+                    } else {
+                        this.currentLSN = lastSeg.endLsn + 1;
+                    }
+                    return;
+                }
+            }
+        }
+
         let maxLSN = 0;
         let hasEntries = false;
         this.streamLogEntries((entry) => {
@@ -230,71 +360,22 @@ export class WriteAheadLog {
      * - Monotonic LSN strictly required within the log stream
      */
     streamLogEntries(visitor: (entry: LogEntry) => void): void {
-        if (!existsSync(this.logPath)) return;
-        let fd: number;
-        try {
-            fd = openSync(this.logPath, 'r');
-        } catch {
-            return;
-        }
-        const buf = Buffer.alloc(65536); // 64KB read chunks
-        let partial = '';
-        let currentOffset = 0;
-        let lastLsn = -1;
-        try {
-            let bytesRead: number;
-            while ((bytesRead = readSync(fd, buf, 0, buf.length, null)) > 0) {
-                const chunk = partial + buf.toString('utf8', 0, bytesRead);
-                const lines = chunk.split('\n');
-                // Last element may be a partial line — carry it to next chunk
-                partial = lines.pop() || '';
-                for (const line of lines) {
-                    const recordOffset = currentOffset;
-                    currentOffset += Buffer.byteLength(line, 'utf8') + 1; // +1 for \n
-                    if (!line.trim()) continue;
+        streamLogFile(this.logPath, visitor, true);
+    }
 
-                    let entry: LogEntry;
-                    try {
-                        entry = JSON.parse(line);
-                    } catch (e: any) {
-                        throw new RecoveryCorruptionError(this.logPath, recordOffset, `Invalid JSON record: ${e?.message || 'parse error'}`);
-                    }
-
-                    if (!this.verifyChecksum(entry)) {
-                        throw new RecoveryCorruptionError(this.logPath, recordOffset, 'Checksum mismatch', entry.lsn);
-                    }
-
-                    if (lastLsn !== -1 && entry.lsn <= lastLsn) {
-                        throw new RecoveryCorruptionError(this.logPath, recordOffset, `Non-monotonic LSN: expected > ${lastLsn}, got ${entry.lsn}`, entry.lsn);
-                    }
-                    lastLsn = entry.lsn;
-
-                    visitor(entry);
+    streamAllLogEntries(visitor: (entry: LogEntry) => void): void {
+        const dir = dirname(this.logPath);
+        if (existsSync(dir)) {
+            const files = readdirSync(dir).filter(f => f.startsWith('.wal.seg-'));
+            if (files.length > 0) {
+                const segPaths = files.map(f => join(dir, f));
+                const verified = verifyWalSegmentContinuity(segPaths, true);
+                for (const seg of verified) {
+                    streamLogFile(seg.path, visitor, false);
                 }
             }
-
-            // EOF reached: check final unterminated record (partial)
-            if (partial.trim()) {
-                const recordOffset = currentOffset;
-                try {
-                    const entry: LogEntry = JSON.parse(partial);
-                    if (this.verifyChecksum(entry)) {
-                        if (lastLsn !== -1 && entry.lsn <= lastLsn) {
-                            throw new RecoveryCorruptionError(this.logPath, recordOffset, `Non-monotonic LSN: expected > ${lastLsn}, got ${entry.lsn}`, entry.lsn);
-                        }
-                        lastLsn = entry.lsn;
-                        visitor(entry);
-                    } else {
-                        // Tolerated torn tail at EOF: checksum mismatch on final unterminated fragment
-                    }
-                } catch (err: any) {
-                    if (err instanceof RecoveryCorruptionError) throw err;
-                    // Tolerated torn tail at EOF: invalid JSON on final unterminated fragment
-                }
-            }
-        } finally {
-            closeSync(fd);
         }
+        this.streamLogEntries(visitor);
     }
 
     private calculateChecksum(entry: Omit<LogEntry, 'checksum'>): string {
@@ -302,8 +383,7 @@ export class WriteAheadLog {
     }
 
     private verifyChecksum(entry: LogEntry): boolean {
-        const { checksum, ...entryWithoutChecksum } = entry;
-        return this.calculateChecksum(entryWithoutChecksum as Omit<LogEntry, 'checksum'>) === checksum;
+        return verifyLogEntryChecksum(entry as LogEntry);
     }
 
     /**
@@ -408,18 +488,18 @@ export class WriteAheadLog {
             return null;
         }
 
-        const archivePath = `${this.logPath}.seg-${firstLsn}-${lastLsn}`;
+        const archivePath = `${this.logPath}.seg-${padLsn(firstLsn)}-${padLsn(lastLsn)}`;
         const dir = dirname(this.logPath);
 
         // 1. Atomic rename to immutable segment
         renameSync(this.logPath, archivePath);
-        if (this.synchronous === 'full') this.fsyncFile(archivePath);
-        if (this.synchronous === 'full') this.fsyncDir(dir);
+        this.fsyncFile(archivePath);
+        this.fsyncDir(dir);
 
         // 2. Start fresh empty log
         writeFileSync(this.logPath, '');
-        if (this.synchronous === 'full') this.fsyncFile(this.logPath);
-        if (this.synchronous === 'full') this.fsyncDir(dir);
+        this.fsyncFile(this.logPath);
+        this.fsyncDir(dir);
 
         // 3. Emit a CHECKPOINT entry at the head of the new log
         this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
@@ -440,9 +520,12 @@ export class WriteAheadLog {
         const files = readdirSync(dir);
         return files
             .filter(f => (f.startsWith('.wal.seg-') || f.startsWith('.wal.')) && f !== '.wal')
-            .sort()
-            .reverse()
-            .map(f => join(dir, f));
+            .map(f => {
+                const m = f.match(/\.seg-(\d+)-(\d+)$/);
+                return { path: join(dir, f), startLsn: m ? parseInt(m[1], 10) : 0 };
+            })
+            .sort((a, b) => b.startLsn - a.startLsn)
+            .map(s => s.path);
     }
 
     private cleanupOldArchives(keepCount: number): void {
@@ -451,13 +534,16 @@ export class WriteAheadLog {
         const files = readdirSync(dir);
         const archiveFiles = files
             .filter(f => (f.startsWith('.wal.seg-') || f.startsWith('.wal.')) && f !== '.wal')
-            .map(f => join(dir, f))
-            .sort(); // oldest first
+            .map(f => {
+                const m = f.match(/\.seg-(\d+)-(\d+)$/);
+                return { path: join(dir, f), startLsn: m ? parseInt(m[1], 10) : 0 };
+            })
+            .sort((a, b) => a.startLsn - b.startLsn); // oldest first
 
         while (archiveFiles.length > keepCount) {
             const oldestFile = archiveFiles.shift();
-            if (oldestFile && existsSync(oldestFile)) {
-                unlinkSync(oldestFile);
+            if (oldestFile && existsSync(oldestFile.path)) {
+                unlinkSync(oldestFile.path);
             }
         }
     }
@@ -861,7 +947,7 @@ export function partitionedPath(dbPath: string, key: string): string {
     if (!key || typeof key !== 'string' || !key.trim()) {
         throw new TypeError(`Invalid key '${key}': key must be a non-empty string`);
     }
-    if (key.includes('..') || key.includes('/') || key.includes('\\') || key.includes('\0') || key === '.' || key.startsWith('.')) {
+    if (key === '.' || key === '..' || key.includes('/') || key.includes('\\') || key.includes('\0') || key.startsWith('.')) {
         throw new TypeError(`Invalid key '${key}': keys must not contain slashes, null bytes, or directory traversal`);
     }
     // Fast 32-bit FNV-1a of the key to pick the partition dirs. We only need
@@ -905,11 +991,17 @@ export async function walkPartitions(dbPath: string, visitor: (filePath: string)
                             if (!entry2.name.endsWith('.json')) continue;
                             await visitor(join(level1Path, entry2.name));
                         }
-                    } catch { /* dir may be removed mid-walk */ }
+                    } catch (e: any) {
+                        if (e?.code === 'ENOENT') { /* dir removed mid-walk */ } else throw e;
+                    }
                 }
-            } catch { /* dir may be removed mid-walk */ }
+            } catch (e: any) {
+                if (e?.code === 'ENOENT') { /* dir removed mid-walk */ } else throw e;
+            }
         }
-    } catch { /* dbPath may not exist */ }
+    } catch (e: any) {
+        if (e?.code === 'ENOENT') { /* dbPath may not exist */ } else throw e;
+    }
 }
 
 export interface RestoreMarker {
@@ -929,9 +1021,11 @@ export function recoverPendingRestore(dbPath: string): void {
     try {
         const content = readFileSync(markerPath, 'utf-8');
         marker = JSON.parse(content);
-    } catch {
-        // Corrupt marker file — leave for manual investigation
-        return;
+        if (!marker || typeof marker !== 'object' || !marker.targetDir || !marker.stagingDir || !marker.backupDir) {
+            throw new Error('Malformed marker schema');
+        }
+    } catch (err: any) {
+        throw new RecoveryCorruptionError(markerPath, 0, `Corrupted restore marker file: ${err?.message || err}`);
     }
 
     const targetExists = existsSync(marker.targetDir);
@@ -983,11 +1077,11 @@ export function recoverPendingRestore(dbPath: string): void {
         try {
             fd = openSync(parentDir, 'r');
             fsyncSync(fd);
-        } catch { /* approved: parent directory fsync best-effort */ } finally {
+        } finally {
             if (fd !== undefined) closeSync(fd);
         }
     }
-    try { unlinkSync(markerPath); } catch { }
+    try { unlinkSync(markerPath); } catch { /* approved: cleanup unneeded marker */ }
 }
 
 export function verifyWalSegmentContinuity(segmentPaths: string[], verifyContent: boolean = true): Array<{ path: string; startLsn: number; endLsn: number }> {
@@ -1022,30 +1116,9 @@ export function verifyWalSegmentContinuity(segmentPaths: string[], verifyContent
         }
 
         if (verifyContent && existsSync(seg.path)) {
-            const content = readFileSync(seg.path, 'utf8').trim();
-            if (!content) {
+            const { firstLsn, lastLsn, count } = streamLogFile(seg.path, () => {}, false);
+            if (count === 0 || firstLsn === null || lastLsn === null) {
                 throw new RecoveryCorruptionError(seg.path, 0, `Empty WAL segment with non-empty declared range ${seg.startLsn}-${seg.endLsn}`);
-            }
-            const lines = content.split('\n').filter(l => l.trim().length > 0);
-            if (lines.length === 0) {
-                throw new RecoveryCorruptionError(seg.path, 0, `Empty WAL segment with non-empty declared range ${seg.startLsn}-${seg.endLsn}`);
-            }
-            let firstLsn: number | null = null;
-            let lastLsn: number | null = null;
-            let prevRecordLsn = -1;
-            for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-                let entry: LogEntry;
-                try {
-                    entry = JSON.parse(lines[lineIdx]);
-                } catch (e: any) {
-                    throw new RecoveryCorruptionError(seg.path, lineIdx, `Invalid JSON record in segment: ${e?.message || 'parse error'}`);
-                }
-                if (firstLsn === null) firstLsn = entry.lsn;
-                if (prevRecordLsn !== -1 && entry.lsn <= prevRecordLsn) {
-                    throw new RecoveryCorruptionError(seg.path, lineIdx, `Non-monotonic record LSN in segment: expected > ${prevRecordLsn}, got ${entry.lsn}`, entry.lsn);
-                }
-                prevRecordLsn = entry.lsn;
-                lastLsn = entry.lsn;
             }
             if (firstLsn !== seg.startLsn) {
                 throw new RecoveryCorruptionError(seg.path, 0, `WAL segment start LSN mismatch: declared ${seg.startLsn}, actual first record ${firstLsn}`);
@@ -1108,6 +1181,16 @@ export class ACIDStorageEngine {
     private activeSnapshotLsn: number | null = null;
     private snapshotBeforeImages: Map<string, { state: 'present' | 'deleted'; data?: JsonValue }> = new Map();
     private lastCommittedLSN: number = 0;
+    private degraded: boolean = false;
+    private lastMaintenanceError: Error | null = null;
+
+    isDegraded(): boolean {
+        return this.degraded;
+    }
+
+    getLastMaintenanceError(): Error | null {
+        return this.lastMaintenanceError;
+    }
 
     getLastCommittedLSN(): number {
         return this.lastCommittedLSN;
@@ -1212,10 +1295,12 @@ export class ACIDStorageEngine {
                                 }
                             } catch (err: any) {
                                 if (err instanceof DataCorruptionError) throw err;
+                                if (err?.code === 'ENOENT') { /* dir removed mid-walk */ } else throw err;
                             }
                         }
                     } catch (err: any) {
                         if (err instanceof DataCorruptionError) throw err;
+                        if (err?.code === 'ENOENT') { /* dir removed mid-walk */ } else throw err;
                     }
                 }
             }
@@ -1302,7 +1387,7 @@ export class ACIDStorageEngine {
         const abortedTransactions = new Set<string>();
 
         // Phase 1: streaming analysis — determine which transactions committed or aborted
-        this.wal.streamLogEntries((entry) => {
+        this.wal.streamAllLogEntries((entry) => {
             if (entry.operation === 'COMMIT') {
                 committedTransactions.add(entry.transactionId);
                 if (entry.lsn > this.lastCommittedLSN) {
@@ -1315,7 +1400,7 @@ export class ACIDStorageEngine {
 
         // Phase 2: redo + undo — single streaming pass
         const undoByKey = new Map<string, LogEntry>();
-        this.wal.streamLogEntries((entry) => {
+        this.wal.streamAllLogEntries((entry) => {
             if (entry.operation === 'WRITE' && committedTransactions.has(entry.transactionId)) {
                 this.redoOperation(entry);
             } else if (entry.operation === 'DELETE' && committedTransactions.has(entry.transactionId)) {
@@ -1774,8 +1859,12 @@ export class ACIDStorageEngine {
             try {
                 this.flushCommittedBuffer(true);
                 this.wal.rotateLog();
-            } catch {
+                this.degraded = false;
+                this.lastMaintenanceError = null;
+            } catch (err: any) {
                 // Post-commit maintenance failure must not invalidate the commit
+                this.degraded = true;
+                this.lastMaintenanceError = err instanceof Error ? err : new Error(String(err));
             }
         }
     }
@@ -1954,7 +2043,8 @@ export class ACIDStorageEngine {
                 try {
                     this.atomicWriteFile(filePath, JSON.stringify(entry.data), syncNeeded);
                     success = true;
-                } catch {
+                } catch (err) {
+                    if (forceFsync) throw err;
                     // best-effort — WAL redo will handle on crash, retain in committedBuffer to retry
                 } finally {
                     if (success) this.committedBuffer.delete(key);
@@ -1963,7 +2053,8 @@ export class ACIDStorageEngine {
                 try {
                     if (existsSync(filePath)) unlinkSync(filePath);
                     success = true;
-                } catch {
+                } catch (err) {
+                    if (forceFsync) throw err;
                     // retain in committedBuffer to retry
                 } finally {
                     if (success) this.committedBuffer.delete(key);
@@ -1973,7 +2064,12 @@ export class ACIDStorageEngine {
 
         if (syncNeeded) {
             for (const dir of touchedDirs) {
-                try { this.fsyncDir(dir); } catch { /* approved: directory fsync best-effort */ }
+                try {
+                    this.fsyncDir(dir);
+                } catch (err) {
+                    if (forceFsync) throw err;
+                    /* approved: directory fsync best-effort in normal mode */
+                }
             }
         }
 
