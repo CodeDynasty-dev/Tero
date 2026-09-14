@@ -1762,12 +1762,19 @@ export class Tero {
     const entries = [...this.pendingLocalTombstoneRemovals.entries()];
     for (const [key, lsn] of entries) {
       await this.withReconciliationLock(key, async () => {
-        // If the key was re-deleted after the recreate that queued this
-        // removal, the local tombstone should stay — cancel the pending
-        // removal. (committed === null or undefined-with-local-tombstone
-        // both indicate the key is currently deleted.)
+        // Determine whether the key is actually DELETED. We must NOT treat
+        // `getCommittedData(key) === undefined` as "deleted": undefined means
+        // only "not in committedBuffer", which also describes a key that was
+        // flushed to a data file on disk (present). So check the data file
+        // on disk too. Key is deleted iff: a committed delete is still in the
+        // buffer (null), OR the buffer has no entry and no data file exists.
+        // If the key is deleted, the local tombstone should stay — cancel the
+        // pending removal. Otherwise it is present (buffer value or disk file)
+        // and the tombstone must be removed.
         const committed = this.acidEngine.getCommittedData(key);
-        if (committed === undefined || committed === null) {
+        const fileExists = existsSync(this.keyToPath(key));
+        const keyDeleted = committed === null || (committed === undefined && !fileExists);
+        if (keyDeleted) {
           this.pendingLocalTombstoneRemovals.delete(key);
           try { this.savePendingLocalTombstoneRemovals(); } catch { /* approved */ }
           return;
