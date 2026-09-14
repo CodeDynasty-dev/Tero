@@ -4,7 +4,6 @@ import { resolve as pathResolve, relative as pathRelative } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
-import { TieredStorageManager, TieredStorageConfig, TieredStorageStats } from "./tiered-storage.js";
 import QuickLRU from "quick-lru";
 
 /**
@@ -135,23 +134,22 @@ interface TeroConfig {
    * true in production; default false for backwards compatibility.
    */
   fileLock?: boolean;
-  /** Tiered storage: bucket is authoritative store, local disk is working set cache. */
-  tieredStorage?: TieredStorageConfig;
 }
+
+type HydrationMode = 'lazy' | 'eager';
 
 interface HydrateConfig {
   cloudStorage: CloudStorageConfig;
   /**
    * Hydration mode:
-   *   - 'gradual' | 'lazy' (default): downloads ZERO files on startup for instant boot.
+   *   - 'lazy' (default): downloads 0 files on startup for instant boot.
    *     Files are hydrated gradually on-demand as they are requested.
-   *   - 'eager': bulk downloads files during Tero.create() before engine init.
-   *   - 'all' | 'missing' | 'snapshot': legacy mode aliases.
+   *   - 'eager': bulk downloads missing files from the bucket before engine init.
    */
-  mode?: 'gradual' | 'lazy' | 'all' | 'missing' | 'snapshot' | 'eager';
-  /** Continue when a single file fails to download (default true). */
+  mode?: HydrationMode;
+  /** Continue when a single file fails to download in eager mode (default true). */
   continueOnError?: boolean;
-  /** Maximum time to wait for hydration before attempting engine init (ms). */
+  /** Maximum time to wait for hydration in eager mode before engine init (ms). */
   timeout?: number;
   /** Optional custom S3 client for mocking/testing */
   customS3Client?: any;
@@ -336,8 +334,10 @@ export class Tero {
   private acidEngine: ACIDStorageEngine;
   private backupManager?: BackupManager;
   private dataRecovery?: DataRecovery;
-  private tieredStorageManager?: TieredStorageManager;
-  private tieredStorageConfig?: TieredStorageConfig;
+  private hydrateMode: HydrationMode = 'lazy';
+  private inFlightHydrations = new Map<string, Promise<any | null>>();
+  private missingKeys: QuickLRU<string, boolean>;
+  private readonly MISSING_KEYS_MAX: number = 50000;
   private committedCount: number = 0;
   private rolledBackCount: number = 0;
 
@@ -407,6 +407,9 @@ export class Tero {
       // for an unbounded Set at 1M keys — addresses cloud-scale heap bloat).
       this.knownKeys = new QuickLRU<string, boolean>({ maxSize: this.KNOWN_KEYS_MAX });
 
+      // Initialize bounded LRU for missing-keys (negative cache to prevent S3 spamming)
+      this.missingKeys = new QuickLRU<string, boolean>({ maxSize: this.MISSING_KEYS_MAX });
+
       // Initialize ACID storage engine (primary system)
       const syncMode: SynchronousMode = synchronous ?? 'full';
       const syncInterval: number = commitIntervalMs ?? 10;
@@ -425,24 +428,17 @@ export class Tero {
         this.enableLiveBackup(config.liveBackup);
       }
 
-      // Tiered storage / gradual hydration: initialize manager if enabled or if hydrateOnStartup is configured
-      const tieredConfig = config?.tieredStorage ?? (config?.hydrateOnStartup ? {
-        enabled: true,
-        cloudStorage: config.hydrateOnStartup.cloudStorage,
-        autoHydrateOnRead: true,
-        customS3Client: (config.hydrateOnStartup as any).customS3Client,
-      } : undefined);
-
-      if (tieredConfig?.enabled) {
-        this.tieredStorageConfig = tieredConfig;
-        this.tieredStorageManager = new TieredStorageManager({
-          dbPath: this.teroDirectory,
-          config: tieredConfig,
-          acidEngine: this.acidEngine,
-          onEvictKey: (key: string) => {
-            this.cache.delete(key);
-            this.knownKeys.delete(key);
-          }
+      // Configure data recovery & gradual hydration if hydrateOnStartup is configured
+      if (config?.hydrateOnStartup) {
+        const isEager = config.hydrateOnStartup.mode === 'eager' ||
+          (config.hydrateOnStartup as any).mode === 'all' ||
+          (config.hydrateOnStartup as any).mode === 'missing';
+        this.hydrateMode = isEager ? 'eager' : 'lazy';
+        this.dataRecovery = new DataRecovery({
+          cloudStorage: config.hydrateOnStartup.cloudStorage,
+          localPath: this.teroDirectory,
+          continueOnError: config.hydrateOnStartup.continueOnError ?? true,
+          customS3Client: config.hydrateOnStartup.customS3Client,
         });
       }
     } catch (error) {
@@ -451,8 +447,10 @@ export class Tero {
   }
 
   /**
-   * v2 async factory. Instant startup: downloads NO files on startup.
-   * Hydration is gradual on-demand via tiered read-through as files are requested.
+   * v2 async factory.
+   * - mode: 'lazy' (default) -> Instant startup, downloads 0 files on boot.
+   *   Files hydrate gradually on-demand as they are requested.
+   * - mode: 'eager' -> Bulk downloads files from cloud bucket before engine init.
    */
   static async create(config?: TeroConfig): Promise<Tero> {
     const rawDirectory = config?.directory || 'TeroDB';
@@ -463,16 +461,19 @@ export class Tero {
 
     const hydrate = config?.hydrateOnStartup;
 
-    // Gradual hydration (instant startup, zero files downloaded) is the default:
-    // Files are hydrated lazily via read-through as they are requested.
-    // Only if the caller explicitly requests eager bulk pre-download ('eager')
-    // does it execute bulk recovery before returning.
-    if (hydrate && hydrate.mode === 'eager') {
+    // Eager mode: bulk pre-downloads missing files before boot
+    const isEager = hydrate && (
+      hydrate.mode === 'eager' ||
+      (hydrate as any).mode === 'all' ||
+      (hydrate as any).mode === 'missing'
+    );
+
+    if (isEager) {
       const recovery = new DataRecovery({
         cloudStorage: hydrate.cloudStorage,
         localPath: teroDirectory,
-        mode: 'missing',
         continueOnError: hydrate.continueOnError ?? true,
+        customS3Client: hydrate.customS3Client,
       });
 
       let hydrateCancelled = false;
@@ -484,6 +485,7 @@ export class Tero {
           // Hydration errors are non-fatal
         }
       };
+
       const timeoutMs = hydrate.timeout;
       if (typeof timeoutMs === 'number' && timeoutMs > 0) {
         await Promise.race([
@@ -498,43 +500,82 @@ export class Tero {
       }
     }
 
-    // Automatically configure tiered storage with the bucket credentials from hydrateOnStartup
-    // if not explicitly defined, ensuring gradual on-demand hydration on read.
-    const effectiveConfig: TeroConfig = {
-      ...config,
-      tieredStorage: config?.tieredStorage ?? (hydrate ? {
-        enabled: true,
-        cloudStorage: hydrate.cloudStorage,
-        autoHydrateOnRead: true,
-        customS3Client: (hydrate as any).customS3Client,
-      } : undefined)
-    };
-
-    const instance = new Tero(effectiveConfig);
-
-    if (hydrate) {
-      (instance as any).dataRecovery = new DataRecovery({
-        cloudStorage: hydrate.cloudStorage,
-        localPath: teroDirectory,
-        continueOnError: hydrate.continueOnError ?? true,
-      });
-    }
-
-    return instance;
+    // Default 'lazy' mode: ZERO downloads during create(). Startup is instant.
+    return new Tero(config);
   }
 
   /**
-   * v2: explicitly run hydration at any time (idempotent). Pulls missing/all files
-   * from the client's bucket according to the config passed. Requires either
-   * `configureDataRecovery(...)` to have been called, or `hydrateOnStartup` in
-   * the constructor config.
+   * Lazily fetches and caches a document from cloud storage on-demand.
+   * Pure, efficient design for large workloads at maximum scale:
+   * 1. Fast-path negative cache (bounded QuickLRU) prevents repetitive S3 roundtrips for missing keys.
+   * 2. Singleflight deduplication coalesces concurrent requests for the same key into a single S3 request.
+   * 3. Atomic temp-file persistence + direct in-memory cache update eliminates redundant disk reads.
    */
-  async hydrate(options?: { mode?: 'all' | 'missing' | 'snapshot'; timeout?: number }): Promise<RecoveryResult> {
+  private async hydrateKey(key: string): Promise<any | null> {
+    if (!this.dataRecovery || this.hydrateMode !== 'lazy') {
+      return null;
+    }
+
+    // Fast-path negative cache: avoid S3 API roundtrip for known missing keys
+    if (this.missingKeys.has(key)) {
+      return null;
+    }
+
+    // Singleflight: coalesce concurrent requests for the same key
+    const inFlight = this.inFlightHydrations.get(key);
+    if (inFlight) {
+      return await inFlight;
+    }
+
+    const fetchPromise = (async () => {
+      try {
+        const data = await this.dataRecovery!.fetchAndPersist(key);
+        if (data !== null && data !== undefined) {
+          this.knownKeys.set(key, true);
+          this.updateCache(key, data, undefined);
+          return data;
+        } else {
+          this.missingKeys.set(key, true);
+          return null;
+        }
+      } catch {
+        return null;
+      } finally {
+        this.inFlightHydrations.delete(key);
+      }
+    })();
+
+    this.inFlightHydrations.set(key, fetchPromise);
+    return await fetchPromise;
+  }
+
+  /**
+   * Run hydration at any time (idempotent).
+   * Strictly supports two modes:
+   * - 'lazy' (default): enables on-demand gradual hydration (downloads 0 files in bulk).
+   * - 'eager': bulk downloads all missing files from cloud before returning.
+   */
+  async hydrate(options?: { mode?: HydrationMode; timeout?: number }): Promise<RecoveryResult> {
     const recovery = this.dataRecovery;
     if (!recovery) {
       throw new Error('Data recovery not configured. Call configureDataRecovery() or pass hydrateOnStartup in config.');
     }
-    const mode = options?.mode ?? 'missing';
+    const requestedMode = options?.mode ?? this.hydrateMode;
+    const isEager = requestedMode === 'eager' ||
+      (requestedMode as any) === 'all' ||
+      (requestedMode as any) === 'missing';
+
+    if (!isEager) {
+      this.hydrateMode = 'lazy';
+      return {
+        success: true,
+        recovered: [],
+        failed: [],
+        totalFiles: 0,
+        duration: 0,
+      };
+    }
+    this.hydrateMode = 'eager';
     const timeoutMs = options?.timeout;
     let cancelled = false;
     let timeoutTimer: any;
@@ -544,20 +585,7 @@ export class Tero {
     }
     try {
       if (cancelled) throw new Error(`Hydrate timed out after ${timeoutMs}ms`);
-      if (mode === 'all') {
-        return await recovery.recoverIndividualFiles(undefined, () => cancelled);
-      } else if (mode === 'snapshot') {
-        try {
-          const r = await recovery.recoverFromArchive();
-          if (cancelled) throw new Error(`Hydrate timed out after ${timeoutMs}ms`);
-          return r;
-        } catch (e) {
-          if (cancelled) throw e;
-          return await recovery.recoverMissingFiles(() => cancelled);
-        }
-      } else {
-        return await recovery.recoverMissingFiles(() => cancelled);
-      }
+      return await recovery.recoverMissingFiles(() => cancelled);
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer);
     }
@@ -666,14 +694,11 @@ export class Tero {
       const cachedEntry = this.cache.get(key);
       let cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) ? cachedEntry.data : undefined;
 
-      // Tiered storage: if updating an evicted document, read-through to preserve existing fields in deepMerge
-      if (cachedData === undefined && this.tieredStorageManager &&
+      // Lazy hydration: if updating a cold document not on disk, hydrate beforeImage from cloud
+      if (cachedData === undefined && this.dataRecovery && this.hydrateMode === 'lazy' &&
           this.acidEngine.getCommittedData(key) === undefined &&
           !existsSync(this.keyToPath(key))) {
-        const cloudData = await this.tieredStorageManager.fetchFromCloud(key);
-        if (cloudData !== null && cloudData !== undefined) {
-          cachedData = cloudData;
-        }
+        cachedData = (await this.hydrateKey(key)) ?? undefined;
       }
 
       // Engine write — returns void (sync fast path) or Promise (contended lock)
@@ -687,6 +712,7 @@ export class Tero {
       // updates to the same key would lose earlier fields).
       const afterImage = this.acidEngine.getPendingAfterImage(txId, key);
       this.updateCache(key, afterImage !== undefined ? afterImage : data, txId);
+      this.missingKeys.delete(key);
     } catch (error) {
       throw new Error(`Write failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -717,9 +743,9 @@ export class Tero {
       const readResult = this.acidEngine.read(txId, key);
       let data = (readResult !== undefined && readResult instanceof Promise) ? await readResult : readResult;
 
-      // Tiered storage: read-through on cache/disk miss
-      if ((data === null || data === undefined) && this.tieredStorageManager) {
-        data = await this.tieredStorageManager.fetchFromCloud(key);
+      // Lazy hydration: stream on-demand if missing locally
+      if ((data === null || data === undefined) && this.dataRecovery && this.hydrateMode === 'lazy') {
+        data = await this.hydrateKey(key);
       }
 
       if (data !== null && data !== undefined) {
@@ -752,14 +778,8 @@ export class Tero {
           if (entry && (entry as any).transactionId === txId) {
             (entry as any).transactionId = undefined;
           }
-          if (this.tieredStorageManager) {
-            this.tieredStorageManager.markDirty(key);
-          }
         }
         this.txTouchedKeys.delete(txId);
-        if (this.tieredStorageManager && this.tieredStorageConfig?.writeThrough) {
-          await this.tieredStorageManager.syncToCloud();
-        }
       }
       this.committedCount++;
     } catch (error) {
@@ -833,13 +853,16 @@ export class Tero {
         this.knownKeys.set(key, true); // re-pin; existed all along
         await this.rollback(transactionId);
         return false;
-      } else if (this.tieredStorageManager) {
-        // In tiered storage, check if key exists in the cloud bucket before creating
-        const cloudData = await this.tieredStorageManager.fetchFromCloud(key);
-        if (cloudData !== null && cloudData !== undefined) {
-          this.knownKeys.set(key, true);
-          await this.rollback(transactionId);
-          return false;
+      } else if (this.dataRecovery && this.hydrateMode === 'lazy') {
+        if (!this.missingKeys.has(key)) {
+          const info = await this.dataRecovery.checkFileInCloud(key).catch(() => ({ exists: false }));
+          if (info.exists) {
+            this.knownKeys.set(key, true);
+            await this.rollback(transactionId);
+            return false;
+          } else {
+            this.missingKeys.set(key, true);
+          }
         }
       }
       // Also check pendingWrites of other active tx via reading within tx
@@ -849,6 +872,7 @@ export class Tero {
       await this.write(transactionId, key, initialData || {});
       await this.commit(transactionId);
       this.knownKeys.set(key, true);
+      this.missingKeys.delete(key);
 
       return true;
     } catch (error) {
@@ -906,12 +930,9 @@ export class Tero {
     // 3. Slow path: read directly from disk (partitioned path; atomic rename = consistent)
     const filePath = this.keyToPath(key);
     if (!existsSync(filePath)) {
-      if (this.tieredStorageManager) {
-        const cloudData = await this.tieredStorageManager.fetchFromCloud(key);
-        if (cloudData !== null && cloudData !== undefined) {
-          this.updateCache(key, cloudData, undefined);
-          return deepClone(cloudData);
-        }
+      const hydrated = await this.hydrateKey(key);
+      if (hydrated !== null && hydrated !== undefined) {
+        return deepClone(hydrated);
       }
       return null;
     }
@@ -919,9 +940,6 @@ export class Tero {
     try {
       const content = readFileSync(filePath, 'utf-8');
       const data = content.trim() ? JSON.parse(content) : {};
-      if (this.tieredStorageManager) {
-        this.tieredStorageManager.recordAccess(key);
-      }
       this.updateCache(key, data, undefined);
       return deepClone(data);
     } catch (error) {
@@ -949,12 +967,7 @@ export class Tero {
       await this._deleteRaw(transactionId, key);
       await this.commit(transactionId);
       this.knownKeys.delete(key);
-      if (this.tieredStorageManager) {
-        this.tieredStorageManager.markDeleted(key);
-        if (this.tieredStorageConfig?.writeThrough) {
-          await this.tieredStorageManager.syncToCloud();
-        }
-      }
+      this.missingKeys.set(key, true);
     } catch (error) {
       await this.rollback(transactionId);
       throw error;
@@ -992,7 +1005,10 @@ export class Tero {
       }
       await this.commit(transactionId);
       // Register all written keys in knownKeys so future exists() calls are O(1)
-      for (const op of operations) this.knownKeys.set(op.key, true);
+      for (const op of operations) {
+        this.knownKeys.set(op.key, true);
+        this.missingKeys.delete(op.key);
+      }
     } catch (error) {
       await this.rollback(transactionId);
       throw new Error(`Batch write failed: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
@@ -1105,6 +1121,7 @@ export class Tero {
     if (result !== undefined) await result;
     this.cache.delete(key);
     this.knownKeys.delete(key);
+    this.missingKeys.set(key, true);
   }
 
   async _rollbackRaw(transactionId: string): Promise<void> {
@@ -1587,9 +1604,6 @@ export class Tero {
 
   // Cleanup methods
   async destroyAsync(): Promise<void> {
-    if (this.tieredStorageManager) {
-      await this.tieredStorageManager.destroy();
-    }
     if (this.backupManager) {
       await this.backupManager.drainInFlight();
       this.backupManager.destroy();
@@ -1597,6 +1611,8 @@ export class Tero {
     if (this.acidEngine) {
       this.acidEngine.destroy();
     }
+    this.inFlightHydrations.clear();
+    this.missingKeys.clear();
     this.clearCache();
     this.releaseFileLock();
   }
@@ -1606,9 +1622,6 @@ export class Tero {
   }
 
   destroy(): void {
-    if (this.tieredStorageManager) {
-      this.tieredStorageManager.destroy().catch(() => {});
-    }
     // Sync destroy cannot drain inflight S3 uploads (that's async) — warn if live backup has in-flight work.
     // Prefer `await db.destroyAsync()` / `await db.close()` in production when live backup is enabled.
     if (this.backupManager) {
@@ -1621,27 +1634,10 @@ export class Tero {
     if (this.acidEngine) {
       this.acidEngine.destroy();
     }
+    this.inFlightHydrations.clear();
+    this.missingKeys.clear();
     this.clearCache();
     this.releaseFileLock();
-  }
-
-  // Tiered Storage API
-  getTieredStorageStats(): TieredStorageStats | undefined {
-    return this.tieredStorageManager?.getStats();
-  }
-
-  async syncToCloud(): Promise<{ uploaded: number; deleted: number }> {
-    if (!this.tieredStorageManager) {
-      throw new Error('Tiered storage not configured.');
-    }
-    return await this.tieredStorageManager.syncToCloud();
-  }
-
-  evictLocalColdFiles(): number {
-    if (!this.tieredStorageManager) {
-      throw new Error('Tiered storage not configured.');
-    }
-    return this.tieredStorageManager.evictColdFiles();
   }
 
   /**
@@ -1692,4 +1688,4 @@ export class Tero {
 }
 
 // Export types for external use
-export { BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger, TieredStorageConfig, TieredStorageStats, TieredStorageManager };
+export { BackupConfig, BackupMetadata, BucketBackupResult, CloudStorageConfig, RecoveryConfig, RecoveryResult, FileRecoveryInfo, HydrateConfig, HydrationMode, TeroConfig, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger };

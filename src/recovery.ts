@@ -1,5 +1,5 @@
 import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand } from "@aws-sdk/client-s3";
-import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync } from "fs";
+import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
 import { CloudStorageConfig } from "./backup.js";
@@ -10,9 +10,9 @@ export interface RecoveryConfig {
     localPath: string;
     autoRecover?: boolean; // Automatically recover missing files
     recoveryTimeout?: number; // Timeout for recovery operations (default: 30000ms)
-    mode?: 'all' | 'missing' | 'none'; // 'all' overwrites local; 'missing' only pulls absent files
     continueOnError?: boolean; // Keep going when a real (non-404) error occurs for one file
     concurrency?: number; // Parallel S3 GETs — default 10 for fast hydration (was sequential)
+    customS3Client?: any; // Optional custom S3 client for mocking/testing
 }
 
 export interface RecoveryResult {
@@ -42,6 +42,11 @@ export class DataRecovery {
 
     private initializeCloudStorage(): void {
         try {
+            if (this.config.customS3Client) {
+                this.s3Client = this.config.customS3Client;
+                return;
+            }
+
             const clientConfig: any = {
                 region: this.config.cloudStorage.region,
                 credentials: {
@@ -118,19 +123,15 @@ export class DataRecovery {
         }
     }
 
-    async recoverSingleFile(key: string): Promise<boolean> {
+    /**
+     * Efficiently fetches a single file from cloud storage, writes it atomically
+     * to the partitioned disk location, and returns the parsed JSON data directly
+     * from memory — avoiding redundant disk reads or extra syscalls.
+     */
+    async fetchAndPersist(key: string): Promise<any | null> {
         try {
             const cloudKey = this.getCloudKey(`${key}.json`);
-            // Write into the 2-level hash-partition location the engine reads from —
-            // NOT flat at the db root. The partition is deterministic from the key,
-            // so restored files are immediately visible to engine reads.
             const localFilePath = partitionedPath(this.config.localPath, key);
-
-            // Ensure local directory exists
-            const localDir = dirname(localFilePath);
-            if (!existsSync(localDir)) {
-                mkdirSync(localDir, { recursive: true });
-            }
 
             const getCommand = new GetObjectCommand({
                 Bucket: this.config.cloudStorage.bucket,
@@ -138,23 +139,49 @@ export class DataRecovery {
             });
 
             const response = await this.s3Client.send(getCommand);
-
             if (!response.Body) {
-                throw new Error('No data received from cloud storage');
+                return null;
             }
 
-            // Stream the file to local storage
-            const writeStream = createWriteStream(localFilePath);
-            await pipeline(response.Body as any, writeStream);
+            let content: string;
+            if (typeof (response.Body as any).transformToString === 'function') {
+                content = await (response.Body as any).transformToString('utf-8');
+            } else {
+                const chunks: Buffer[] = [];
+                for await (const chunk of response.Body as any) {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                }
+                content = Buffer.concat(chunks).toString('utf-8');
+            }
 
-            return true;
+            const localDir = dirname(localFilePath);
+            if (!existsSync(localDir)) {
+                mkdirSync(localDir, { recursive: true });
+            }
+
+            // Write atomically to avoid partial reads on crash
+            const tempFilePath = `${localFilePath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+            try {
+                writeFileSync(tempFilePath, content, 'utf-8');
+                renameSync(tempFilePath, localFilePath);
+            } catch (writeErr) {
+                try { if (existsSync(tempFilePath)) unlinkSync(tempFilePath); } catch { }
+                throw writeErr;
+            }
+
+            const trimmed = content.trim();
+            return trimmed ? JSON.parse(trimmed) : {};
         } catch (error: any) {
             if (this.isNotFound(error)) {
-                return false;
+                return null;
             }
-            // Re-surface real errors so callers don't mistake them for "not in cloud".
             throw new Error(`Failed to recover file from cloud: ${error?.message || 'Unknown error'}`);
         }
+    }
+
+    async recoverSingleFile(key: string): Promise<boolean> {
+        const data = await this.fetchAndPersist(key);
+        return data !== null;
     }
 
     async recoverFromArchive(archiveName?: string): Promise<RecoveryResult> {
@@ -437,8 +464,15 @@ export class DataRecovery {
                 mkdirSync(localDir, { recursive: true });
             }
 
-            const writeStream = createWriteStream(localPath);
-            await pipeline(response.Body as any, writeStream);
+            const tempPath = `${localPath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+            try {
+                const writeStream = createWriteStream(tempPath);
+                await pipeline(response.Body as any, writeStream);
+                renameSync(tempPath, localPath);
+            } catch (err) {
+                try { if (existsSync(tempPath)) unlinkSync(tempPath); } catch { }
+                throw err;
+            }
 
             return true;
         } catch (error: any) {
