@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync } from "fs";
-import { resolve as pathResolve, relative as pathRelative } from "path";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync } from "fs";
+import { resolve as pathResolve, relative as pathRelative, join as pathJoin } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo } from "./recovery.js";
@@ -359,6 +359,8 @@ export class Tero {
   private readonly MISSING_KEYS_MAX: number = 50000;
   private committedCount: number = 0;
   private rolledBackCount: number = 0;
+  /** Monotonic per-key generation for in-flight hydration invalidation (P0-1). */
+  private keyGenerations = new Map<string, number>();
 
   /**
    * Bounded LRU of known-existing keys. Replaces the unbounded Set<string>
@@ -434,6 +436,25 @@ export class Tero {
       const syncInterval: number = commitIntervalMs ?? 10;
       const dataFlushInterval: number = dataFlushIntervalMs ?? 50;
       this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval, config?.checkpointBatchSize);
+
+      // Restore durable local tombstones (P0-2) — prevents resurrection after restart even if cloud tombstone not yet durable
+      try {
+        const tombDir = pathJoin(this.teroDirectory, '.tombstones');
+        if (existsSync(tombDir)) {
+          const files = readdirSync(tombDir);
+          for (const f of files) {
+            if (!f.endsWith('.deleted')) continue;
+            try {
+              const content = readFileSync(pathJoin(tombDir, f), 'utf8');
+              const obj = JSON.parse(content);
+              if (obj.key && typeof obj.key === 'string') {
+                this.missingKeys.set(obj.key, true);
+                this.bumpGeneration(obj.key);
+              }
+            } catch {}
+          }
+        }
+      } catch {}
 
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
@@ -531,6 +552,9 @@ export class Tero {
    * 1. Fast-path negative cache (bounded QuickLRU) prevents repetitive S3 roundtrips for missing keys.
    * 2. Singleflight deduplication coalesces concurrent requests for the same key into a single S3 request.
    * 3. Atomic temp-file persistence + direct in-memory cache update eliminates redundant disk reads.
+   * 4. Generation-aware invalidation prevents resurrection: a delete/write that
+   *    commits while hydration is in-flight bumps the per-key generation; stale
+   *    hydration results are discarded and any just-written file is removed.
    */
   private async hydrateKey(key: string): Promise<any | null> {
     if (!this.dataRecovery || this.hydrateMode !== 'lazy') {
@@ -548,10 +572,82 @@ export class Tero {
       return await inFlight;
     }
 
+    const startGen = this.getGeneration(key);
     const fetchPromise = (async () => {
       try {
+        // Local durable tombstone check (P0-2 cross-restart) — must not resurrect
+        if (this.hasLocalTombstone(key)) {
+          this.missingKeys.set(key, true);
+          return null;
+        }
+        // Check cloud tombstone before fetching — deleted keys must not be resurrected
+        try {
+          const hasTomb = await (this.dataRecovery as any).hasTombstone?.(key);
+          if (hasTomb) {
+            this.missingKeys.set(key, true);
+            return null;
+          }
+        } catch {
+          // tombstone check best-effort; fall through to normal fetch
+        }
+        // If local committed state already has a value/tombstone newer than hydration start, don't fetch
+        const committedBefore = this.acidEngine.getCommittedData(key);
+        if (committedBefore !== undefined) {
+          if (committedBefore === null) {
+            this.missingKeys.set(key, true);
+            return null;
+          }
+          // local has newer committed data — stale hydration would be older
+          if (this.getGeneration(key) !== startGen) return null;
+        }
+        if (existsSync(this.keyToPath(key)) && this.getGeneration(key) !== startGen) {
+          return null;
+        }
+
         const data = await this.dataRecovery!.fetchAndPersist(key);
+
+        // Generation check — if delete/write committed while fetch was in-flight, discard stale result
+        if (this.getGeneration(key) !== startGen) {
+          if (data !== null && data !== undefined) {
+            try {
+              const p = this.keyToPath(key);
+              if (existsSync(p)) unlinkSync(p);
+            } catch {}
+            this.cache.delete(key);
+          }
+          return null;
+        }
+
+        // Post-fetch local tombstone check (delete committed after our pre-check or durable local tombstone)
+        if (this.hasLocalTombstone(key)) {
+          if (data !== null && data !== undefined) {
+            try { unlinkSync(this.keyToPath(key)); } catch {}
+            this.cache.delete(key);
+          }
+          this.missingKeys.set(key, true);
+          return null;
+        }
+        const committedAfter = this.acidEngine.getCommittedData(key);
+        if (committedAfter !== undefined && committedAfter === null) {
+          if (data !== null && data !== undefined) {
+            try { unlinkSync(this.keyToPath(key)); } catch {}
+            this.cache.delete(key);
+          }
+          this.missingKeys.set(key, true);
+          return null;
+        }
+
         if (data !== null && data !== undefined) {
+          // Re-check tombstone after fetch — cloud delete could have happened concurrently
+          try {
+            const hasTombAfter = await (this.dataRecovery as any).hasTombstone?.(key);
+            if (hasTombAfter) {
+              try { unlinkSync(this.keyToPath(key)); } catch {}
+              this.cache.delete(key);
+              this.missingKeys.set(key, true);
+              return null;
+            }
+          } catch {}
           this.knownKeys.set(key, true);
           this.updateCache(key, data, undefined);
           return data;
@@ -643,6 +739,16 @@ export class Tero {
     if (key === '.' || key === '..' || key.includes('/') || key.includes('\\') || key.includes('\0') || key.startsWith('.')) {
       throw new Error('Key contains invalid characters');
     }
+  }
+
+  private bumpGeneration(key: string): number {
+    const next = (this.keyGenerations.get(key) ?? 0) + 1;
+    this.keyGenerations.set(key, next);
+    return next;
+  }
+
+  private getGeneration(key: string): number {
+    return this.keyGenerations.get(key) ?? 0;
   }
 
   /**
@@ -800,6 +906,37 @@ export class Tero {
           if (entry && (entry as any).transactionId === txId) {
             (entry as any).transactionId = undefined;
           }
+          // Bump generation for P0-1 in-flight hydration invalidation and P0-10 stale hydration
+          this.bumpGeneration(key);
+        }
+        // Handle durable tombstones for deletes/writes (P0-2)
+        for (const key of touched) {
+          const committed = this.acidEngine.getCommittedData(key);
+          if (committed !== undefined) {
+            if (committed !== null) {
+              // Write/present — clear tombstones so re-create can succeed and hydration can fetch
+              this.deleteLocalTombstone(key);
+              if (this.dataRecovery) {
+                try { await (this.dataRecovery as any).deleteTombstone?.(key); } catch {}
+              }
+            } else {
+              // Delete — ensure tombstones for resurrection protection
+              this.writeLocalTombstone(key);
+              if (this.dataRecovery && this.hydrateMode === 'lazy') {
+                try { await this.dataRecovery.deleteFromCloud(key); } catch {}
+                try { await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine.getLastCommittedLSN()); } catch {}
+              }
+            }
+          } else {
+            // Fallback: if no committed entry but key was in touched (e.g., already flushed),
+            // check local file existence to infer delete vs write
+            if (!existsSync(this.keyToPath(key))) {
+              // likely deleted — ensure tombstone
+              this.writeLocalTombstone(key);
+            } else {
+              this.deleteLocalTombstone(key);
+            }
+          }
         }
         this.txTouchedKeys.delete(txId);
       }
@@ -877,7 +1014,7 @@ export class Tero {
         return false;
       } else if (this.dataRecovery && this.hydrateMode === 'lazy') {
         if (!this.missingKeys.has(key)) {
-          const info = await this.dataRecovery.checkFileInCloud(key).catch(() => ({ exists: false }));
+          const info = await this.dataRecovery.checkFileInCloud(key);
           if (info.exists) {
             this.knownKeys.set(key, true);
             await this.rollback(transactionId);
@@ -982,6 +1119,46 @@ export class Tero {
     return partitionedPath(this.teroDirectory, key);
   }
 
+  private localTombstonePath(key: string): string {
+    const safe = key.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 200);
+    return pathJoin(this.teroDirectory, '.tombstones', `${safe}.deleted`);
+  }
+
+  private writeLocalTombstone(key: string): void {
+    try {
+      const dir = pathJoin(this.teroDirectory, '.tombstones');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const p = this.localTombstonePath(key);
+      // Store LSN for version ordering
+      const lsn = this.acidEngine?.getLastCommittedLSN?.() ?? Date.now();
+      writeFileSync(p, JSON.stringify({ key, lsn, deletedAt: Date.now() }));
+      try {
+        const fd = openSync(p, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        const dirFd = openSync(dir, 'r');
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      } catch {}
+    } catch {}
+  }
+
+  private hasLocalTombstone(key: string): boolean {
+    try {
+      const p = this.localTombstonePath(key);
+      if (!existsSync(p)) return false;
+      // Tombstone is durable until explicitly cleared on re-create
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private deleteLocalTombstone(key: string): void {
+    try {
+      const p = this.localTombstonePath(key);
+      if (existsSync(p)) unlinkSync(p);
+    } catch {}
+  }
+
   async remove(key: string): Promise<void> {
     const transactionId = this._beginTransaction();
 
@@ -990,11 +1167,19 @@ export class Tero {
       await this.commit(transactionId);
       this.knownKeys.delete(key);
       this.missingKeys.set(key, true);
+      // Durable local tombstone prevents in-flight hydration resurrection (P0-1) and cross-restart resurrection (P0-2)
+      this.writeLocalTombstone(key);
 
       if (this.dataRecovery && this.hydrateMode === 'lazy') {
+        const lsn = this.acidEngine.getLastCommittedLSN();
+        // Best-effort cloud delete; failure leaves local tombstone as fallback
         try {
           await this.dataRecovery.deleteFromCloud(key);
-        } catch { }
+        } catch {}
+        // Durable cloud tombstone — even if delete failed, tombstone prevents resurrection on other nodes
+        try {
+          await this.dataRecovery.putTombstone(key, lsn);
+        } catch {}
       }
     } catch (error) {
       await this.rollback(transactionId);
@@ -1147,6 +1332,13 @@ export class Tero {
   async _deleteRaw(transactionId: string, key: string): Promise<void> {
     const result = this.acidEngine.delete(transactionId, key);
     if (result !== undefined) await result;
+    // Track for commit-time generation bump and cache cleanup
+    let touched = this.txTouchedKeys.get(transactionId);
+    if (!touched) {
+      touched = new Set();
+      this.txTouchedKeys.set(transactionId, touched);
+    }
+    touched.add(key);
     this.cache.delete(key);
     this.knownKeys.delete(key);
     this.missingKeys.set(key, true);

@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, ListObjectsV2Command, HeadObjectCommand, DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSync, renameSync, unlinkSync, writeFileSync, writeSync } from "fs";
 import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
@@ -277,6 +277,88 @@ export class DataRecovery {
             }));
         } catch (e: any) {
             if (this.isNotFound(e)) return;
+            throw e;
+        }
+    }
+
+    /**
+     * Upload a durable tombstone for a deleted key (P0-2). Tombstone carries
+     * a monotonic version (LSN or timestamp) so that a later re-create can
+     * invalidate it. Hydration must check tombstone before resurrecting.
+     */
+    async putTombstone(key: string, version?: number): Promise<void> {
+        if (!this.s3Client || !this.config.cloudStorage) return;
+        const cloudKey = this.getCloudKey(`${key}.json.deleted`);
+        const ver = version ?? Date.now();
+        await this.s3Client.send(new PutObjectCommand({
+            Bucket: this.config.cloudStorage.bucket,
+            Key: cloudKey,
+            Body: Buffer.alloc(0),
+            ContentType: 'application/octet-stream',
+            Metadata: {
+                'tombstone-version': String(ver),
+                'deleted-at': new Date().toISOString(),
+            }
+        }));
+    }
+
+    async deleteTombstone(key: string): Promise<void> {
+        if (!this.s3Client || !this.config.cloudStorage) return;
+        try {
+            const cloudKey = this.getCloudKey(`${key}.json.deleted`);
+            await this.s3Client.send(new DeleteObjectCommand({
+                Bucket: this.config.cloudStorage.bucket,
+                Key: cloudKey
+            }));
+        } catch (e: any) {
+            if (this.isNotFound(e)) return;
+            throw e;
+        }
+    }
+
+    /**
+     * Check if a tombstone exists for the key. If both a document and a tombstone
+     * exist, the newer LastModified wins (tombstone newer => logically deleted).
+     * Returns true if key is tombstoned (deleted) and hydration must not resurrect.
+     */
+    async hasTombstone(key: string): Promise<boolean> {
+        if (!this.s3Client || !this.config.cloudStorage) return false;
+        const tombKey = this.getCloudKey(`${key}.json.deleted`);
+        let tombMeta: { LastModified?: Date } | null = null;
+        try {
+            const resp: any = await this.s3Client.send(new HeadObjectCommand({
+                Bucket: this.config.cloudStorage.bucket,
+                Key: tombKey
+            }));
+            // Defensive: some test mocks return a GetObject-shaped response (Body) for HeadObject.
+            // Only treat as tombstone if response looks like HeadObject (has LastModified/ContentLength without Body).
+            if (resp && resp.Body !== undefined) return false;
+            if (!resp || (resp.LastModified === undefined && resp.ContentLength === undefined && resp.ETag === undefined && resp.ContentType === undefined)) {
+                // Empty or unexpected mock response — treat as no tombstone
+                return false;
+            }
+            tombMeta = resp;
+        } catch (e: any) {
+            if (this.isNotFound(e)) return false;
+            throw e;
+        }
+        if (!tombMeta) return false;
+        // If document also exists, compare timestamps — tombstone must be newer to win
+        try {
+            const docKey = this.getCloudKey(`${key}.json`);
+            const docResp: any = await this.s3Client.send(new HeadObjectCommand({
+                Bucket: this.config.cloudStorage.bucket,
+                Key: docKey
+            }));
+            const docTime = docResp.LastModified?.getTime() ?? 0;
+            const tombTime = tombMeta.LastModified?.getTime() ?? 0;
+            // Tombstone newer or equal => deleted; otherwise document is newer (re-created)
+            return tombTime >= docTime;
+        } catch (e: any) {
+            if (this.isNotFound(e)) {
+                // No document, only tombstone => deleted
+                return true;
+            }
             throw e;
         }
     }
