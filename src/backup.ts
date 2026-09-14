@@ -939,13 +939,13 @@ export class BackupManager {
           snapshotEntries.push(entry);
         });
         const presentEntries = snapshotEntries.filter(e => e.state === 'present' && e.data !== undefined);
-        const snapshotData: Array<{ name: string; buf: Buffer; sha256: string; size: number }> = [];
+        const snapshotData: Array<{ name: string; buf: Buffer; sha256: string; size: number; lsn: number }> = [];
         _snapshotManifestEntries = [];
         for (const e of presentEntries) {
           const name = `${e.key}.json`;
           const buf = Buffer.from(JSON.stringify(e.data));
           const sha256 = createHash('sha256').update(buf).digest('hex');
-          snapshotData.push({ name, buf, sha256, size: buf.length });
+          snapshotData.push({ name, buf, sha256, size: buf.length, lsn: e.lsn });
           _snapshotManifestEntries.push({ name, size: buf.length, state: 'present', sha256 });
         }
         for (const e of snapshotEntries.filter(en => en.state === 'deleted')) {
@@ -963,7 +963,7 @@ export class BackupManager {
               if (remote.eTag === md5) return;
             }
             // P2: size/mtime is not content equality — always verify via hash (ETag above); no size/mtime shortcut
-            await this.uploadBytes(cloudKey, file.buf, 'application/json');
+            await this.uploadBytes(cloudKey, file.buf, 'application/json', { 'version-lsn': String(file.lsn) });
             uploadedDataFiles++;
           } catch (error) {
             errors.push(`data:${file.name}:${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -1170,11 +1170,11 @@ export class BackupManager {
     return `${base}/${this.getDbName()}/nodes/${nodeId}/`;
   }
 
-  private async uploadBytes(key: string, body: Buffer, contentType = 'application/octet-stream'): Promise<void> {
+  private async uploadBytes(key: string, body: Buffer, contentType = 'application/octet-stream', extraMetadata?: Record<string, string>): Promise<void> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
     await this.s3Client.send(new PutObjectCommand({
       Bucket: this.config.cloudStorage.bucket, Key: key, Body: body, ContentType: contentType,
-      Metadata: { 'backup-timestamp': new Date().toISOString(), 'source-db': this.getDbName() },
+      Metadata: { 'backup-timestamp': new Date().toISOString(), 'source-db': this.getDbName(), ...(extraMetadata || {}) },
     }));
   }
 
@@ -1354,7 +1354,7 @@ export class BackupManager {
         const filePath = partitionedPath(this.dbPath, entry.key);
         const rel = posixRel(filePath);
         if (entry.state === 'deleted') {
-          await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
+          await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream', { 'tombstone-version': String(entry.lsn) });
           tombstoned++;
           manifestDataItems.push({
             path: rel,
@@ -1365,7 +1365,7 @@ export class BackupManager {
           });
         } else if (entry.state === 'present' && entry.data !== undefined) {
           const buf = Buffer.from(JSON.stringify(entry.data));
-          await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json');
+          await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json', { 'version-lsn': String(entry.lsn) });
           count++;
           manifestDataItems.push({
             path: rel,
@@ -1428,7 +1428,7 @@ export class BackupManager {
       const rel = posixRel(filePath);
       if (entry.state === 'present' && entry.data !== undefined) {
         const buf = Buffer.from(JSON.stringify(entry.data));
-        await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json');
+        await this.uploadBytes(`${dataPrefix}${rel}`, buf, 'application/json', { 'version-lsn': String(entry.lsn) });
         uploaded++;
         ackList.push({ key: entry.key, lsn: entry.lsn });
         try { await this.deleteObject(`${dataPrefix}${rel}.deleted`); } catch { /* approved: remote tombstone may not exist */ }
@@ -1440,7 +1440,7 @@ export class BackupManager {
           state: 'present'
         });
       } else {
-        await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream');
+        await this.uploadBytes(`${dataPrefix}${rel}.deleted`, Buffer.alloc(0), 'application/octet-stream', { 'tombstone-version': String(entry.lsn) });
         tombstoned++;
         ackList.push({ key: entry.key, lsn: entry.lsn });
         manifestDataItems.push({

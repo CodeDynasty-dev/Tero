@@ -343,16 +343,23 @@ export class DataRecovery {
             throw e;
         }
         if (!tombMeta) return false;
-        // If document also exists, compare timestamps — tombstone must be newer to win
+        // Prefer version-lsn metadata (authoritative LSN ordering) over wall-clock LastModified
+        const tombVerStr = (tombMeta as any).Metadata?.['tombstone-version'] ?? (tombMeta as any).Metadata?.['version-lsn'] ?? (tombMeta as any).Metadata?.['tombstone_version'];
+        const tombVer = tombVerStr !== undefined ? parseInt(String(tombVerStr), 10) : NaN;
         try {
             const docKey = this.getCloudKey(`${key}.json`);
             const docResp: any = await this.s3Client.send(new HeadObjectCommand({
                 Bucket: this.config.cloudStorage.bucket,
                 Key: docKey
             }));
+            const docVerStr = (docResp as any).Metadata?.['version-lsn'] ?? (docResp as any).Metadata?.['tombstone-version'] ?? (docResp as any).Metadata?.['version_lsn'];
+            const docVer = docVerStr !== undefined ? parseInt(String(docVerStr), 10) : NaN;
+            if (!isNaN(tombVer) && !isNaN(docVer)) {
+                return tombVer >= docVer;
+            }
             const docTime = docResp.LastModified?.getTime() ?? 0;
-            const tombTime = tombMeta.LastModified?.getTime() ?? 0;
-            // Tombstone newer or equal => deleted; otherwise document is newer (re-created)
+            const tombTime = (tombMeta as any).LastModified?.getTime() ?? 0;
+            // If tombstone has version but doc doesn't, prefer tombstone if its version is recent, but fall back to timestamp
             return tombTime >= docTime;
         } catch (e: any) {
             if (this.isNotFound(e)) {
