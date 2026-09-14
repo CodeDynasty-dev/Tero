@@ -1360,20 +1360,19 @@ export class Tero {
   private deleteLocalTombstone(key: string): void {
     const p = this.localTombstonePath(key);
     if (!existsSync(p)) return;
+
+    unlinkSync(p);
+
+    const dir = pathJoin(this.teroDirectory, '.tombstones');
+    const dirFd = openSync(dir, 'r');
     try {
-      unlinkSync(p);
-      // Durably persist directory removal
-      try {
-        const dir = pathJoin(this.teroDirectory, '.tombstones');
-        const dirFd = openSync(dir, 'r');
-        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-      } catch { /* approved: dir fsync best-effort */ }
-    } catch (err: any) {
-      // Re-create can succeed while old local tombstone remains → restart would incorrectly hide document
-      // Do not swallow silently; keep file for retry and warn
-      if (existsSync(p)) {
-        console.warn(`[Tero] failed to delete local tombstone for '${key}': ${err?.message || err}`);
-      }
+        fsyncSync(dirFd);
+    } finally {
+        closeSync(dirFd);
+    }
+
+    if (existsSync(p)) {
+        throw new Error(`Failed to durably remove local tombstone for '${key}'`);
     }
   }
 
