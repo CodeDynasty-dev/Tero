@@ -1260,6 +1260,15 @@ export class BackupManager {
     this.lastCheckpointError = undefined;
     this.liveShipper = new WalShipper({ wal: engine.getWAL(), upload: (k, b) => this.uploadBytes(k, b, 'application/gzip'), prefix, intervalMs });
     this.liveShipper.start();
+    // Rotation must never delete a segment the shipper has not uploaded yet.
+    // A 1MB WAL fills in well under a second under load, so the fixed keep count
+    // alone could unlink segments before the next 1s tick ever read them — a
+    // transient S3 error would then truncate the continuous LSN chain in the
+    // bucket permanently. The protector defers pruning of unshipped segments
+    // (bounded by the WAL's protect byte budget, so an outage cannot fill disk).
+    engine.getWAL().setArchiveProtector(
+      (segmentEndLsn) => segmentEndLsn > (this.liveShipper?.getShippedLsn() ?? Number.POSITIVE_INFINITY),
+    );
     this.log.info(`🚀 Tero live backup enabled: nodeId=${nodeId} intervalMs=${intervalMs} RPO≤1s`);
     // CRITICAL: take the initial FULL checkpoint automatically. Without it, every
     // document written BEFORE enableLiveBackup() is unrestorable until the first
@@ -1288,6 +1297,10 @@ export class BackupManager {
   disableLiveBackup(): void {
     if (!this.liveShipper) return;
     this.liveShipper.stop(); this.liveShipper = undefined;
+    // Detach the protector: with no shipper there is no bucket to protect WAL
+    // for, so retention must return to the plain keep-count behaviour — else
+    // "disabled" would silently mean "never prune".
+    this.liveEngine?.getWAL().setArchiveProtector(null);
     this.log.info('🛑 Tero live backup disabled');
   }
 
@@ -1820,6 +1833,15 @@ class WalShipper {
   constructor(private deps: WalShipperDeps) {
     this.intervalMs = deps.intervalMs;
     this.status = { state: 'stopped', lastShippedLsn: 0, lastShipAt: 0, segmentsShipped: 0, totalBytesShipped: 0, errorCount: 0 };
+  }
+
+  /**
+   * Highest LSN whose entries are durably in the bucket. -1 while nothing has
+   * been shipped (including "not started yet") so the WAL archive protector
+   * keeps every segment on disk until the first successful upload.
+   */
+  getShippedLsn(): number {
+    return this.initialized ? this.lastLsn : -1;
   }
 
   start(): void {

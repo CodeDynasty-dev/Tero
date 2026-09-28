@@ -228,11 +228,25 @@ const db = new Tero({
   directory: './data',       // default: 'TeroDB'
   cacheSize: 1000,          // default: 100, configurable LRU capacity
   synchronous: 'full',      // 'full' (default, fsync per commit), 'normal' (coalesced timer), or 'off'
+  checkpointBatchSize: 5000,// default: 1000, committedBuffer entries flushed per tick
+  archiveKeepCount: 50,     // default: 20, rotated 1MB WAL segments kept locally
   fileLock: true,           // default: true, cross-process .lock directory guard
   backup: { ... },          // optional: install a BackupConfig at construction
   hydrateOnStartup: { ... },// optional: v2 hydration before engine init
 });
 ```
+
+### WAL retention and live backup
+
+Every commit is appended to a WAL that rotates into immutable 1MB segments
+(`.wal.seg-<start>-<end>`); those segments are what a point-in-time restore
+replays, so `archiveKeepCount` is a recovery window, not a cache.
+
+With `liveBackup` enabled the keep count is only a floor: a segment whose
+entries have not been durably uploaded yet is **never** pruned, so a bucket
+outage cannot turn a rotation into data loss. That deferral is bounded by a
+per-WAL byte budget (64MB by default) — past it, retention falls back to
+prune-oldest and logs a warning, because filling the disk would be worse.
 
 ## Testing
 

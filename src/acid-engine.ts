@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, openSync, closeSync, fsyncSync, renameSync, rmSync } from "fs";
+import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, lstatSync, openSync, closeSync, fsyncSync, renameSync, rmSync, type Dirent } from "fs";
 import { join, dirname } from "path";
 import { randomBytes } from "crypto";
 import { StringDecoder } from "string_decoder";
@@ -202,12 +202,60 @@ export function streamLogFile(filePath: string, visitor: (entry: LogEntry) => vo
     return { firstLsn, lastLsn: lastLsn === -1 ? null : lastLsn, count };
 }
 
+/**
+ * Rotated WAL segments a database keeps locally by default.
+ *
+ * The old value (3) was a 3MB cache, not a retention window: a 1MB WAL can
+ * rotate several times per second under load, so three segments could be
+ * unlinked inside the live shipper's 1s tick — the exact window in which their
+ * entries would have been uploaded. 20 segments (= 20MB at the 1MB segment
+ * size) gives the shipper ~20 rotations of slack. `setArchiveProtector` is what
+ * actually guarantees an unshipped segment survives, this is just the floor for
+ * databases without live backup.
+ */
+export const DEFAULT_ARCHIVE_KEEP_COUNT = 20;
+
+/**
+ * Hard ceiling on the archives retained *only* because they have not been
+ * shipped yet (on top of the keep count). This is the disk-safety valve: a
+ * bucket that is unreachable for hours must not let the local WAL grow without
+ * bound. Segments past this budget are pruned oldest-first and a warning is
+ * emitted, because that is the one path where unshipped WAL is discarded.
+ */
+export const DEFAULT_ARCHIVE_PROTECT_MAX_BYTES = 64 * 1024 * 1024; // 64MB
+
+export interface WriteAheadLogOptions {
+    /** Rotated segments retained locally. Default: DEFAULT_ARCHIVE_KEEP_COUNT. */
+    archiveKeepCount?: number;
+    /** Byte budget for not-yet-shipped segments. Default: DEFAULT_ARCHIVE_PROTECT_MAX_BYTES. */
+    archiveProtectMaxBytes?: number;
+}
+
+/**
+ * Warn at most once a minute when the disk-safety valve has to discard
+ * unshipped WAL — recurring but harmless to rate limit, and noisy enough that
+ * it must not spam every rotation.
+ */
+const ARCHIVE_OVERFLOW_WARN_INTERVAL_MS = 60_000;
+
 // Write-Ahead Log (WAL) implementation
 export class WriteAheadLog {
     private logPath: string;
     private currentLSN: number = 0;
     private readonly LOG_FILE_SIZE_LIMIT = 1 * 1024 * 1024; // 1MB
-    private readonly ARCHIVE_KEEP_COUNT = 3;
+    /** Retained rotated segments — see DEFAULT_ARCHIVE_KEEP_COUNT. */
+    private archiveKeepCount: number;
+    /** Disk-safety valve — see DEFAULT_ARCHIVE_PROTECT_MAX_BYTES. */
+    private archiveProtectMaxBytes: number;
+    /**
+     * Owner-supplied predicate answering "has this segment's last LSN NOT been
+     * durably shipped yet?". Live backup installs one so rotation can never
+     * unlink a segment before its entries reached the bucket. Absent for
+     * local-only databases, where pruning is unconditional.
+     */
+    private archiveProtector?: (segmentEndLsn: number) => boolean;
+    /** Rate limit for the disk-safety-valve warning (see the constant). */
+    private lastProtectOverflowWarnAt = 0;
     private synchronous: SynchronousMode;
     private commitIntervalMs: number;
     private dirty: boolean = false;
@@ -224,10 +272,18 @@ export class WriteAheadLog {
     private writeBufferSize: number = 0;
     private readonly FLUSH_THRESHOLD = 4 * 1024 * 1024; // 4MB — auto-flush if buffer exceeds
 
-    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10) {
+    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, options: WriteAheadLogOptions = {}) {
         this.logPath = join(dbPath, '.wal');
         this.synchronous = synchronous;
         this.commitIntervalMs = commitIntervalMs;
+        const keepCount = options.archiveKeepCount;
+        this.archiveKeepCount = typeof keepCount === 'number' && Number.isFinite(keepCount) && keepCount >= 1
+            ? Math.floor(keepCount)
+            : DEFAULT_ARCHIVE_KEEP_COUNT;
+        const protectBytes = options.archiveProtectMaxBytes;
+        this.archiveProtectMaxBytes = typeof protectBytes === 'number' && Number.isFinite(protectBytes) && protectBytes >= 0
+            ? Math.floor(protectBytes)
+            : DEFAULT_ARCHIVE_PROTECT_MAX_BYTES;
         this.initializeWAL();
         if (synchronous === 'normal') {
             this.startGroupCommitTimer();
@@ -471,7 +527,8 @@ export class WriteAheadLog {
      * 3. Fsync archive and parent directory.
      * 4. Create fresh empty WAL and fsync it and parent directory.
      * 5. Emit a CHECKPOINT entry at the head of the new log.
-     * 6. Clean up old archives beyond ARCHIVE_KEEP_COUNT.
+     * 6. Clean up old archives beyond the keep count, sparing any segment the
+     *    archive protector reports as not-yet-shipped (see cleanupOldArchives).
      */
     rotateLog(): string | null {
         this.forceFlush();
@@ -507,10 +564,33 @@ export class WriteAheadLog {
         // 3. Emit a CHECKPOINT entry at the head of the new log
         this.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM' });
 
-        // 4. Prune old archives
-        this.cleanupOldArchives(this.ARCHIVE_KEEP_COUNT);
+        // 4. Prune old archives (never one that has not been shipped yet)
+        this.cleanupOldArchives();
 
         return archivePath;
+    }
+
+    /**
+     * Every structurally valid rotated segment on disk, oldest first.
+     *
+     * Strictly matches deterministic segments `.wal.seg-<start>-<end>`; a partial
+     * or foreign file in the directory is ignored rather than guessed at. The end
+     * LSN is what retention decisions are made on (see cleanupOldArchives).
+     */
+    private listSegments(): Array<{ path: string; startLsn: number; endLsn: number }> {
+        const dir = dirname(this.logPath);
+        if (!existsSync(dir)) return [];
+        const files = readdirSync(dir);
+        return files
+            .filter(f => f.startsWith('.wal.seg-'))
+            .map(f => {
+                const m = f.match(/^\.wal\.seg-(\d+)-(\d+)$/);
+                return m
+                    ? { path: join(dir, f), startLsn: parseInt(m[1], 10), endLsn: parseInt(m[2], 10) }
+                    : null;
+            })
+            .filter((s): s is { path: string; startLsn: number; endLsn: number } => s !== null)
+            .sort((a, b) => a.startLsn - b.startLsn); // oldest first
     }
 
     /**
@@ -519,38 +599,81 @@ export class WriteAheadLog {
      * Strictly matches deterministic structured segments .wal.seg-<start>-<end>.
      */
     listArchives(): string[] {
-        const dir = dirname(this.logPath);
-        if (!existsSync(dir)) return [];
-        const files = readdirSync(dir);
-        return files
-            .filter(f => f.startsWith('.wal.seg-'))
-            .map(f => {
-                const m = f.match(/^\.wal\.seg-(\d+)-(\d+)$/);
-                return m ? { path: join(dir, f), startLsn: parseInt(m[1], 10) } : null;
-            })
-            .filter((s): s is { path: string; startLsn: number } => s !== null)
+        return this.listSegments()
             .sort((a, b) => b.startLsn - a.startLsn)
             .map(s => s.path);
     }
 
-    private cleanupOldArchives(keepCount: number): void {
-        const dir = dirname(this.logPath);
-        if (!existsSync(dir)) return;
-        const files = readdirSync(dir);
-        const archiveFiles = files
-            .filter(f => f.startsWith('.wal.seg-'))
-            .map(f => {
-                const m = f.match(/^\.wal\.seg-(\d+)-(\d+)$/);
-                return m ? { path: join(dir, f), startLsn: parseInt(m[1], 10) } : null;
-            })
-            .filter((s): s is { path: string; startLsn: number } => s !== null)
-            .sort((a, b) => a.startLsn - b.startLsn); // oldest first
+    /**
+     * Declare a segment as "must not be pruned" — used by live backup so a
+     * rotation can never unlink WAL that has not reached the bucket yet.
+     *
+     * The predicate receives a segment's last LSN and returns true while that
+     * LSN is still unshipped. Protection is best-effort by design: it is capped
+     * by the protect byte budget so an unreachable bucket degrades into the old
+     * prune-oldest behaviour instead of filling the disk. Pass null to detach
+     * (e.g. when live backup is disabled and pruning should be unconditional).
+     */
+    setArchiveProtector(protector: ((segmentEndLsn: number) => boolean) | null): void {
+        this.archiveProtector = protector ?? undefined;
+    }
 
-        while (archiveFiles.length > keepCount) {
-            const oldestFile = archiveFiles.shift();
-            if (oldestFile && existsSync(oldestFile.path)) {
-                unlinkSync(oldestFile.path);
+    /**
+     * Retain the newest `keepCount` segments and delete the rest, oldest first —
+     * except any segment the archive protector still considers unshipped, which
+     * is deferred as long as the protect byte budget allows.
+     *
+     * `force` skips both the keep count and the protector entirely: it is the
+     * "wipe the WAL" path (truncateLog), where the caller has explicitly
+     * declared the archived entries worthless.
+     */
+    private cleanupOldArchives(keepCount: number = this.archiveKeepCount, options: { force?: boolean } = {}): void {
+        const segments = this.listSegments(); // oldest first
+        if (segments.length === 0) return;
+
+        const surplus = segments.slice(0, Math.max(0, segments.length - Math.max(0, keepCount)));
+        if (surplus.length === 0) return;
+
+        const protect = options.force ? undefined : this.archiveProtector;
+        let deferredBytes = 0;
+        let overflowDiscarded = 0;
+
+        for (const segment of surplus) {
+            if (protect && protect(segment.endLsn)) {
+                const size = this.segmentSize(segment.path);
+                if (deferredBytes + size <= this.archiveProtectMaxBytes) {
+                    deferredBytes += size;
+                    continue; // keep: its entries have not been shipped yet
+                }
+                // Disk-safety valve: the bucket has been unreachable long enough
+                // to exhaust the budget. Fall through and prune, but say so —
+                // this is the only path that discards unshipped WAL.
+                overflowDiscarded++;
             }
+            try {
+                unlinkSync(segment.path);
+            } catch { /* approved: a segment that vanished is already pruned */ }
+        }
+
+        if (overflowDiscarded > 0) {
+            const now = Date.now();
+            if (now - this.lastProtectOverflowWarnAt >= ARCHIVE_OVERFLOW_WARN_INTERVAL_MS) {
+                this.lastProtectOverflowWarnAt = now;
+                console.warn(
+                    `[Tero] WAL archive protection budget exhausted (${this.archiveProtectMaxBytes} bytes): ` +
+                    `discarded ${overflowDiscarded} unshipped segment(s). Live backup is not keeping up — ` +
+                    `check getLiveBackupStatus().lastError.`,
+                );
+            }
+        }
+    }
+
+    /** Size of a segment in bytes; 0 when it is already gone or unreadable. */
+    private segmentSize(path: string): number {
+        try {
+            return statSync(path).size;
+        } catch {
+            return 0;
         }
     }
 
@@ -594,7 +717,9 @@ export class WriteAheadLog {
         this.fsyncFile(this.logPath);
         this.fsyncDir(dirname(this.logPath));
         this.dirty = false;
-        this.cleanupOldArchives(0);
+        // force: an explicit truncate discards archived entries on purpose, so
+        // neither the keep count nor the ship-protector applies.
+        this.cleanupOldArchives(0, { force: true });
     }
 
     destroy(): void {
@@ -970,6 +1095,146 @@ export function partitionedPath(dbPath: string, key: string): string {
     const hex = h.toString(16).padStart(8, '0');
     // Use 2 hex chars per level: 256 buckets per level, 2 levels = 65,536 leaves
     return join(dbPath, hex.slice(0, 2), hex.slice(2, 4), `${key}.json`);
+}
+
+/**
+ * Max directory depth the temp sweep descends. partitionedPath() produces
+ * <dbPath>/<xx>/<yy>/<key>.json, so depth 2 reaches every data file. Dot-
+ * directories are never descended into: .backup holds real data files
+ * (backup.ts:416) and .tombstones holds <hash>.deleted.
+ */
+const TEMP_SWEEP_MAX_DEPTH = 2;
+
+/**
+ * Age a temp file must reach before it is treated as orphaned. A timestamp
+ * older than this cannot belong to an in-flight write, because the producer
+ * writes it immediately before the rename.
+ */
+const TEMP_SWEEP_MIN_AGE_MS = 60_000;
+
+/**
+ * Tero's only temp-file shape, as produced by every atomic write:
+ *
+ *   <target>.tmp.<pid>.<Date.now()>.<random>        acid-engine.ts, index.ts
+ *   <target>.tmp.<pid>.<Math.random().toString(36)> backup.ts:163
+ *
+ * backup.ts omits the timestamp, so that variant can never be proven orphaned
+ * and is always left alone.
+ */
+const TERO_TMP_RE = /\.tmp\.(\d+)\.(\d+)\.([A-Za-z0-9]+)/;
+
+/**
+ * Decides whether a directory entry is an orphaned temp file left by an
+ * earlier process. This is the single point the sweep's safety rests on.
+ *
+ * The timestamp is matched *structurally* rather than by a `.tmp.` substring
+ * search, which matters because Tero keys are only forbidden from '/', '\',
+ * '\0' and a leading '.'. A user key such as `weird.tmp.thing` is therefore
+ * legal, and its `<key>.json` data file would be a false positive for a naive
+ * matcher. No legitimate filename carries `<digits>.<13-digit epoch>.<alnum>`
+ * in that position: documents are `<key>.json`, WAL segments are
+ * `.wal.seg-<padded>`, pending queues are `.cloud_pending*.json` and tombstones
+ * are `<hash>.deleted`.
+ *
+ * recovery.ts's mirrored form `<key>.json.<ts>.<rand>.tmp` has no `.tmp.`
+ * marker and is deliberately not matched. Those files live for a single await
+ * and that module already unlinks them on its own error path, so there is
+ * nothing to reap.
+ */
+function isOrphanedTempFile(name: string, cutoff: number): boolean {
+    const m = TERO_TMP_RE.exec(name);
+    if (!m) return false;
+
+    const pid = Number(m[1]);
+    const ts = Number(m[2]);
+    // Require a 13-digit Date.now() so the pattern cannot be widened by some
+    // other dotted-numeric filename.
+    if (!/^\d{13}$/.test(m[2])) return false;
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    // This process's own temp file. Covers a second Tero instance in the same
+    // process (the file lock rejects that only when fileLock is enabled) and
+    // makes the sweep inert on a freshly created directory.
+    if (pid === process.pid) return false;
+
+    return ts < cutoff;
+}
+
+/**
+ * Remove temp files left behind by a process that died between writing its temp
+ * file and renaming it into place.
+ *
+ * Safety rests on three properties, in order of importance:
+ *
+ *  1. It runs ONLY from the constructor, after the cross-process `.lock` is
+ *     held and after crash recovery has run. No writer exists yet, so a temp
+ *     file observed here can only predate this process. Writes this process
+ *     makes later are renamed away synchronously and are never observable.
+ *  2. The pid embedded in the name must differ from ours (see
+ *     isOrphanedTempFile), so an in-flight write is never unlinked out from
+ *     under its own `renameSync`.
+ *  3. A name that does not parse as a temp file is left untouched rather than
+ *     guessed at.
+ *
+ * The embedded timestamp must also be older than `minAgeMs`, which keeps the
+ * sweep inert even if a second process does hold the directory open and writes
+ * a temp file while we are walking it.
+ *
+ * Only temp files are unlinked, and the parent directory is fsynced so the
+ * unlink survives power loss. Failing to remove a temp file never fails
+ * startup -- it is a space leak, not a correctness problem.
+ */
+export function sweepStaleTempFiles(dbPath: string, minAgeMs: number = TEMP_SWEEP_MIN_AGE_MS): { scanned: number; removed: number } {
+    let scanned = 0;
+    let removed = 0;
+    const cutoff = Date.now() - minAgeMs;
+
+    // Explicit stack rather than recursion: the data directory can hold 65k
+    // partition leaves, and a recursive walk would fan out directory handles
+    // and risk a stack overflow.
+    const pending: Array<{ dir: string; depth: number }> = [{ dir: dbPath, depth: 0 }];
+
+    while (pending.length > 0) {
+        const { dir, depth } = pending.pop()!;
+
+        let entries: Dirent[];
+        try {
+            entries = readdirSync(dir, { withFileTypes: true });
+        } catch {
+            continue; // vanished or unreadable -- nothing to sweep here
+        }
+
+        for (const entry of entries) {
+            const name = entry.name;
+
+            if (entry.isDirectory()) {
+                if (name.startsWith('.')) continue;
+                if (depth + 1 > TEMP_SWEEP_MAX_DEPTH) continue;
+                pending.push({ dir: join(dir, name), depth: depth + 1 });
+                continue;
+            }
+
+            if (!isOrphanedTempFile(name, cutoff)) continue;
+            scanned++;
+
+            const fullPath = join(dir, name);
+            try {
+                // lstat, never stat: a temp file must never be followed through
+                // a symlink, or the sweep could unlink a target outside the
+                // data directory.
+                if (!lstatSync(fullPath).isFile()) continue;
+                unlinkSync(fullPath);
+                removed++;
+                // Durably record the unlink, so a power loss cannot resurrect
+                // the temp file and let it re-accumulate on the next boot.
+                try {
+                    const fd = openSync(dir, 'r');
+                    try { fsyncSync(fd); } finally { closeSync(fd); }
+                } catch { /* directory fsync is best-effort */ }
+            } catch { /* approved: a leftover temp file never fails startup */ }
+        }
+    }
+
+    return { scanned, removed };
 }
 
 /**
@@ -1390,14 +1655,14 @@ export class ACIDStorageEngine {
     private synchronous: SynchronousMode;
     private checkpointBatchSize: number;
 
-    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50, checkpointBatchSize: number = 1000) {
+    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50, checkpointBatchSize: number = 1000, archiveKeepCount?: number) {
         this.dbPath = dbPath;
         // Startup ordering: restore-marker recovery -> filesystem validation -> WAL recovery
         recoverPendingRestore(this.dbPath);
         this.synchronous = synchronous;
         this.DATA_FLUSH_INTERVAL_MS = dataFlushIntervalMs;
         this.checkpointBatchSize = checkpointBatchSize > 0 ? checkpointBatchSize : 1000;
-        this.wal = new WriteAheadLog(dbPath, synchronous, commitIntervalMs);
+        this.wal = new WriteAheadLog(dbPath, synchronous, commitIntervalMs, { archiveKeepCount });
         this.lockManager = new LockManager();
         this.initializeStorage();
         // Background data-file checkpoint timer — flushes committedBuffer to disk

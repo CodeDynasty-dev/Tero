@@ -2,7 +2,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync, renameSync } from "fs";
 import { resolve as pathResolve, relative as pathRelative, join as pathJoin } from "path";
-import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError } from "./acid-engine.js";
+import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError, sweepStaleTempFiles } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
 import { DataRecovery, RecoveryConfig, RecoveryResult, FileRecoveryInfo, classifyRecoveryError } from "./recovery.js";
 import QuickLRU from "quick-lru";
@@ -126,6 +126,16 @@ interface TeroConfig {
   cacheSize?: number;
   /** Max committedBuffer entries flushed to disk per tick (prevents event loop stalls). Default: 1000. */
   checkpointBatchSize?: number;
+  /**
+   * Rotated WAL segments retained locally (1MB each). Default: 20.
+   *
+   * Retention is a *recovery window*, not a cache: every segment is a slice of
+   * history that a point-in-time restore can replay. With live backup enabled
+   * this only sets the floor — a segment that has not been shipped to the bucket
+   * is never pruned at all (up to the protect byte budget), so a bucket outage
+   * cannot turn a rotation into data loss.
+   */
+  archiveKeepCount?: number;
   /**
    * Durability / throughput trade-off knob (like SQLite's `PRAGMA synchronous`):
    *   - 'full'   (default): fsync the WAL on every commit. Max durability, ~15–60 ops/s
@@ -551,6 +561,13 @@ export class Tero {
         this.acquireFileLock();
       }
 
+      // Reap temp files orphaned by a process that died mid-atomic-write. Safe
+      // here and only here: the lock is held, and no writer exists yet, so any
+      // .tmp.* file on disk predates this instance. Never fails the boot.
+      try {
+        sweepStaleTempFiles(this.teroDirectory);
+      } catch { /* approved: a leftover temp file must not block startup */ }
+
       // Initialize QuickLRU cache
       this.cache = new QuickLRU<string, CacheEntry>({
         maxSize: this.cacheSize
@@ -567,7 +584,7 @@ export class Tero {
       const syncMode: SynchronousMode = synchronous ?? 'full';
       const syncInterval: number = commitIntervalMs ?? 10;
       const dataFlushInterval: number = dataFlushIntervalMs ?? 50;
-      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval, config?.checkpointBatchSize);
+      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval, config?.checkpointBatchSize, config?.archiveKeepCount);
 
       // Restore durable local tombstones (P0-2) — prevents resurrection after restart even if cloud tombstone not yet durable
       try {
