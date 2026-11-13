@@ -239,7 +239,9 @@ await check('checkpointAndBackupToBucket() rotates WAL + uploads segment', async
     backup2 = await db.checkpointAndBackupToBucket({ tag: 'live-2' });
     assert.equal(backup2.success, true, `backup should succeed, errors: ${JSON.stringify(backup2.errors)}`);
     assert.ok(backup2.uploadedWALSegments >= 1, `expected >= 1 WAL segment, got ${backup2.uploadedWALSegments}`);
-    assert.ok(backup2.uploadedDataFiles >= 9, `expected >= 9 data files (user4 added), got ${backup2.uploadedDataFiles}`);
+    // Unchanged documents are skipped by ETag, so only what changed since backup #1
+    // is uploaded: the new user4 and the updated user1.
+    assert.ok(backup2.uploadedDataFiles >= 2, `expected >= 2 changed data files (user4 added, user1 updated), got ${backup2.uploadedDataFiles}`);
 })();
 
 // ---------------------------------------------------------------------------

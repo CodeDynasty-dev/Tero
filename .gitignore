@@ -29,3 +29,4 @@ RecoveryBench**
 ChaosSoakDB
 test_**
 ProdTestDB/
+.DS_Store

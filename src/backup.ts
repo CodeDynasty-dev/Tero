@@ -1,12 +1,18 @@
+import { buildS3ClientConfig } from "./s3-config.js";
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync, openSync, fsyncSync, closeSync, rmSync, writeSync } from "fs";
 import { join, basename, relative, dirname, sep } from "path";
 import { create as tarCreate } from "tar";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { CronJob } from "cron";
-import { gzipSync, gunzipSync } from "zlib";
+import { gzip as gzipCb, gunzipSync } from "zlib";
+
+/** gzip on the libuv pool: compressing several MB of WAL synchronously every ship tick stalled the event loop for hundreds of ms. */
+function gzipAsync(buf: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => gzipCb(buf, { level: 1 }, (err, out) => (err ? reject(err) : resolve(out))));
+}
 import { createHash, randomUUID } from "crypto";
-import { ACIDStorageEngine, LogEntry, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum, streamLogFile, safeRemoveDirectory } from "./acid-engine.js";
+import { ACIDStorageEngine, LogEntry, DirtyEntry, SnapshotHandle, writeWalSeed, readRawWalLines, partitionedPath, walkPartitions, RecoveryCorruptionError, verifyLogEntryChecksum, streamLogFile, safeRemoveDirectory } from "./acid-engine.js";
 
 /**
  * LSN padded to 16 digits so lexicographic object-key sort == numeric LSN sort.
@@ -74,10 +80,27 @@ export interface LiveBackupStatus {
 }
 
 export interface LiveBackupOptions {
-  /** The only consistency level live backup offers: RPO ≤ 1 second of committed writes. */
-  consistency: 'per-second';
+  /**
+   * - 'per-second': RPO ≤ 1 second of committed writes (intervalMs ≤ 1000).
+   * - 'interval':   RPO = intervalMs (1000–300000). Each ship is one PUT per engine,
+   *                 so a slower cadence cuts bucket request costs proportionally.
+   */
+  consistency: 'per-second' | 'interval';
   /** Ship interval in ms. Default 1000. Minimum 250. */
   intervalMs?: number;
+  /**
+   * Automatic incremental checkpoint cadence (ms). Default 900000 (15 min); 0 disables.
+   * A checkpoint bounds three things: how much WAL a restore replays, how many
+   * dirty documents are held in memory, and (via pruning) how many WAL objects
+   * accumulate in the bucket.
+   */
+  checkpointIntervalMs?: number;
+  /**
+   * Wait this long before the initial FULL checkpoint (default 0). Lets a server
+   * finish booting before uploading every document. Safe: until it publishes, the
+   * previous checkpoint plus the shipped WAL still describe everything.
+   */
+  initialCheckpointDelayMs?: number;
   /** Stable identity for this node in the bucket. Persisted to <dbPath>/.tero-node-id. */
   nodeId?: string;
 }
@@ -95,6 +118,8 @@ export interface RestoreLiveResult {
   segmentsReplayed: number;
   baseLsn: number | null;
   lastLsn: number;
+  /** Set only with allowWalGap: first LSN that could not be replayed because the bucket's WAL chain is broken there. */
+  walGapAtLsn?: number;
 }
 
 export interface CloudStorageConfig {
@@ -107,7 +132,12 @@ export interface CloudStorageConfig {
   pathPrefix?: string; // Optional path prefix in bucket
   /** Override the derived bucket subprefix (avoids basename collisions). Defaults to "<basename>-<hash>". */
   dbName?: string;
+  /** Per-request timeout (ms). Default 30000. Without one, a hung connection blocks its caller forever. */
+  requestTimeoutMs?: number;
+  /** TCP/TLS connect timeout (ms). Default 5000. */
+  connectionTimeoutMs?: number;
 }
+
 
 /** Injectable logger for BackupManager. Pass your own to route backup logs into
  *  your observability stack, or pass console. Default is silent to prevent log noise. */
@@ -228,21 +258,7 @@ export class BackupManager {
         return;
       }
 
-      const clientConfig: any = {
-        region: cloudConfig.region,
-        credentials: {
-          accessKeyId: cloudConfig.accessKeyId,
-          secretAccessKey: cloudConfig.secretAccessKey,
-        },
-      };
-
-      // Configure for Cloudflare R2 or custom endpoints
-      if (cloudConfig.endpoint) {
-        clientConfig.endpoint = cloudConfig.endpoint;
-        clientConfig.forcePathStyle = true; // Required for R2
-      }
-
-      this.s3Client = new S3Client(clientConfig);
+      this.s3Client = new S3Client(buildS3ClientConfig(cloudConfig));
     } catch (error) {
       throw new Error(`Failed to initialize cloud storage: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -1162,6 +1178,7 @@ export class BackupManager {
     // Clear the reference too — the automatic initial-checkpoint retry loop
     // checks it and must stop retrying after destroy.
     if (this.liveShipper) { this.liveShipper.stop(); this.liveShipper = undefined; }
+    if (this.checkpointTimer) { clearInterval(this.checkpointTimer); this.checkpointTimer = undefined; }
     this.log.info('🛑 BackupManager destroyed, all scheduled backups cancelled');
   }
 
@@ -1189,7 +1206,13 @@ export class BackupManager {
 
   private async readJsonOrDefault<T>(key: string): Promise<T | null> {
     try { return JSON.parse((await this.downloadBytes(key)).toString('utf8')) as T; }
-    catch (e) { if (e instanceof Error && (e.name === 'NoSuchKey' || /NoSuchKey|404|not found|does not exist/i.test(e.message))) return null; throw e; }
+    catch (e) {
+      // A missing BUCKET is a configuration error, never "no backup yet": treating
+      // it as absent would let a restore silently produce an empty database.
+      if (e instanceof Error && (e.name === 'NoSuchBucket' || /NoSuchBucket|bucket does not exist/i.test(e.message))) throw e;
+      if (e instanceof Error && (e.name === 'NoSuchKey' || /NoSuchKey|404|not found|does not exist/i.test(e.message))) return null;
+      throw e;
+    }
   }
 
   private async listPrefix(prefix: string): Promise<string[]> {
@@ -1238,11 +1261,12 @@ export class BackupManager {
   }
 
   enableLiveBackup(engine: ACIDStorageEngine, opts: LiveBackupOptions): void {
-    if (opts.consistency !== 'per-second') throw new Error("Tero live backup only supports consistency: 'per-second' (RPO ≤ 1s). Other levels are not offered.");
+    if (opts.consistency !== 'per-second' && opts.consistency !== 'interval') throw new Error("Tero live backup consistency must be 'per-second' (RPO ≤ 1s) or 'interval' (RPO = intervalMs).");
     if (this.liveShipper) return;
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured — call configureBackup() with cloudStorage first.');
     const intervalMs = Math.max(250, opts.intervalMs ?? 1000);
-    if (intervalMs > 1000) throw new Error(`intervalMs=${intervalMs} violates the per-second consistency contract (RPO ≤ 1s). Use intervalMs ≤ 1000.`);
+    if (opts.consistency === 'per-second' && intervalMs > 1000) throw new Error(`intervalMs=${intervalMs} violates the per-second consistency contract (RPO ≤ 1s). Use intervalMs ≤ 1000, or consistency: 'interval'.`);
+    if (opts.consistency === 'interval' && intervalMs > 300_000) throw new Error(`intervalMs=${intervalMs} is above the 300000ms maximum for consistency: 'interval'.`);
     // Resolve nodeId: explicit > persisted file > fresh id. Sanitize hard — this
     // becomes an S3 key path component; garbage must never produce nested paths.
     let nodeId = opts.nodeId;
@@ -1257,8 +1281,19 @@ export class BackupManager {
     } catch { /* approved: node ID file write best-effort */ }
     const prefix = this.liveCloudPrefix(nodeId);
     this.liveNodeId = nodeId; this.liveEngine = engine; this.livePrefix = prefix;
+    // Live checkpoints upload exactly the documents committed since the last one.
+    engine.setDirtyTracking(true);
     this.lastCheckpointError = undefined;
-    this.liveShipper = new WalShipper({ wal: engine.getWAL(), upload: (k, b) => this.uploadBytes(k, b, 'application/gzip'), prefix, intervalMs });
+    this.liveShipper = new WalShipper({
+      wal: engine.getWAL(), upload: (k, b) => this.uploadBytes(k, b, 'application/gzip'), prefix, intervalMs,
+      // A hole in the shipped WAL makes everything after the last checkpoint
+      // unrestorable. A checkpoint re-bases the bucket on the current state and
+      // closes it, so take one right away instead of waiting for the timer.
+      onGap: () => {
+        if (this.liveCheckpoints === 0 || this.liveCheckpointPromise) return;
+        this.liveCheckpointToBucket().catch(() => { /* surfaced via lastCheckpointError */ });
+      },
+    });
     this.liveShipper.start();
     // Rotation must never delete a segment the shipper has not uploaded yet.
     // A 1MB WAL fills in well under a second under load, so the fixed keep count
@@ -1275,15 +1310,33 @@ export class BackupManager {
     // manual liveCheckpointToBucket() — a crash in that window loses all prior data.
     // Retry with backoff (bucket may be temporarily unreachable); surface failures
     // in getLiveBackupStatus().lastCheckpointError.
-    void this.runInitialCheckpoint(prefix);
+    void this.runInitialCheckpoint(prefix, Math.max(0, opts.initialCheckpointDelayMs ?? 0));
+    const ckptEvery = opts.checkpointIntervalMs ?? 15 * 60_000;
+    if (ckptEvery > 0) {
+      this.checkpointTimer = setInterval(() => {
+        // Skip while the initial checkpoint is still being retried.
+        if (this.liveCheckpoints === 0 || this.liveCheckpointPromise) return;
+        this.liveCheckpointToBucket().catch(() => { /* surfaced via lastCheckpointError */ });
+      }, Math.max(1000, ckptEvery));
+      this.checkpointTimer.unref?.();
+    }
   }
 
+  private checkpointTimer?: ReturnType<typeof setInterval>;
+
   /** Initial full checkpoint with bounded retry. Stops on success or disable. */
-  private async runInitialCheckpoint(prefix: string): Promise<void> {
+  private async runInitialCheckpoint(prefix: string, delayMs = 0): Promise<void> {
+    if (delayMs > 0) {
+      await new Promise(r => { const t = setTimeout(r, delayMs); t.unref?.(); });
+    }
     for (let attempt = 1; ; attempt++) {
       if (this.liveShipper === undefined || this.livePrefix !== prefix) return; // disabled/re-enabled under us
       try {
-        await this.liveCheckpointToBucket();
+        // Always FULL: whatever this process found on disk (a restore, a period with
+        // live backup off, history whose WAL was pruned) is re-based in the bucket.
+        // An incremental here would only upload this session's dirty documents and
+        // then prune the WAL that held everything else.
+        await this.liveCheckpointToBucket({ full: true });
         return;
       } catch (e) {
         this.lastCheckpointError = `initial-checkpoint attempt ${attempt}: ${e instanceof Error ? e.message : String(e)}`;
@@ -1297,10 +1350,12 @@ export class BackupManager {
   disableLiveBackup(): void {
     if (!this.liveShipper) return;
     this.liveShipper.stop(); this.liveShipper = undefined;
+    if (this.checkpointTimer) { clearInterval(this.checkpointTimer); this.checkpointTimer = undefined; }
     // Detach the protector: with no shipper there is no bucket to protect WAL
     // for, so retention must return to the plain keep-count behaviour — else
     // "disabled" would silently mean "never prune".
     this.liveEngine?.getWAL().setArchiveProtector(null);
+    this.liveEngine?.setDirtyTracking(false);
     this.log.info('🛑 Tero live backup disabled');
   }
 
@@ -1318,13 +1373,13 @@ export class BackupManager {
 
   // __TERO_LIVE_PART2__
 
-  async liveCheckpointToBucket(_opts?: { tag?: string }): Promise<LiveCheckpointResult> {
+  async liveCheckpointToBucket(opts?: { tag?: string; full?: boolean }): Promise<LiveCheckpointResult> {
     if (!this.liveEngine || !this.liveNodeId || !this.livePrefix) throw new Error('Live backup not enabled — call enableLiveBackup() first.');
     // Share the in-flight run: concurrent callers (e.g. the automatic initial
     // checkpoint racing a manual call) must never interleave uploads — a second
     // run could publish latest.json before the first run's data is durable.
     if (this.liveCheckpointPromise) return this.liveCheckpointPromise;
-    this.liveCheckpointPromise = this.doLiveCheckpoint();
+    this.liveCheckpointPromise = this.doLiveCheckpoint(opts?.full === true);
     try {
       const r = await this.liveCheckpointPromise;
       this.lastCheckpointError = undefined;
@@ -1337,7 +1392,7 @@ export class BackupManager {
     }
   }
 
-  private async doLiveCheckpoint(): Promise<LiveCheckpointResult> {
+  private async doLiveCheckpoint(forceFull = false): Promise<LiveCheckpointResult> {
     const engine = this.liveEngine!;
     const start = Date.now();
     const ckptPrefix = `${this.livePrefix}checkpoint/`;
@@ -1350,20 +1405,54 @@ export class BackupManager {
     // instead would let mid-checkpoint writes be skipped by BOTH the checkpoint
     // content AND the replay filter — silent stale-data loss.
     const ckptLsn = engine.getLastCommittedLSN();
-    // (2) Flush committed data so the files we read reflect all commits ≤ ckptLsn.
-    engine.flushCommittedBuffer(true);
+    // Replay floor: a transaction that BEGAN before this checkpoint but commits
+    // after it has WRITE records below ckptLsn. Restore must replay from here.
+    const replayFromLsn = engine.getReplayFloorLsn();
+    const capturedAt = Date.now();
+    // (2) Write committed data so the files we read reflect all commits ≤ ckptLsn.
+    // No fsync: the backup only reads these files back (from the page cache);
+    // local durability is the WAL's and the durable checkpoint's job. The forced
+    // variant fsynced every pending file synchronously — seconds of blocked loop.
+    engine.flushCommittedBuffer(false, Infinity);
+    // (3) Pin the version-consistent view NOW, in the same tick as the LSN capture.
+    // Opening the snapshot after the first await (as before) let commits that
+    // landed in between leak into a checkpoint labelled with the older LSN —
+    // a point-in-time restore then returned data from after the requested time.
+    // By reference, once: committed images are never mutated and the checkpoint only
+    // serializes them. Deep-cloning every dirty document here (twice — beginSnapshot
+    // peeked again) blocked the event loop for seconds and doubled peak memory.
+    const dirtyAtCapture = engine.peekDirtyKeys(ckptLsn, false);
+    const handle = engine.beginSnapshot(ckptLsn, dirtyAtCapture);
+    // A full checkpoint covers everything below its replay floor, so the shipper
+    // never needs to (re)send older WAL — after a restart it would otherwise
+    // re-upload ranges the bucket already holds.
+    if (forceFull && this.liveShipper && this.liveShipper.getShippedLsn() < replayFromLsn - 1) {
+      this.liveShipper.setInitialLsn(replayFromLsn - 1);
+    }
+    try {
+      return await this.doLiveCheckpointCaptured(engine, start, ckptPrefix, latestKey, ckptLsn, replayFromLsn, capturedAt, dirtyAtCapture, handle, forceFull);
+    } finally {
+      handle.close();
+    }
+  }
+
+  private async doLiveCheckpointCaptured(
+    engine: ACIDStorageEngine, start: number, ckptPrefix: string, latestKey: string,
+    ckptLsn: number, replayFromLsn: number, capturedAt: number,
+    dirtyAtCapture: Map<string, DirtyEntry>, handle: SnapshotHandle, forceFull = false,
+  ): Promise<LiveCheckpointResult> {
     const posixRel = (p: string) => relative(this.dbPath, p).split(sep).join('/');
     const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number }>(latestKey);
-    if (!latest) {
-      // FULL checkpoint: consumes a versioned logical snapshot (snapshotFiles) from engine
+    if (!latest || forceFull) {
+      // FULL checkpoint: consumes the version-consistent snapshot pinned at capture
       const baseTs = new Date().toISOString().replace(/[:.]/g, '-');
       const dataPrefix = `${ckptPrefix}${baseTs}/data/`;
-      const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
+      const dirtySnapshot = dirtyAtCapture;
 
       let count = 0;
       let tombstoned = 0;
       const manifestDataItems: Array<{ path: string; size: number; sha256: string; versionLsn: number; state: string }> = [];
-      await pooledConsumeAsyncGen(engine.snapshotFiles(ckptLsn), 16, async (entry) => {
+      await pooledConsumeAsyncGen(handle.files(), 16, async (entry) => {
         const filePath = partitionedPath(this.dbPath, entry.key);
         const rel = posixRel(filePath);
         if (entry.state === 'deleted') {
@@ -1419,18 +1508,23 @@ export class BackupManager {
 
       await this.uploadBytes(`${ckptPrefix}${baseTs}/index.json`, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, createdAt: new Date().toISOString(), docCount: count }, null, 2)), 'application/json');
       await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify(manifestObj, null, 2)), 'application/json');
-      await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString() }, null, 2)), 'application/json');
+      await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs, baseLsn: ckptLsn, replayFromLsn, capturedAt, updatedAt: new Date().toISOString() }, null, 2)), 'application/json');
 
       // CRITICAL P0 ORDERING: Acknowledge ONLY AFTER latest and manifest are published!
       // Every acknowledged dirty entry now has a durable representation (present file or .deleted tombstone)
       engine.acknowledgeDirtyKeys(dirtySnapshot.values());
+      await this.pruneCoveredWal(walKeys, replayFromLsn);
+      // The previous base is superseded by this one.
+      if (latest && latest.baseTs !== baseTs) {
+        const stale = await this.listPrefix(`${ckptPrefix}${latest.baseTs}/`);
+        await pooledMap(stale, 16, async (k) => { try { await this.deleteObject(k); } catch { /* approved: retried next full checkpoint */ } });
+      }
 
       this.liveCheckpoints++;
       return { uploadedDocs: count, tombstonedDocs: tombstoned, fullUpload: true, duration: Date.now() - start };
     }
-    // INCREMENTAL checkpoint — upload ONLY dirty docs from versioned snapshot, tombstone deleted ones.
-    const dirtySnapshot = engine.peekDirtyKeys(ckptLsn);
-    const dirtyEntries = [...dirtySnapshot.values()];
+    // INCREMENTAL checkpoint — upload ONLY dirty docs (as of capture), tombstone deleted ones.
+    const dirtyEntries = [...dirtyAtCapture.values()];
     const dataPrefix = `${ckptPrefix}${latest.baseTs}/data/`;
     let uploaded = 0;
     let tombstoned = 0;
@@ -1494,13 +1588,30 @@ export class BackupManager {
     };
 
     await this.uploadBytes(`${this.livePrefix}MANIFEST.json`, Buffer.from(JSON.stringify(manifestObj, null, 2)), 'application/json');
-    await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
+    await this.uploadBytes(latestKey, Buffer.from(JSON.stringify({ baseTs: latest.baseTs, baseLsn: ckptLsn, replayFromLsn, capturedAt, updatedAt: new Date().toISOString(), dirtyUploaded: uploaded, tombstoned }, null, 2)), 'application/json');
 
     // CRITICAL P0 ORDERING: Two-phase acknowledgment: ONLY acknowledge successfully uploaded items AFTER manifest and latest are published
     engine.acknowledgeDirtyKeys(ackList);
+    await this.pruneCoveredWal(walKeys, replayFromLsn);
 
     this.liveCheckpoints++;
     return { uploadedDocs: uploaded, tombstonedDocs: tombstoned, fullUpload: false, duration: Date.now() - start };
+  }
+
+  /**
+   * Delete bucket WAL objects the published checkpoint makes redundant: a restore
+   * replays only from replayFromLsn onward, so segments that END before it are
+   * never read again. Without this the WAL prefix grows by one object per ship
+   * forever, and every checkpoint's LIST gets slower and costlier. Best-effort.
+   */
+  private async pruneCoveredWal(walKeys: string[], replayFromLsn: number): Promise<void> {
+    const stale = walKeys.filter(k => {
+      const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/);
+      return m ? parseInt(m[2], 10) < replayFromLsn : false;
+    });
+    await pooledMap(stale, 16, async (k) => {
+      try { await this.deleteObject(k); } catch { /* approved: retried at the next checkpoint */ }
+    });
   }
 
   // __TERO_LIVE_PART3__
@@ -1509,7 +1620,7 @@ export class BackupManager {
    * Crash-safe restore: downloads and replays WAL into a fresh temporary staging directory,
    * then promotes staging to targetDir via a crash-safe .restore-in-progress marker protocol.
    */
-  async restoreLiveToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
+  async restoreLiveToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number; allowWalGap?: boolean } = {}): Promise<RestoreLiveResult> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
     const restoreId = randomUUID();
     const stagingDir = `${targetDir}.staging.${restoreId}`;
@@ -1583,7 +1694,7 @@ export class BackupManager {
    * Explicit merge restore: restores state directly into an existing target directory
    * without staging or promoting. Stale files not present in the backup will survive.
    */
-  async mergeRestoreToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
+  async mergeRestoreToDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number; allowWalGap?: boolean } = {}): Promise<RestoreLiveResult> {
     if (!this.s3Client || !this.config.cloudStorage) throw new Error('Cloud storage not configured');
     if (existsSync(targetDir) && readdirSync(targetDir).some(f => !f.startsWith('.'))) {
       this.log.warn(`⚠️  mergeRestoreToDirectory: target '${targetDir}' is not empty — restored state will be merged over existing files.`);
@@ -1592,7 +1703,7 @@ export class BackupManager {
     return this._restoreToTargetDirectory(targetDir, opts);
   }
 
-  private async _restoreToTargetDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number } = {}): Promise<RestoreLiveResult> {
+  private async _restoreToTargetDirectory(targetDir: string, opts: { nodeId?: string; pointInTime?: number; targetLsn?: number; allowWalGap?: boolean } = {}): Promise<RestoreLiveResult> {
     if (opts.pointInTime !== undefined && opts.targetLsn !== undefined) {
       throw new Error('Ambiguous PITR parameters: specify targetLsn XOR pointInTime, not both.');
     }
@@ -1610,11 +1721,23 @@ export class BackupManager {
       nodeId = [...ids][0];
     }
     const prefix = this.liveCloudPrefix(nodeId);
-    const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number }>(`${prefix}checkpoint/latest.json`);
+    const latest = await this.readJsonOrDefault<{ baseTs: string; baseLsn: number; replayFromLsn?: number; capturedAt?: number }>(`${prefix}checkpoint/latest.json`);
     let docsRestored = 0;
     let baseLsn: number | null = null;
+    // First LSN the WAL replay must read. Checkpoints written before replayFromLsn
+    // existed fall back to baseLsn + 1 (their old behaviour).
+    let replayFrom = 0;
     if (latest) {
       baseLsn = latest.baseLsn ?? null;
+      replayFrom = typeof latest.replayFromLsn === 'number' ? latest.replayFromLsn : (baseLsn ?? -1) + 1;
+      // The checkpoint already contains every commit up to baseLsn, so it cannot
+      // represent an earlier moment. Refuse instead of silently returning newer data.
+      if (targetLsn !== undefined && baseLsn !== null && targetLsn < baseLsn) {
+        throw new Error(`Cannot restore to LSN ${targetLsn}: the oldest restorable point is the latest checkpoint at LSN ${baseLsn}.`);
+      }
+      if (pit !== undefined && typeof latest.capturedAt === 'number' && pit < latest.capturedAt) {
+        throw new Error(`Cannot restore to ${new Date(pit).toISOString()}: the oldest restorable point is the latest checkpoint at ${new Date(latest.capturedAt).toISOString()}.`);
+      }
       const dataWithMeta = await this.listPrefixWithMeta(`${prefix}checkpoint/${latest.baseTs}/data/`);
       const tombstoneMeta = new Map<string, Date>();
       const activeMeta = new Map<string, { key: string; lastModified: Date }>();
@@ -1662,14 +1785,22 @@ export class BackupManager {
       }
     }
     const walKeys = (await this.listPrefix(`${prefix}wal/`))
-      .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) > (baseLsn ?? 0) : false; })
+      .filter(k => { const m = k.match(/seg-(\d+)-(\d+)\.json\.gz$/); return m ? parseInt(m[2]) >= replayFrom : false; })
       .sort((a, b) => {
         const ma = a.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
         const mb = b.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
         return parseInt(ma[1], 10) - parseInt(mb[1], 10);
       });
 
+    // Highest LSN the bucket holds for this node, including anything past a gap:
+    // the restored database must number above all of it.
+    let bucketMaxEnd = -1;
+    for (const wk of walKeys) {
+      const mm = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
+      bucketMaxEnd = Math.max(bucketMaxEnd, parseInt(mm[2], 10));
+    }
     let prevEnd = -1;
+    let walGapAtLsn: number | undefined;
     for (let i = 0; i < walKeys.length; i++) {
       const wk = walKeys[i];
       const m = wk.match(/seg-(\d+)-(\d+)\.json\.gz$/)!;
@@ -1677,14 +1808,27 @@ export class BackupManager {
       if (s > e) {
         throw new RecoveryCorruptionError(wk, 0, `Invalid segment range in cloud WAL: startLsn (${s}) > endLsn (${e})`);
       }
+      let gap: string | null = null;
       if (i === 0) {
-        if (baseLsn !== undefined && baseLsn !== null && baseLsn > 0 && s > baseLsn + 1) {
-          throw new RecoveryCorruptionError(wk, 0, `WAL continuity gap between base checkpoint (${baseLsn}) and first cloud WAL segment (${s})`);
+        if (baseLsn !== undefined && baseLsn !== null && baseLsn > 0 && s > replayFrom) {
+          gap = `WAL continuity gap between base checkpoint (replay from ${replayFrom}) and first cloud WAL segment (${s})`;
         }
       } else if (prevEnd >= 0) {
-        if (s !== prevEnd + 1) {
-          throw new RecoveryCorruptionError(wk, 0, `WAL segment gap in cloud restore: expected ${prevEnd + 1}, found ${s}`);
+        // Overlap (the same range shipped twice, e.g. around a restart) is harmless:
+        // replay skips LSNs it has already seen. A gap is not.
+        if (s > prevEnd + 1) {
+          gap = `WAL segment gap in cloud restore: expected ${prevEnd + 1}, found ${s}`;
         }
+      }
+      if (gap) {
+        if (!opts.allowWalGap) throw new RecoveryCorruptionError(wk, 0, gap);
+        // Opt-in: restore the checkpoint plus the contiguous WAL before the gap
+        // instead of refusing to restore anything. Replaying past a gap could
+        // apply a later write on top of a missing earlier one, so stop here.
+        walGapAtLsn = i === 0 ? replayFrom : prevEnd + 1;
+        this.log.warn(`⚠️  ${gap} — allowWalGap is set: restoring up to LSN ${walGapAtLsn - 1} and ignoring ${walKeys.length - i} later segment(s).`);
+        walKeys.length = i;
+        break;
       }
       prevEnd = Math.max(prevEnd, e);
     }
@@ -1715,6 +1859,7 @@ export class BackupManager {
     }
 
     let segmentsReplayed = 0, lastLsn = baseLsn ?? 0;
+    let replayedThrough = -1;
     const pending = new Map<string, LogEntry[]>();
     const apply = (e: LogEntry) => {
       if (!e.key) return;
@@ -1756,6 +1901,8 @@ export class BackupManager {
 
       let prevRecordLsn = -1;
       for (const e of entries) {
+        if (e.lsn <= replayedThrough) { prevRecordLsn = e.lsn; continue; } // already seen in an overlapping segment
+        replayedThrough = e.lsn;
         if (prevRecordLsn !== -1 && e.lsn <= prevRecordLsn) {
           throw new RecoveryCorruptionError(wk, 0, `Non-monotonic record LSN in cloud WAL segment: expected > ${prevRecordLsn}, got ${e.lsn}`, e.lsn);
         }
@@ -1778,19 +1925,26 @@ export class BackupManager {
           }
         }
         if (effectiveTargetLsn !== undefined && e.lsn > effectiveTargetLsn) continue;
-        if (e.lsn <= (baseLsn ?? 0)) continue;
+        if (e.lsn < replayFrom) continue;
         if (e.operation === 'WRITE' || e.operation === 'DELETE') {
-          if (!e.transactionId) { apply(e); continue; }
+          if (!e.transactionId) { if (e.lsn > (baseLsn ?? -1)) apply(e); continue; }
           if (!pending.has(e.transactionId)) pending.set(e.transactionId, []);
           pending.get(e.transactionId)!.push(e);
         } else if (e.operation === 'COMMIT') {
-          for (const w of pending.get(e.transactionId) ?? []) apply(w);
+          // Visibility is decided by the COMMIT position: transactions committed at
+          // or before baseLsn are already in the checkpoint data (re-applying their
+          // older after-images could roll documents back); later ones are replayed
+          // in full, including WRITE records that precede baseLsn.
+          if (e.lsn > (baseLsn ?? -1)) for (const w of pending.get(e.transactionId) ?? []) apply(w);
           pending.delete(e.transactionId);
         } else if (e.operation === 'ROLLBACK') { pending.delete(e.transactionId); }
       }
       segmentsReplayed++;
     }
-    return { nodeId, docsRestored, segmentsReplayed, baseLsn, lastLsn };
+    // Continue LSN numbering above everything the bucket holds for this node.
+    const highestLsn = Math.max(baseLsn ?? 0, prevEnd, lastLsn, bucketMaxEnd);
+    writeWalSeed(targetDir, highestLsn + 1);
+    return { nodeId, docsRestored, segmentsReplayed, baseLsn, lastLsn: highestLsn, ...(walGapAtLsn !== undefined ? { walGapAtLsn } : {}) };
   }
 }
 
@@ -1805,10 +1959,12 @@ interface ShipperStatus {
 }
 
 interface WalShipperDeps {
-  wal: { getLogEntries(fromLSN?: number): LogEntry[]; getCurrentLSN(): number; listArchives(): string[] };
+  wal: { getLogEntries(fromLSN?: number): LogEntry[]; getCurrentLSN(): number; listArchives(): string[]; getLogPath?(): string };
   upload: (key: string, body: Buffer) => Promise<void>;
   prefix: string;
   intervalMs: number;
+  /** Called when WAL that was never shipped is no longer on disk (the bucket chain has a hole). */
+  onGap?: () => void;
 }
 
 /**
@@ -1882,12 +2038,24 @@ class WalShipper {
     this.shipping = true;
     this.tickCount++;
     try {
-      await this.shipArchives();
-      // All operations (including BEGIN and CHECKPOINT) are shipped to guarantee raw LSN continuity
-      const entries = this.deps.wal.getLogEntries(this.lastLsn + 1);
-      if (entries.length === 0) { this.status.state = 'healthy'; return; }
-      const start = entries[0].lsn, end = entries[entries.length - 1].lsn;
-      const body = gzipSync(Buffer.from(JSON.stringify(entries)), { level: 1 });
+      // Archives hold older LSNs than the active log. If any of them is still
+      // unshipped, shipping the active log now would jump past it and leave a hole.
+      if (!(await this.shipArchives())) return;
+      // All operations (including BEGIN and CHECKPOINT) are shipped to guarantee raw LSN continuity.
+      // Raw lines: "[" + lines + "]" is byte-identical to JSON.stringify(entries).
+      let start: number, end: number, body: Buffer;
+      if (this.deps.wal.getLogPath) {
+        const { lines, firstLsn, lastLsn } = readRawWalLines(this.deps.wal.getLogPath(), this.lastLsn);
+        if (lines.length === 0 || firstLsn === null || lastLsn === null) { this.status.state = 'healthy'; return; }
+        if (this.lastLsn >= 0 && firstLsn > this.lastLsn + 1) this.deps.onGap?.();
+        start = firstLsn; end = lastLsn;
+        body = await gzipAsync(Buffer.from('[' + lines.join(',') + ']'));
+      } else {
+        const entries = this.deps.wal.getLogEntries(this.lastLsn + 1);
+        if (entries.length === 0) { this.status.state = 'healthy'; return; }
+        start = entries[0].lsn; end = entries[entries.length - 1].lsn;
+        body = await gzipAsync(Buffer.from(JSON.stringify(entries)));
+      }
       await this.deps.upload(`${this.deps.prefix}wal/seg-${padLsn(start)}-${padLsn(end)}.json.gz`, body);
       this.lastLsn = end;
       this.status.lastShippedLsn = end; this.status.lastShipAt = Date.now();
@@ -1901,26 +2069,34 @@ class WalShipper {
     }
   }
 
-  private async shipArchives(): Promise<void> {
-    const archives = this.deps.wal.listArchives();
+  /** Ships rotated segments OLDEST FIRST. Returns false when one could not be shipped (nothing newer may go before it). */
+  private async shipArchives(): Promise<boolean> {
+    // listArchives() is newest-first. Shipping in that order advanced lastLsn past
+    // every older segment, which were then marked shipped without being uploaded.
+    const startOf = (p: string) => { const r = basename(p).match(/^\.wal\.seg-(\d+)-(\d+)$/); return r ? parseInt(r[1], 10) : 0; };
+    const archives = this.deps.wal.listArchives().slice().sort((a, b) => startOf(a) - startOf(b));
     for (const p of archives) {
       if (this.shippedArchives.has(p)) continue;
       // Throttle failing archives: retry each failing archive only every 5 ticks.
       const retryAt = this.archiveRetryAt.get(p);
-      if (retryAt !== undefined && this.tickCount < retryAt) continue;
+      if (retryAt !== undefined && this.tickCount < retryAt) return false;
       try {
-        const fresh: LogEntry[] = [];
-        streamLogFile(p, (entry) => {
-          if (entry.lsn > this.lastLsn) {
-            fresh.push(entry);
-          }
-        }, false);
-        if (fresh.length > 0) {
-          const s = fresh[0].lsn, en = fresh[fresh.length - 1].lsn;
-          const body = gzipSync(Buffer.from(JSON.stringify(fresh)), { level: 1 });
-          await this.deps.upload(`${this.deps.prefix}wal/seg-${padLsn(s)}-${padLsn(en)}.json.gz`, body);
-          this.lastLsn = en;
-          this.status.lastShippedLsn = en; this.status.lastShipAt = Date.now();
+        // Segment names carry their LSN range. Fully shipped already → nothing to
+        // read (after a restart this used to re-parse every retained segment).
+        // Otherwise forward the not-yet-shipped raw lines — no parse/re-serialize.
+        const range = basename(p).match(/^\.wal\.seg-(\d+)-(\d+)$/);
+        if (range && parseInt(range[2], 10) <= this.lastLsn) {
+          this.shippedArchives.add(p);
+          this.archiveRetryAt.delete(p);
+          continue;
+        }
+        const { lines, firstLsn, lastLsn } = readRawWalLines(p, this.lastLsn);
+        if (lines.length > 0 && firstLsn !== null && lastLsn !== null) {
+          if (this.lastLsn >= 0 && firstLsn > this.lastLsn + 1) this.deps.onGap?.();
+          const body = await gzipAsync(Buffer.from('[' + lines.join(',') + ']'));
+          await this.deps.upload(`${this.deps.prefix}wal/seg-${padLsn(firstLsn)}-${padLsn(lastLsn)}.json.gz`, body);
+          this.lastLsn = lastLsn;
+          this.status.lastShippedLsn = lastLsn; this.status.lastShipAt = Date.now();
           this.status.segmentsShipped++; this.status.totalBytesShipped += body.length;
         }
         this.shippedArchives.add(p);
@@ -1929,7 +2105,14 @@ class WalShipper {
         this.archiveRetryAt.set(p, this.tickCount + 5);
         this.status.state = 'degraded'; this.status.errorCount++;
         this.status.lastError = `archive:${e instanceof Error ? e.message : e}`;
+        return false;
       }
     }
+    // Bound the bookkeeping to segments that still exist.
+    if (this.shippedArchives.size > archives.length + 64) {
+      const live = new Set(archives);
+      for (const p of this.shippedArchives) if (!live.has(p)) this.shippedArchives.delete(p);
+    }
+    return true;
   }
 }

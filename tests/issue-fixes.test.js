@@ -883,7 +883,35 @@ test('P1: failed local tombstone removal is retried via a dedicated durable queu
   const testDir = resolve('./test_p1_local_tombstone_removal_db');
   rmSync(testDir, { recursive: true, force: true });
 
-  const db = new Tero({ directory: testDir, synchronous: 'full' });
+  // Local tombstones exist only while deletes are mirrored to a bucket. The mock
+  // bucket refuses tombstone PUTs, so the local marker stays in place.
+  const store = new Map();
+  const s3 = {
+    async send(command) {
+      const name = command.constructor.name;
+      const key = command.input.Key;
+      if (name === 'PutObjectCommand') {
+        if (key.endsWith('.deleted')) { const e = new Error('put fail'); e.name = 'InternalError'; throw e; }
+        store.set(key, { lastModified: new Date(), metadata: command.input.Metadata || {} }); return {};
+      }
+      if (name === 'DeleteObjectCommand') { store.delete(key); return {}; }
+      if (name === 'HeadObjectCommand') {
+        const item = store.get(key);
+        if (!item) { const e = new Error('NotFound'); e.name = 'NotFound'; e.$metadata = { httpStatusCode: 404 }; throw e; }
+        return { LastModified: item.lastModified, Metadata: item.metadata, ContentLength: 0 };
+      }
+      if (name === 'GetObjectCommand') { const e = new Error('NoSuchKey'); e.name = 'NoSuchKey'; throw e; }
+      if (name === 'ListObjectsV2Command') return { Contents: [], IsTruncated: false };
+      return {};
+    },
+  };
+  const db = await Tero.create({
+    directory: testDir, synchronous: 'full',
+    hydrateOnStartup: {
+      cloudStorage: { bucket: 'b', region: 'r', accessKeyId: 'k', secretAccessKey: 's', pathPrefix: 'p', dbName: 'db' },
+      mode: 'lazy', customS3Client: s3,
+    },
+  });
   const tombDir = join(testDir, '.tombstones');
   const tombPath = () => join(tombDir, `${createHash('sha256').update('local_removal_doc').digest('hex')}.deleted`);
   const localPendingPath = join(testDir, '.local_tombstone_deletions.json');

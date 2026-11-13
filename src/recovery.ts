@@ -3,6 +3,7 @@ import { createWriteStream, existsSync, mkdirSync, openSync, fsyncSync, closeSyn
 import { join, dirname, resolve as pathResolve } from "path";
 import { pipeline } from "stream/promises";
 import { CloudStorageConfig } from "./backup.js";
+import { buildS3ClientConfig } from "./s3-config.js";
 import { partitionedPath, DataCorruptionError } from "./acid-engine.js";
 
 export const MAX_DOCUMENT_SIZE = 10 * 1024 * 1024; // 10MB limit
@@ -91,21 +92,7 @@ export class DataRecovery {
                 return;
             }
 
-            const clientConfig: any = {
-                region: this.config.cloudStorage.region,
-                credentials: {
-                    accessKeyId: this.config.cloudStorage.accessKeyId,
-                    secretAccessKey: this.config.cloudStorage.secretAccessKey,
-                },
-            };
-
-            // Configure for Cloudflare R2 or custom endpoints
-            if (this.config.cloudStorage.endpoint) {
-                clientConfig.endpoint = this.config.cloudStorage.endpoint;
-                clientConfig.forcePathStyle = true; // Required for R2
-            }
-
-            this.s3Client = new S3Client(clientConfig);
+            this.s3Client = new S3Client(buildS3ClientConfig(this.config.cloudStorage));
         } catch (error) {
             throw new Error(`Failed to initialize cloud storage for recovery: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
         }

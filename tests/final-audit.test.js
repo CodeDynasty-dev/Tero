@@ -67,7 +67,9 @@ async function dbWithCloud(dir, s3) {
 
 test('AUDIT[1] commit succeeds even when post-commit tombstone cleanup fails', async () => {
   const dir = resolve('./audit1_db'); rmSync(dir, { recursive: true, force: true });
-  const db = new Tero({ directory: dir, synchronous: 'full' });
+  // Local tombstones exist only while deletes are mirrored to a bucket; the
+  // failing tombstone PUT keeps the local marker in place for this scenario.
+  const db = await dbWithCloud(dir, mockS3({ putTombstoneFail: true }));
   try {
     await db.create('K', { v: 1 });
     await db.delete('K');                       // write local tombstone
@@ -102,7 +104,9 @@ test('AUDIT[2] recreate clears pending cloud tombstone and removes cloud tombsto
 
 test('AUDIT[3] local tombstone retry removes tombstone even after a commit-buffer flush', async () => {
   const dir = resolve('./audit3_db'); rmSync(dir, { recursive: true, force: true });
-  const db = new Tero({ directory: dir, synchronous: 'full' });
+  // Local tombstones exist only while deletes are mirrored to a bucket; the
+  // failing tombstone PUT keeps the local marker in place for this scenario.
+  const db = await dbWithCloud(dir, mockS3({ putTombstoneFail: true }));
   try {
     await db.create('K', { v: 1 });
     await db.delete('K');

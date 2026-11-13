@@ -46,9 +46,15 @@ const db = new Tero({
 
 await db.create('user1', { name: 'Alice', email: 'alice@example.com' });
 const user = await db.get('user1');
-await db.update('user1', { age: 30 });
+await db.update('user1', { age: 30 });   // deep-merges into the document
+await db.set('user1', { name: 'Alice' }); // replaces it: fields not given are removed
 await db.remove('user1');
 ```
+
+`update()` merges, so it can add or change fields but never remove one. When you
+hold the whole document (read → modify → write), use `set()` — it is an upsert
+that replaces the document exactly. Transactions have `tx.set()` and
+`batchWrite()` accepts `{ key, data, replace: true }`.
 
 ## ACID transactions
 
@@ -231,10 +237,53 @@ const db = new Tero({
   checkpointBatchSize: 5000,// default: 1000, committedBuffer entries flushed per tick
   archiveKeepCount: 50,     // default: 20, rotated 1MB WAL segments kept locally
   fileLock: true,           // default: true, cross-process .lock directory guard
+  durableCheckpointIntervalMs: 30000, // default: 30000; fsync data files + log a durable
+                            // checkpoint so a restart replays only WAL written since
   backup: { ... },          // optional: install a BackupConfig at construction
   hydrateOnStartup: { ... },// optional: v2 hydration before engine init
 });
 ```
+
+### Crash recovery
+
+Recovery is redo-only and starts at the last durable checkpoint (taken every
+`durableCheckpointIntervalMs` and on close), so boot time and memory are bounded
+by one checkpoint interval of writes, not by how long the process ran.
+Uncommitted transactions never reach data files, so nothing is undone.
+
+### Cloud recovery modes
+
+`configureDataRecovery({ ..., mode })`:
+
+- `'lazy'` (default): a missing key is fetched from the bucket on read, and
+  deletes/re-creates are mirrored there with tombstones.
+- `'off'`: the bucket is never touched by `get/create/update/delete` — use it
+  when the local disk is authoritative and restores happen explicitly
+  (`Tero.restoreFromLiveBackup`, `recoverAllFromCloud`) before the database opens.
+
+S3 clients use a 30s request timeout and 5s connect timeout by default
+(`cloudStorage.requestTimeoutMs`, `cloudStorage.connectionTimeoutMs`).
+
+### Live backup cadence and checkpoints
+
+```javascript
+db.enableLiveBackup({
+  consistency: 'interval',    // or 'per-second' (intervalMs ≤ 1000)
+  intervalMs: 5000,           // RPO; one PUT per ship — slower = cheaper
+  checkpointIntervalMs: 900000, // default 15 min, 0 disables
+  initialCheckpointDelayMs: 15000, // default 0: let the app boot before the full upload
+});
+```
+
+The first checkpoint after every start is a FULL one (it re-bases whatever is on
+disk — a restore, history whose WAL was pruned), so a restart never leaves
+documents that exist only in old WAL. Periodic durable checkpoints fsync on the
+libuv thread pool, so they don't block the event loop.
+
+Each checkpoint uploads the documents changed since the last one, records the
+replay floor in `latest.json`, and deletes bucket WAL objects that end before it.
+A point-in-time restore can only go back to the latest checkpoint; asking for an
+earlier moment throws instead of returning newer data.
 
 ### WAL retention and live backup
 

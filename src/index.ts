@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync, renameSync } from "fs";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, unlinkSync, readFileSync, writeFileSync, readdirSync, fsyncSync, renameSync, fstatSync, statSync } from "fs";
 import { resolve as pathResolve, relative as pathRelative, join as pathJoin } from "path";
 import { ACIDStorageEngine, SynchronousMode, partitionedPath, RecoveryCorruptionError, DataCorruptionError, sweepStaleTempFiles } from "./acid-engine.js";
 import { BackupManager, BackupConfig, BackupMetadata, CloudStorageConfig, BucketBackupResult, LiveBackupOptions, LiveBackupStatus, LiveCheckpointResult, RestoreLiveResult, BackupLogger } from "./backup.js";
@@ -18,6 +18,14 @@ const PROCESS_UNIQUE = randomBytes(5);
 let idCounter = ~~(Math.random() * 0xffffff);
 
 const MAX_DOCUMENT_DEPTH = 32;
+
+/** Data directories this process currently holds open (see acquireFileLock). */
+const OPEN_DIRECTORIES = new Map<string, number>(); // directory -> fd of its .lock
+
+/** Changes on every boot of the machine/container; '' where unavailable (non-Linux). */
+function currentBootId(): string {
+  try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch { return ''; }
+}
 const MAX_DOCUMENT_SIZE = 16 * 1024 * 1024; // 16MB max document size limit
 
 /**
@@ -164,9 +172,16 @@ interface TeroConfig {
    * true in production; default false for backwards compatibility.
    */
   fileLock?: boolean;
+  /**
+   * Durable checkpoint cadence (ms). Every interval with new commits, data files are
+   * fsynced and a durable CHECKPOINT is logged, so a restart only replays WAL written
+   * since then — boot time and memory stay bounded no matter how long the process
+   * ran. Default 30000. 0 disables (a checkpoint is still taken on close).
+   */
+  durableCheckpointIntervalMs?: number;
 }
 
-type HydrationMode = 'lazy' | 'eager';
+type HydrationMode = 'lazy' | 'eager' | 'off';
 
 interface HydrateConfig {
   cloudStorage: CloudStorageConfig;
@@ -308,6 +323,7 @@ export class Transaction {
           let hasTomb = false;
           if (typeof dbAny.dataRecovery.hasTombstone === 'function') {
             hasTomb = await dbAny.dataRecovery.hasTombstone(key);
+            if (hasTomb) dbAny.knownCloudTombstones.set(key, true);
           }
           if (!hasTomb) {
             const info = await dbAny.dataRecovery.checkFileInCloud(key);
@@ -336,6 +352,14 @@ export class Transaction {
       }
       throw err;
     }
+  }
+
+  /** Replace the whole document within this transaction (see Tero.set). */
+  async set(key: string, data: any): Promise<void> {
+    this._checkActive();
+    await this.db._writeRaw(this.id, key, data, true);
+    this.opCount++;
+    this.operationsLog.push({ key, operation: 'update' });
   }
 
   async update(key: string, data: any): Promise<void> {
@@ -584,26 +608,14 @@ export class Tero {
       const syncMode: SynchronousMode = synchronous ?? 'full';
       const syncInterval: number = commitIntervalMs ?? 10;
       const dataFlushInterval: number = dataFlushIntervalMs ?? 50;
-      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval, config?.checkpointBatchSize, config?.archiveKeepCount);
+      this.acidEngine = new ACIDStorageEngine(this.teroDirectory, syncMode, syncInterval, dataFlushInterval, config?.checkpointBatchSize, config?.archiveKeepCount, config?.durableCheckpointIntervalMs ?? 30_000);
+      // Dirty-key tracking feeds live-backup checkpoints only; enableLiveBackup()
+      // turns it on. Left on without a consumer it clones every document forever.
+      this.acidEngine.setDirtyTracking(false);
 
-      // Restore durable local tombstones (P0-2) — prevents resurrection after restart even if cloud tombstone not yet durable
-      try {
-        const tombDir = pathJoin(this.teroDirectory, '.tombstones');
-        if (existsSync(tombDir)) {
-          const files = readdirSync(tombDir);
-          for (const f of files) {
-            if (!f.endsWith('.deleted')) continue;
-            try {
-              const content = readFileSync(pathJoin(tombDir, f), 'utf8');
-              const obj = JSON.parse(content);
-              if (obj.key && typeof obj.key === 'string') {
-                this.missingKeys.set(obj.key, true);
-                this.bumpGeneration(obj.key);
-              }
-            } catch { /* approved */ }
-          }
-        }
-      } catch { /* approved */ }
+      // Local tombstones are NOT read at boot any more: hydrateKey() checks
+      // hasLocalTombstone() on demand before any cloud fetch, so resurrection is
+      // still impossible, and boot no longer scales with the number of deletes.
       // v2: optionally install a backup config at construction time.
       if (config?.backup) {
         this.configureBackup(config.backup);
@@ -634,32 +646,11 @@ export class Tero {
       this.loadPendingCloud();
       this.loadPendingCloudDeletions();
       this.loadPendingLocalTombstoneRemovals();
-      // Fallback: reconstruct pending from local tombstones if queue file was lost (ENOSPC case)
-      try {
-        const tombDir = pathJoin(this.teroDirectory, '.tombstones');
-        if (existsSync(tombDir)) {
-          const files = readdirSync(tombDir);
-          for (const f of files) {
-            if (!f.endsWith('.deleted')) continue;
-            try {
-              const content = readFileSync(pathJoin(tombDir, f), 'utf8');
-              const obj = JSON.parse(content);
-              if (obj.key && typeof obj.key === 'string' && typeof obj.lsn === 'number') {
-                if (!this.cloudPendingTombstones.has(obj.key) && !this.cloudPendingTombstoneDeletions.has(obj.key) && !this.pendingLocalTombstoneRemovals.has(obj.key)) {
-                  if (this.dataRecovery) {
-                    this.cloudPendingTombstones.set(obj.key, obj.lsn);
-                  }
-                }
-              }
-            } catch {}
-          }
-          if (this.cloudPendingTombstones.size > 0) {
-            try { this.savePendingCloud(); } catch {}
-          }
-        }
-      } catch {}
+      if (this.cloudReconcileEnabled()) this.requeueTombstonesFromDisk();
       if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0 || this.pendingLocalTombstoneRemovals.size > 0) this.scheduleCloudRetry();
     } catch (error) {
+      // A failed open must not keep the directory locked (in this process or on disk).
+      this.releaseFileLock();
       if (error instanceof RecoveryCorruptionError || error instanceof DataCorruptionError) {
         throw error;
       }
@@ -765,6 +756,7 @@ export class Tero {
             const hasTomb = await (this.dataRecovery as any).hasTombstone(key);
             if (hasTomb) {
               this.missingKeys.set(key, true);
+              this.knownCloudTombstones.set(key, true);
               return null;
             }
           } catch (err: any) {
@@ -868,6 +860,7 @@ export class Tero {
         throw err;
       } finally {
         this.inFlightHydrations.delete(key);
+        this.keyGenerations.delete(key);
       }
     })();
 
@@ -947,7 +940,45 @@ export class Tero {
     }
   }
 
+  /** True when deletes/re-creates must be mirrored to the bucket (lazy/eager hydration). */
+  private cloudReconcileEnabled(): boolean {
+    return !!this.dataRecovery && this.hydrateMode !== 'off';
+  }
+
+  /**
+   * Keys known to have a tombstone in the bucket. A commit only issues the cloud
+   * tombstone DELETE for keys in this set (or with a local tombstone / pending
+   * queue entry) — previously every single commit awaited a DeleteObject.
+   * Bounded; on eviction the bucket's newest-wins rule (document vs tombstone
+   * LastModified) still keeps a later backup authoritative.
+   */
+  private knownCloudTombstones = new QuickLRU<string, true>({ maxSize: 100_000 });
+
+  /** Fallback when the durable queue file was lost (ENOSPC): rebuild it from local tombstones. */
+  private requeueTombstonesFromDisk(): void {
+    try {
+      const tombDir = pathJoin(this.teroDirectory, '.tombstones');
+      if (!existsSync(tombDir)) return;
+      for (const f of readdirSync(tombDir)) {
+        if (!f.endsWith('.deleted')) continue;
+        try {
+          const obj = JSON.parse(readFileSync(pathJoin(tombDir, f), 'utf8'));
+          if (obj.key && typeof obj.key === 'string' && typeof obj.lsn === 'number' &&
+            !this.cloudPendingTombstones.has(obj.key) && !this.cloudPendingTombstoneDeletions.has(obj.key) && !this.pendingLocalTombstoneRemovals.has(obj.key)) {
+            this.cloudPendingTombstones.set(obj.key, obj.lsn);
+          }
+        } catch { /* approved: unreadable tombstone file */ }
+      }
+      if (this.cloudPendingTombstones.size > 0) {
+        try { this.savePendingCloud(); } catch { /* approved */ }
+      }
+    } catch { /* approved */ }
+  }
+
   private bumpGeneration(key: string): number {
+    // Generations only exist to invalidate an in-flight hydration. Tracking them
+    // for every committed key grew this map without bound.
+    if (!this.inFlightHydrations.has(key)) return 0;
     const next = (this.keyGenerations.get(key) ?? 0) + 1;
     this.keyGenerations.set(key, next);
     return next;
@@ -971,8 +1002,12 @@ export class Tero {
   }
 
   private updateCache(key: string, data: any, transactionId?: string): void {
+    // Stored by reference: every value cached here is an engine-owned image that
+    // is never mutated after it is produced (merges build new objects), and every
+    // read path hands out deepClone(entry.data). Cloning here too doubled the
+    // cost of every write.
     this.cache.set(key, {
-      data: deepClone(data),
+      data,
       lastAccessed: Date.now(),
       transactionId
     });
@@ -1006,7 +1041,12 @@ export class Tero {
     return typeof id === 'string' ? id : id.getId();
   }
 
-  async write(transactionId: string | Transaction, key: string, data: any): Promise<void> {
+  /**
+   * Write inside a transaction. Default: deep-merge `data` into the current document.
+   * With `{ replace: true }` the document becomes exactly `data` — the only way to
+   * remove a field (a merge can add and change fields but never drop one).
+   */
+  async write(transactionId: string | Transaction, key: string, data: any, options?: { replace?: boolean }): Promise<void> {
     try {
       const txId = this._txId(transactionId);
       this.validateKey(key);
@@ -1015,28 +1055,36 @@ export class Tero {
         throw new Error('Data cannot be null or undefined');
       }
 
-      data = deepClone(data);
-
+      // replace: the serialization done for the size check doubles as the private
+      // copy (JSON semantics: undefined fields dropped, exactly as stored on disk).
+      // One clone instead of three on the hot path. merge: validated deep clone.
+      let jsonStr: string;
+      if (options?.replace) {
+        jsonStr = JSON.stringify(data);
+      } else {
+        data = deepClone(data);
+        jsonStr = JSON.stringify(data);
+      }
       // Use byte length, not char length — 'é' is 1 char but 2 bytes UTF-8, emoji is 4 bytes
-      const jsonStr = JSON.stringify(data);
       const byteLen = Buffer.byteLength(jsonStr, 'utf8');
       if (byteLen > MAX_DOCUMENT_SIZE) {
         throw new Error(`Document size exceeds maximum allowed size (${MAX_DOCUMENT_SIZE / (1024 * 1024)}MB) — got ${(byteLen / (1024 * 1024)).toFixed(2)}MB`);
       }
+      if (options?.replace) data = JSON.parse(jsonStr);
 
       // Check cache for beforeImage so engine doesn't need disk I/O on hot writes
       const cachedEntry = this.cache.get(key);
       let cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === txId)) ? cachedEntry.data : undefined;
 
       // Lazy hydration: if updating a cold document not on disk, hydrate beforeImage from cloud
-      if (cachedData === undefined && this.dataRecovery && this.hydrateMode === 'lazy' &&
+      if (!options?.replace && cachedData === undefined && this.dataRecovery && this.hydrateMode === 'lazy' &&
           this.acidEngine.getCommittedData(key) === undefined &&
           !existsSync(this.keyToPath(key))) {
         cachedData = (await this.hydrateKey(key)) ?? undefined;
       }
 
       // Engine write — returns void (sync fast path) or Promise (contended lock)
-      const writeResult = this.acidEngine.write(txId, key, data, cachedData);
+      const writeResult = this.acidEngine.write(txId, key, data, cachedData, options?.replace === true, options?.replace ? jsonStr : undefined);
       if (writeResult !== undefined) await writeResult;
 
       // Cache the MERGED afterImage (from pendingWrites), NOT the raw user data.
@@ -1121,14 +1169,18 @@ export class Tero {
         // Bump generation for P0-1 in-flight hydration invalidation and P0-10 stale hydration
         this.bumpGeneration(key);
       }
-      // Post-commit reconciliation — durable but best-effort, never fails the logical commit
-      for (const key of touched) {
+      // Post-commit reconciliation — durable but best-effort, never fails the logical commit.
+      // Only meaningful when deletes are mirrored to a bucket (lazy/eager hydration).
+      for (const key of (this.cloudReconcileEnabled() ? touched : [])) {
         try {
           await this.withReconciliationLock(key, async () => {
             const committed = this.acidEngine.getCommittedData(key);
             if (committed !== undefined) {
               if (committed !== null) {
-                // Write/present — clear tombstones so re-create can succeed and hydration can fetch
+                // Write/present — clear tombstones so re-create can succeed and hydration can fetch.
+                // Only keys that may have a cloud tombstone pay for the DeleteObject below.
+                const mayHaveCloudTombstone = this.hasLocalTombstone(key) || this.knownCloudTombstones.has(key) ||
+                  this.cloudPendingTombstones.has(key) || this.cloudPendingTombstoneDeletions.has(key);
                 try {
                   this.deleteLocalTombstone(key);
                 } catch (e) {
@@ -1146,7 +1198,7 @@ export class Tero {
                   this.cloudPendingTombstones.delete(key);
                   try { this.savePendingCloud(); } catch {}
                 }
-                if (this.dataRecovery) {
+                if (this.dataRecovery && mayHaveCloudTombstone) {
                   // Re-check still present before deleting cloud tombstone
                   const committed2 = this.acidEngine.getCommittedData(key);
                   const hasLocal2 = this.hasLocalTombstone(key);
@@ -1157,6 +1209,7 @@ export class Tero {
                   }
                   try {
                     await (this.dataRecovery as any).deleteTombstone?.(key);
+                    this.knownCloudTombstones.delete(key);
                     if (this.cloudPendingTombstoneDeletions.has(key)) {
                       this.cloudPendingTombstoneDeletions.delete(key);
                       try { this.savePendingCloudDeletions(); } catch {}
@@ -1189,9 +1242,16 @@ export class Tero {
                   try { await this.dataRecovery!.deleteFromCloud(key); } catch { failed = true; }
                   try { await (this.dataRecovery as any).putTombstone?.(key, this.acidEngine!.getLastCommittedLSN()); } catch { failed = true; }
                   if (failed) this.queueCloudTombstone(key, this.acidEngine!.getLastCommittedLSN());
-                  else if (this.cloudPendingTombstones.has(key)) {
-                    this.cloudPendingTombstones.delete(key);
-                    try { this.savePendingCloud(); } catch {}
+                  else {
+                    this.knownCloudTombstones.set(key, true);
+                    if (this.cloudPendingTombstones.has(key)) {
+                      this.cloudPendingTombstones.delete(key);
+                      try { this.savePendingCloud(); } catch {}
+                    }
+                    // The bucket now holds the durable tombstone and no document, so
+                    // hydration cannot resurrect the key: the local marker has done
+                    // its job. Dropping it stops .tombstones growing with every delete.
+                    try { this.deleteLocalTombstone(key); } catch { /* approved: retried on next delete/re-create */ }
                   }
                 }
               }
@@ -1233,9 +1293,10 @@ export class Tero {
                   this.cloudPendingTombstones.delete(key);
                   try { this.savePendingCloud(); } catch {}
                 }
-                if (this.dataRecovery) {
+                if (this.dataRecovery && (this.knownCloudTombstones.has(key) || this.cloudPendingTombstoneDeletions.has(key))) {
                   try {
                     await (this.dataRecovery as any).deleteTombstone?.(key);
+                    this.knownCloudTombstones.delete(key);
                     if (this.cloudPendingTombstoneDeletions.has(key)) {
                       this.cloudPendingTombstoneDeletions.delete(key);
                       try { this.savePendingCloudDeletions(); } catch {}
@@ -1328,6 +1389,7 @@ export class Tero {
             let hasTomb = false;
             if (typeof (this.dataRecovery as any).hasTombstone === 'function') {
               hasTomb = await (this.dataRecovery as any).hasTombstone(key);
+              if (hasTomb) this.knownCloudTombstones.set(key, true);
             }
             if (!hasTomb) {
               const info = await this.dataRecovery.checkFileInCloud(key);
@@ -1355,6 +1417,26 @@ export class Tero {
         throw new Error(`Create failed for key '${key}': ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
       }
     });
+  }
+
+  /**
+   * Upsert that REPLACES the whole document (creates it if absent). Unlike
+   * update(), fields missing from `data` are removed — use this whenever the
+   * caller holds the complete document (read-modify-write).
+   */
+  async set(key: string, data: any): Promise<void> {
+    this.validateKey(key);
+    if (data === undefined || data === null) throw new Error('Data cannot be null or undefined');
+    const transactionId = this._beginTransaction();
+    try {
+      await this.write(transactionId, key, data, { replace: true });
+      await this.commit(transactionId);
+      this.knownKeys.set(key, true);
+      this.missingKeys.delete(key);
+    } catch (error) {
+      await this.rollback(transactionId);
+      throw error;
+    }
   }
 
   async update(key: string, data: any): Promise<void> {
@@ -1955,32 +2037,8 @@ export class Tero {
         await this.commit(transactionId);
         this.knownKeys.delete(key);
         this.missingKeys.set(key, true);
-        this.writeLocalTombstone(key);
-        if (this.dataRecovery && this.hydrateMode === 'lazy') {
-          // Already inside outer reconciliation lock — re-check still deleted before cloud mutation
-          const committed = this.acidEngine.getCommittedData(key);
-          const hasLocal = this.hasLocalTombstone(key);
-          const existsLocal = existsSync(this.keyToPath(key));
-          const stillDeleted = hasLocal || (committed !== undefined && committed === null) || (!existsLocal && committed === undefined);
-          if (!stillDeleted) {
-            this.cloudPendingTombstones.delete(key);
-            this.savePendingCloud();
-            return;
-          }
-          const lsn = this.acidEngine!.getLastCommittedLSN();
-          let failed = false;
-          try {
-            await this.dataRecovery!.deleteFromCloud(key);
-          } catch { failed = true; }
-          try {
-            await (this.dataRecovery as any).putTombstone(key, lsn);
-          } catch { failed = true; }
-          if (failed) this.queueCloudTombstone(key, lsn);
-          else if (this.cloudPendingTombstones.has(key)) {
-            this.cloudPendingTombstones.delete(key);
-            this.savePendingCloud();
-          }
-        }
+        // Cloud mirroring (local tombstone, bucket delete + tombstone, retry queue)
+        // happens once, inside commit(). It used to run a second time here.
       } catch (error) {
         try { await this.rollback(transactionId); } catch {}
         throw error;
@@ -2010,12 +2068,12 @@ export class Tero {
   }
 
   // Batch Operations
-  async batchWrite(operations: Array<{ key: string; data: any }>): Promise<void> {
+  async batchWrite(operations: Array<{ key: string; data: any; replace?: boolean }>): Promise<void> {
     const transactionId = this._beginTransaction();
 
     try {
       for (const op of operations) {
-        await this.write(transactionId, op.key, op.data);
+        await this.write(transactionId, op.key, op.data, { replace: op.replace === true });
       }
       await this.commit(transactionId);
       // Register all written keys in knownKeys so future exists() calls are O(1)
@@ -2100,10 +2158,13 @@ export class Tero {
   }
 
   // Internal raw methods for Transaction class
-  async _writeRaw(transactionId: string, key: string, data: any): Promise<void> {
+  async _writeRaw(transactionId: string, key: string, data: any, replace = false): Promise<void> {
     const cachedEntry = this.cache.get(key);
     const cachedData = (cachedEntry && (!cachedEntry.transactionId || cachedEntry.transactionId === transactionId)) ? cachedEntry.data : undefined;
-    const result = this.acidEngine.write(transactionId, key, data, cachedData);
+    // Engine replace adopts the object it is given — pass a private JSON copy.
+    const json = replace ? JSON.stringify(data) : undefined;
+    if (replace) data = JSON.parse(json!);
+    const result = this.acidEngine.write(transactionId, key, data, cachedData, replace, json);
     if (result !== undefined) await result;
     // Cache the MERGED afterImage, not the raw caller input. The engine
     // deep-merges partial updates with existing state, so caching `data`
@@ -2335,9 +2396,19 @@ export class Tero {
   // Data Recovery
   // ---------------------------------------------------------------------------
 
-  configureDataRecovery(config: RecoveryConfig): void {
+  configureDataRecovery(config: RecoveryConfig & { mode?: 'lazy' | 'off' }): void {
     try {
       this.dataRecovery = new DataRecovery(config);
+      // mode 'off': keep explicit recovery APIs (recoverFromCloud, recoverAllFromCloud…)
+      // but never touch the bucket from get/create/update/delete. Use it when the
+      // local disk is authoritative and restores happen explicitly at boot — it
+      // keeps the bucket off the request path entirely.
+      if (config.mode === 'off') this.hydrateMode = 'off';
+      else if (this.hydrateMode === 'off') this.hydrateMode = 'lazy';
+      if (this.cloudReconcileEnabled()) {
+        this.requeueTombstonesFromDisk();
+        if (this.cloudPendingTombstones.size > 0 || this.cloudPendingTombstoneDeletions.size > 0 || this.pendingLocalTombstoneRemovals.size > 0) this.scheduleCloudRetry();
+      }
     } catch (error) {
       throw new Error(`Failed to configure data recovery: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
     }
@@ -2594,58 +2665,89 @@ export class Tero {
    */
   private acquireFileLock(): void {
     const lockPath = `${this.teroDirectory}/.lock`;
+    const dir = this.teroDirectory;
+    const heldFd = OPEN_DIRECTORIES.get(dir);
+    if (heldFd !== undefined) {
+      // Still ours only if the lock file on disk is the one that fd points at. If the
+      // directory was wiped or restored underneath a leaked instance, the entry is dead.
+      let same = false;
+      try { const a = fstatSync(heldFd); const b = statSync(lockPath); same = a.ino === b.ino && a.dev === b.dev; } catch { same = false; }
+      if (!same) {
+        OPEN_DIRECTORIES.delete(dir);
+        try { closeSync(heldFd); } catch { /* already closed */ }
+      }
+    }
+    if (OPEN_DIRECTORIES.has(dir)) {
+      throw new Error(`Another Tero instance in THIS process is already using '${dir}'. ` +
+        'Destroy the existing instance before constructing a new one.');
+    }
+    const bootId = currentBootId();
     const tryAcquire = (): boolean => {
+      let fd: number;
       try {
-        this.lockFd = openSync(lockPath, 'wx'); // exclusive create — fails if exists
-        writeSync(this.lockFd, String(process.pid));
-        return true;
+        fd = openSync(lockPath, 'wx'); // exclusive create — fails if exists
       } catch {
         return false;
       }
+      try { writeSync(fd, `${process.pid}\n${bootId}`); } catch { /* an empty lock is reclaimed as stale */ }
+      this.lockFd = fd;
+      OPEN_DIRECTORIES.set(dir, fd);
+      return true;
     };
     if (tryAcquire()) return;
-
-    // Retry loop with bounded attempts for TOCTOU races during stale-lock reclamation
+    // The lock exists. It is stale when its holder cannot be alive:
+    //  - it was written during a different boot of this machine/container, or
+    //  - it names OUR pid but this process has no open instance on the directory
+    //    (containers hand the app the same pid on every start, so after a crash
+    //    the leftover lock always "belongs" to the new process), or
+    //  - the pid it names no longer exists, or
+    //  - it is empty/garbled (holder died between creating and writing it).
     for (let attempt = 0; attempt < 3; attempt++) {
-      let pid = '?';
-      if (existsSync(lockPath)) {
-        try { pid = readFileSync(lockPath, 'utf-8').trim(); } catch { /* unreadable */ }
-      }
-      const pidNum = parseInt(pid, 10);
-      if (Number.isInteger(pidNum) && pidNum > 0 && pidNum !== process.pid) {
+      let raw = '';
+      try { raw = readFileSync(lockPath, 'utf-8'); } catch { /* vanished or unreadable */ }
+      const [pidStr = '', lockBoot = ''] = raw.trim().split('\n');
+      const pidNum = parseInt(pidStr, 10);
+      let stale: boolean;
+      if (!Number.isInteger(pidNum) || pidNum <= 0) {
+        stale = attempt > 0; // give a holder that is mid-write one retry
+      } else if (lockBoot && bootId && lockBoot.trim() !== bootId) {
+        stale = true;
+      } else if (pidNum === process.pid) {
+        stale = true;
+      } else {
         let alive = true;
         try { process.kill(pidNum, 0); } catch (e: any) {
-          // ESRCH = no such process → stale lock from a crashed holder.
-          // EPERM = process exists but is owned by another user → treat as alive.
+          // ESRCH = no such process. EPERM = exists, owned by another user → alive.
           alive = e?.code === 'EPERM';
         }
-        if (!alive) {
-          // Reclaim the stale lock (crashed previous owner) and retry once.
-          try { unlinkSync(lockPath); } catch { /* racing holder */ }
-          if (tryAcquire()) return;
-          continue;
-        }
         if (alive) {
-          throw new Error(`Data directory '${this.teroDirectory}' is locked by live process ${pidNum}. ` +
+          throw new Error(`Data directory '${dir}' is locked by live process ${pidNum}. ` +
             'Stop that process (or use a different directory) and retry.');
         }
+        stale = true;
       }
-      if (pid === String(process.pid)) {
-        throw new Error(`Another Tero instance in THIS process is already using '${this.teroDirectory}'. ` +
-          'Destroy the existing instance before constructing a new one.');
+      if (stale) {
+        try { unlinkSync(lockPath); } catch { /* racing holder */ }
       }
       if (tryAcquire()) return;
     }
-    throw new Error(`Data directory '${this.teroDirectory}' is locked. ` +
+    throw new Error(`Data directory '${dir}' is locked. ` +
       `If the holder crashed, delete '${lockPath}' and retry.`);
   }
 
   private releaseFileLock(): void {
     if (this.lockFd == null) return;
+    const lockPath = `${this.teroDirectory}/.lock`;
+    if (OPEN_DIRECTORIES.get(this.teroDirectory) === this.lockFd) OPEN_DIRECTORIES.delete(this.teroDirectory);
     try {
+      // Only remove the lock file if it is still ours (the directory may have been
+      // replaced and re-opened by a newer instance).
+      let ours = true;
+      try { const a = fstatSync(this.lockFd); const b = statSync(lockPath); ours = a.ino === b.ino && a.dev === b.dev; } catch { ours = false; }
       closeSync(this.lockFd);
-      unlinkSync(`${this.teroDirectory}/.lock`);
+      if (ours) unlinkSync(lockPath);
     } catch { /* best-effort */ }
+    this.lockFd = undefined;
   }
 
   // Cleanup methods

@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, readSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, lstatSync, openSync, closeSync, fsyncSync, renameSync, rmSync, type Dirent } from "fs";
+import { open as openCb, fsync as fsyncCb, close as closeCb } from 'fs';
+import { existsSync, readFileSync, readSync, writeSync, appendFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync, lstatSync, openSync, closeSync, fsyncSync, renameSync, rmSync, type Dirent } from "fs";
 import { join, dirname } from "path";
 import { randomBytes } from "crypto";
 import { StringDecoder } from "string_decoder";
@@ -95,6 +96,12 @@ export interface LogEntry {
     key?: string;
     beforeImage?: JsonValue; // For rollback
     afterImage?: JsonValue;  // For redo
+    /** CHECKPOINT only: every commit with lsn <= this record is durably on the data files. */
+    durable?: boolean;
+    /** CHECKPOINT only: last commit LSN captured BEFORE the data files were synced. Commits above it are redone on recovery even when they sit below this record's own LSN (they landed while the checkpoint was in flight). */
+    durableLsn?: number;
+    /** CHECKPOINT only: oldest LSN a transaction committing after this checkpoint may have written at. */
+    floorLsn?: number;
     timestamp: number;
     checksum: string;  // 64-bit dual-FNV hex (16 chars). 32-bit hash collisions
     // become likely at ~50k WAL entries (birthday paradox);
@@ -120,6 +127,52 @@ function fnv1a64(str: string): string {
     }
     // Combine into 16-char hex (two 32-bit halves)
     return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Start a fresh WAL whose numbering continues at `lsn` (used after a restore).
+ * The single record is a durable CHECKPOINT: the restored data files are the
+ * complete state, so recovery replays nothing, and every LSN the engine issues
+ * from here on is above anything already in the bucket — a new session can never
+ * ship WAL objects that collide with history.
+ */
+export function writeWalSeed(dbPath: string, lsn: number): void {
+    const entry = { operation: 'CHECKPOINT', transactionId: 'SYSTEM', durable: true, floorLsn: lsn, lsn, timestamp: Date.now() };
+    const json = JSON.stringify(entry);
+    const line = json.slice(0, -1) + ',"checksum":"' + fnv1a64(json) + '"}\n';
+    const walPath = join(dbPath, '.wal');
+    mkdirSync(dbPath, { recursive: true });
+    const fd = openSync(walPath, 'w');
+    try { writeSync(fd, line); fsyncSync(fd); } finally { closeSync(fd); }
+    const dfd = openSync(dbPath, 'r');
+    try { fsyncSync(dfd); } finally { closeSync(dfd); }
+}
+
+/**
+ * Raw WAL lines with LSN > afterLsn, without parsing records. A record's own LSN is
+ * the last `"lsn":` field in its line (it is serialized after the document), so
+ * the document's content can never be mistaken for it. A trailing line without a
+ * newline (a write in progress) is left for the next read. Checksums are not
+ * verified here; whoever replays the lines (restore) verifies every record.
+ */
+export function readRawWalLines(path: string, afterLsn: number): { lines: string[]; firstLsn: number | null; lastLsn: number | null } {
+    let text: string;
+    try { text = readFileSync(path, 'utf8'); } catch (err: any) { if (err?.code === 'ENOENT') return { lines: [], firstLsn: null, lastLsn: null }; throw err; }
+    const parts = text.split('\n');
+    parts.pop(); // '' after the final newline, or an unterminated tail
+    const lines: string[] = [];
+    let firstLsn: number | null = null, lastLsn: number | null = null;
+    for (const line of parts) {
+        if (!line) continue;
+        const at = line.lastIndexOf('"lsn":');
+        if (at < 0) throw new RecoveryCorruptionError(path, 0, 'WAL record without an lsn field');
+        const lsn = parseInt(line.slice(at + 6), 10);
+        if (!(lsn > afterLsn)) continue;
+        if (firstLsn === null) firstLsn = lsn;
+        lastLsn = lsn;
+        lines.push(line);
+    }
+    return { lines, firstLsn, lastLsn };
 }
 
 export function streamLogFile(filePath: string, visitor: (entry: LogEntry) => void, allowTornTail = true): { firstLsn: number | null; lastLsn: number | null; count: number } {
@@ -346,12 +399,24 @@ export class WriteAheadLog {
      * trading a small RPO window (commitIntervalMs, default 10ms) for 10–100x
      * throughput. This is the same knob SQLite exposes as `PRAGMA synchronous=NORMAL`.
      */
+    private groupFsyncInFlight = false;
     private startGroupCommitTimer(): void {
         this.groupCommitTimer = setInterval(() => {
-            if (this.dirty) {
-                this.flushBuffer(); // write all buffered entries to disk in one appendFileSync
-                this.fsyncFile(this.logPath); // then fsync once for all of them
+            if (this.dirty && !this.groupFsyncInFlight) {
+                // A throw here (disk full, I/O error) would be an uncaught exception in a
+                // timer and kill the process. Keep the buffer and retry on the next tick.
+                try { this.flushBuffer(); } catch { return; }
                 this.dirty = false;
+                // fsync on the libuv thread pool: a synchronous fsync every 10ms
+                // under steady writes held the event loop for the disk's latency
+                // each time. The RPO is unchanged (interval + one fsync); explicit
+                // barriers (forceFlush, rotation, checkpoints) stay synchronous.
+                this.groupFsyncInFlight = true;
+                const done = () => { this.groupFsyncInFlight = false; };
+                openCb(this.logPath, 'r', (err, fd) => {
+                    if (err) { done(); return; }
+                    fsyncCb(fd, () => closeCb(fd, done));
+                });
             }
         }, this.commitIntervalMs);
         if (this.groupCommitTimer.unref) this.groupCommitTimer.unref();
@@ -370,7 +435,10 @@ export class WriteAheadLog {
             const files = readdirSync(dir).filter(f => f.startsWith('.wal.seg-'));
             if (files.length > 0) {
                 const segPaths = files.map(f => join(dir, f));
-                const verified = verifyWalSegmentContinuity(segPaths, true);
+                // Continuity from segment names only. Re-reading and checksumming every
+                // retained segment on each open dominated boot time; records are still
+                // verified when recovery or restore actually reads them.
+                const verified = verifyWalSegmentContinuity(segPaths, false);
                 if (verified.length > 0) {
                     const lastSeg = verified[verified.length - 1];
                     let activeFirstLsn: number | null = null;
@@ -379,6 +447,7 @@ export class WriteAheadLog {
                         if (activeFirstLsn === null) activeFirstLsn = entry.lsn;
                         if (entry.lsn > activeMaxLsn) activeMaxLsn = entry.lsn;
                     });
+                    this.activeFirstLsn = activeFirstLsn;
                     if (activeFirstLsn !== null) {
                         if (activeFirstLsn !== lastSeg.endLsn + 1) {
                             throw new RecoveryCorruptionError(
@@ -400,11 +469,19 @@ export class WriteAheadLog {
         let maxLSN = 0;
         let hasEntries = false;
         this.streamLogEntries((entry) => {
+            if (!hasEntries) this.activeFirstLsn = entry.lsn;
             hasEntries = true;
             if (entry.lsn > maxLSN) maxLSN = entry.lsn;
         });
         this.currentLSN = hasEntries ? maxLSN + 1 : 0;
     }
+
+    /**
+     * LSN of the first record in the active log (null while it is empty). Tracked
+     * in memory so rotation doesn't have to re-read and re-checksum the whole
+     * file — at high write rates that re-read cost as much as the writes.
+     */
+    private activeFirstLsn: number | null = null;
 
     /**
      * Stream WAL entries from disk line-by-line without loading the entire file
@@ -420,6 +497,33 @@ export class WriteAheadLog {
      */
     streamLogEntries(visitor: (entry: LogEntry) => void): void {
         streamLogFile(this.logPath, visitor, true);
+    }
+
+    /**
+     * The newest durable CHECKPOINT, searching newest file first and stopping at the
+     * first file that has one — older segments are never read.
+     */
+    findLastDurableCheckpoint(): { lsn: number; floorLsn: number } | null {
+        const files = [this.logPath, ...this.listSegments().reverse().map((seg) => seg.path)];
+        for (const path of files) {
+            if (!existsSync(path)) continue;
+            let found: { lsn: number; floorLsn: number } | null = null;
+            streamLogFile(path, (entry) => {
+                if (entry.operation === 'CHECKPOINT' && entry.durable === true) {
+                    found = { lsn: typeof entry.durableLsn === 'number' ? entry.durableLsn : entry.lsn, floorLsn: typeof entry.floorLsn === 'number' ? entry.floorLsn : entry.lsn };
+                }
+            }, path === this.logPath);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    /** Stream entries from the segments that can contain LSN >= minLsn, then the active log. */
+    streamSince(minLsn: number, visitor: (entry: LogEntry) => void): void {
+        for (const seg of this.listSegments()) {
+            if (seg.endLsn >= minLsn) streamLogFile(seg.path, visitor, false);
+        }
+        this.streamLogEntries(visitor);
     }
 
     streamAllLogEntries(visitor: (entry: LogEntry) => void): void {
@@ -453,17 +557,25 @@ export class WriteAheadLog {
      * This eliminates per-entry syscalls: a transaction with N writes does 1
      * appendFileSync (of all N+2 entries) instead of N+2 separate appends.
      */
-    writeLog(entry: Omit<LogEntry, 'lsn' | 'checksum' | 'timestamp'>): number {
+    /**
+     * @param afterImageJson  JSON.stringify(entry.afterImage), when the caller already
+     *   has it: the record is then assembled around it instead of serializing the
+     *   document again. The text is byte-identical to JSON.stringify(record), so
+     *   checksums verify exactly as before.
+     */
+    writeLog(entry: Omit<LogEntry, 'lsn' | 'checksum' | 'timestamp'>, afterImageJson?: string): number {
         const lsn = this.currentLSN++;
-        const entryWithoutChecksum = {
-            ...entry,
-            lsn,
-            timestamp: Date.now()
-        };
-
-        // Single JSON.stringify — compute the checksum from the same string we
-        // push to the buffer, then append the checksum field by string concat.
-        const jsonNoChecksum = JSON.stringify(entryWithoutChecksum);
+        if (this.activeFirstLsn === null) this.activeFirstLsn = lsn;
+        const timestamp = Date.now();
+        let jsonNoChecksum: string;
+        if (afterImageJson !== undefined && entry.afterImage !== undefined) {
+            const { afterImage: _omit, ...head } = entry;
+            jsonNoChecksum = JSON.stringify(head).slice(0, -1) + ',"afterImage":' + afterImageJson + ',"lsn":' + lsn + ',"timestamp":' + timestamp + '}';
+        } else {
+            // Single JSON.stringify — compute the checksum from the same string we
+            // push to the buffer, then append the checksum field by string concat.
+            jsonNoChecksum = JSON.stringify({ ...entry, lsn, timestamp });
+        }
         const checksum = fnv1a64(jsonNoChecksum);
         // 16-char hex checksum inserted before the closing brace
         const line = jsonNoChecksum.slice(0, -1) + ',"checksum":"' + checksum + '"}';
@@ -536,13 +648,16 @@ export class WriteAheadLog {
         const stats = statSync(this.logPath);
         if (stats.size === 0) return null;
 
-        // Determine first and last record LSN in the WAL
-        let firstLsn: number | null = null;
-        let lastLsn: number | null = null;
-        this.streamLogEntries((entry) => {
-            if (firstLsn === null) firstLsn = entry.lsn;
-            lastLsn = entry.lsn;
-        });
+        // First and last record LSN in the WAL: known in memory (everything buffered
+        // was just flushed); fall back to reading the file only if not tracked.
+        let firstLsn: number | null = this.activeFirstLsn;
+        let lastLsn: number | null = firstLsn === null ? null : this.currentLSN - 1;
+        if (firstLsn === null) {
+            this.streamLogEntries((entry) => {
+                if (firstLsn === null) firstLsn = entry.lsn;
+                lastLsn = entry.lsn;
+            });
+        }
 
         if (firstLsn === null || lastLsn === null) {
             return null;
@@ -557,6 +672,7 @@ export class WriteAheadLog {
         this.fsyncDir(dir);
 
         // 2. Start fresh empty log
+        this.activeFirstLsn = null;
         writeFileSync(this.logPath, '');
         this.fsyncFile(this.logPath);
         this.fsyncDir(dir);
@@ -619,6 +735,16 @@ export class WriteAheadLog {
     }
 
     /**
+     * Oldest LSN crash recovery still needs (the last durable checkpoint's replay
+     * floor). Segments ending at or after it are never pruned by the keep count:
+     * dropping one would lose commits whose data files are not fsynced yet.
+     */
+    private recoveryFloor: number | null = null;
+    setRecoveryFloor(lsn: number | null): void {
+        this.recoveryFloor = lsn;
+    }
+
+    /**
      * Retain the newest `keepCount` segments and delete the rest, oldest first —
      * except any segment the archive protector still considers unshipped, which
      * is deferred as long as the protect byte budget allows.
@@ -639,6 +765,9 @@ export class WriteAheadLog {
         let overflowDiscarded = 0;
 
         for (const segment of surplus) {
+            if (!options.force && this.recoveryFloor !== null && segment.endLsn >= this.recoveryFloor) {
+                continue; // still needed by local crash recovery
+            }
             if (protect && protect(segment.endLsn)) {
                 const size = this.segmentSize(segment.path);
                 if (deferredBytes + size <= this.archiveProtectMaxBytes) {
@@ -699,6 +828,11 @@ export class WriteAheadLog {
         this.dirty = false;
     }
 
+    /** Path of the active log file (for raw readers such as the live shipper). */
+    getLogPath(): string {
+        return this.logPath;
+    }
+
     getCurrentLSN(): number {
         return this.currentLSN - 1;
     }
@@ -714,6 +848,7 @@ export class WriteAheadLog {
             throw new Error('Cannot truncate WAL: unflushed entries in write buffer');
         }
         writeFileSync(this.logPath, '');
+        this.activeFirstLsn = null;
         this.fsyncFile(this.logPath);
         this.fsyncDir(dirname(this.logPath));
         this.dirty = false;
@@ -1443,7 +1578,7 @@ export class ACIDStorageEngine {
      * In-memory pending-writes index per active transaction.
      * Keyed by transactionId -> key -> { beforeImage, afterImage, op }
      */
-    private pendingWrites: Map<string, Map<string, { beforeImage: JsonValue; afterImage: JsonValue; op: 'write' | 'delete' }>> = new Map();
+    private pendingWrites: Map<string, Map<string, { beforeImage: JsonValue; afterImage: JsonValue; op: 'write' | 'delete'; json?: string; beforeUnknown?: boolean }>> = new Map();
 
     /**
      * Compaction cadence: every COMMIT_INTERVAL commits, if there are no active
@@ -1461,7 +1596,7 @@ export class ACIDStorageEngine {
      * of being written to data files immediately. A background timer flushes this
      * to disk every `dataFlushIntervalMs` (default 50ms).
      */
-    private committedBuffer: Map<string, { data: JsonValue; op: 'write' | 'delete' }> = new Map();
+    private committedBuffer: Map<string, { data: JsonValue; op: 'write' | 'delete'; json?: string }> = new Map();
     private dataFlushTimer?: ReturnType<typeof setInterval>;
     private readonly DATA_FLUSH_INTERVAL_MS: number;
 
@@ -1470,6 +1605,22 @@ export class ACIDStorageEngine {
      * Every committed write/delete stores its immutable DirtyEntry here with commit LSN.
      */
     private dirtyKeys: Map<string, DirtyEntry> = new Map();
+    /**
+     * Dirty-key tracking is only needed while a consumer (live backup) acknowledges
+     * entries. Without one, every committed document would be cloned into this map
+     * forever — an unbounded copy of the whole working set. The engine tracks by
+     * default (standalone snapshots rely on it); Tero turns it off unless live
+     * backup is enabled.
+     */
+    private trackDirty = true;
+    /** Data files written without fsync (normal mode) since the last durable checkpoint. */
+    private unsyncedFiles: Set<string> = new Set();
+    private unsyncedDirs: Set<string> = new Set();
+    /** Last durable checkpoint: commits <= lsn are on disk; replay starts at floorLsn. */
+    private durableCheckpoint: { lsn: number; floorLsn: number } | null = null;
+    private commitsSinceDurableCheckpoint = 0;
+    private recoveredCommits = 0;
+    private durableCheckpointTimer?: ReturnType<typeof setInterval>;
     private activeSnapshotLsn: number | null = null;
     private snapshotBeforeImages: Map<string, { state: 'present' | 'deleted'; data?: JsonValue }> = new Map();
     private lastCommittedLSN: number = 0;
@@ -1488,7 +1639,7 @@ export class ACIDStorageEngine {
         return this.lastCommittedLSN;
     }
 
-    peekDirtyKeys(upToLsn?: number): Map<string, DirtyEntry> {
+    peekDirtyKeys(upToLsn?: number, clone: boolean = true): Map<string, DirtyEntry> {
         const threshold = upToLsn !== undefined ? upToLsn : Infinity;
         const snapshot = new Map<string, DirtyEntry>();
         for (const [key, entry] of this.dirtyKeys) {
@@ -1497,7 +1648,7 @@ export class ACIDStorageEngine {
                     key: entry.key,
                     lsn: entry.lsn,
                     state: entry.state,
-                    data: entry.data !== undefined ? cloneJson(entry.data) : undefined
+                    data: entry.data !== undefined ? (clone ? cloneJson(entry.data) : entry.data) : undefined
                 });
             }
         }
@@ -1517,15 +1668,51 @@ export class ACIDStorageEngine {
         return this.dirtyKeys.size;
     }
 
+    /** Enable/disable dirty-key tracking. Disabling drops everything tracked so far. */
+    setDirtyTracking(enabled: boolean): void {
+        this.trackDirty = enabled;
+        if (!enabled) this.dirtyKeys.clear();
+    }
+
+    isDirtyTrackingEnabled(): boolean {
+        return this.trackDirty;
+    }
+
+    /**
+     * Oldest LSN any transaction that has not committed yet may have written at.
+     * A checkpoint (local or cloud) taken now must keep WAL from this LSN onward:
+     * a transaction that BEGAN before the checkpoint and COMMITS after it has its
+     * WRITE records below the checkpoint LSN.
+     */
+    getReplayFloorLsn(): number {
+        let floor = this.lastCommittedLSN + 1;
+        for (const tx of this.activeTransactions.values()) {
+            if (tx.status === 'active' && tx.startLSN < floor) floor = tx.startLSN;
+        }
+        return floor;
+    }
+
+    getDurableCheckpoint(): { lsn: number; floorLsn: number } | null {
+        return this.durableCheckpoint;
+    }
+
     /**
      * Creates an isolated logical snapshot handle as of upToLsn.
      * Enforces single-active-snapshot invariant and provides explicit close().
      */
-    beginSnapshot(upToLsn: number): SnapshotHandle {
+    beginSnapshot(upToLsn: number, preCapturedDirty?: Map<string, DirtyEntry>): SnapshotHandle {
         if (this.activeSnapshotLsn !== null) {
             throw new Error(`Cannot begin concurrent snapshot at LSN ${upToLsn}: active snapshot already in progress at LSN ${this.activeSnapshotLsn}`);
         }
-        const dirtySnapshot = this.peekDirtyKeys(upToLsn);
+        if (!this.trackDirty) {
+            // Without dirty tracking the snapshot reads committed state from the data
+            // files, so they must hold exactly the commits up to upToLsn.
+            if (upToLsn !== this.lastCommittedLSN) {
+                throw new Error(`Cannot snapshot at LSN ${upToLsn}: dirty tracking is off, so only the current LSN (${this.lastCommittedLSN}) can be snapshotted`);
+            }
+            this.flushCommittedBuffer(true);
+        }
+        const dirtySnapshot = preCapturedDirty ?? this.peekDirtyKeys(upToLsn);
         this.activeSnapshotLsn = upToLsn;
         this.snapshotBeforeImages.clear();
 
@@ -1655,7 +1842,7 @@ export class ACIDStorageEngine {
     private synchronous: SynchronousMode;
     private checkpointBatchSize: number;
 
-    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50, checkpointBatchSize: number = 1000, archiveKeepCount?: number) {
+    constructor(dbPath: string, synchronous: SynchronousMode = 'full', commitIntervalMs: number = 10, dataFlushIntervalMs: number = 50, checkpointBatchSize: number = 1000, archiveKeepCount?: number, durableCheckpointIntervalMs: number = 30_000) {
         this.dbPath = dbPath;
         // Startup ordering: restore-marker recovery -> filesystem validation -> WAL recovery
         recoverPendingRestore(this.dbPath);
@@ -1665,9 +1852,28 @@ export class ACIDStorageEngine {
         this.wal = new WriteAheadLog(dbPath, synchronous, commitIntervalMs, { archiveKeepCount });
         this.lockManager = new LockManager();
         this.initializeStorage();
+        if (this.recoveredCommits > 0) {
+            // Make the replayed state durable right away so the next boot starts
+            // from here instead of replaying the same WAL again.
+            this.forceCheckpoint();
+        } else if (this.durableCheckpoint) {
+            this.wal.setRecoveryFloor(this.durableCheckpoint.floorLsn);
+        }
         // Background data-file checkpoint timer — flushes committedBuffer to disk
         this.dataFlushTimer = setInterval(() => this.flushCommittedBuffer(), this.DATA_FLUSH_INTERVAL_MS);
         if (this.dataFlushTimer.unref) this.dataFlushTimer.unref();
+        // Periodic durable checkpoint: bounds how much WAL a restart has to replay
+        // (boot time and memory) to roughly one interval of writes.
+        if (durableCheckpointIntervalMs > 0) {
+            this.durableCheckpointTimer = setInterval(() => {
+                if (this.commitsSinceDurableCheckpoint === 0) return;
+                this.forceCheckpointAsync().catch((err: any) => {
+                    this.degraded = true;
+                    this.lastMaintenanceError = err instanceof Error ? err : new Error(String(err));
+                });
+            }, durableCheckpointIntervalMs);
+            this.durableCheckpointTimer.unref?.();
+        }
     }
 
     private fsyncFile(path: string): void {
@@ -1709,62 +1915,45 @@ export class ACIDStorageEngine {
         this.performCrashRecovery();
     }
 
+    /**
+     * Redo-only crash recovery, bounded by the last durable checkpoint.
+     *
+     * Data files only ever receive COMMITTED after-images (writes are deferred to
+     * committedBuffer until commit), so there is nothing to undo: an uncommitted
+     * transaction never touched a data file. (Earlier versions "undid" such
+     * transactions by writing their before-image — on every boot, after redo —
+     * which rolled newer commits back to stale data.)
+     *
+     * The last durable CHECKPOINT is found newest-file-first. Only segments that
+     * reach its replay floor are read: one pass collects transactions committed
+     * after the checkpoint, a second re-applies just their records in WAL order,
+     * streaming — nothing but transaction ids is held in memory.
+     */
     private performCrashRecovery(): void {
-        const committedTransactions = new Set<string>();
-        const abortedTransactions = new Set<string>();
+        const ckpt = this.wal.findLastDurableCheckpoint();
+        const ckptLsn = ckpt ? ckpt.lsn : -1;
+        const floorLsn = ckpt ? ckpt.floorLsn : 0;
+        if (ckpt) this.durableCheckpoint = ckpt;
+        // Everything up to a durable checkpoint is committed state; never report an
+        // older position (a restored database starts at a seeded checkpoint LSN).
+        if (ckptLsn > this.lastCommittedLSN) this.lastCommittedLSN = ckptLsn;
 
-        // Single pass over the WAL: build the commit/abort sets AND buffer the
-        // write/delete records needed for redo/undo. Streaming the log only once
-        // (instead of once per phase) avoids re-reading, re-parsing, and
-        // re-checksumming every segment for each phase. Safe because redo runs
-        // in strict WAL order and undo runs reverse-LSN — both are preserved by
-        // replaying the buffered records in memory.
-        const replay: LogEntry[] = [];
-        this.wal.streamAllLogEntries((entry) => {
-            if (entry.operation === 'COMMIT') {
-                committedTransactions.add(entry.transactionId);
-                if (entry.lsn > this.lastCommittedLSN) {
-                    this.lastCommittedLSN = entry.lsn;
-                }
-                return;
-            }
-            if (entry.operation === 'ROLLBACK') {
-                abortedTransactions.add(entry.transactionId);
-                return;
-            }
-            // Keep only data records (BEGIN/CHECKPOINT, etc. aren't needed for
-            // redo/undo).
-            if (entry.operation === 'WRITE' || entry.operation === 'DELETE') {
-                replay.push(entry);
-            }
+        const toRedo = new Set<string>();
+        this.recoveredCommits = 0;
+        this.wal.streamSince(floorLsn, (entry) => {
+            if (entry.operation !== 'COMMIT') return;
+            if (entry.lsn > this.lastCommittedLSN) this.lastCommittedLSN = entry.lsn;
+            if (entry.lsn > ckptLsn) toRedo.add(entry.transactionId);
         });
+        this.recoveredCommits = toRedo.size;
+        if (toRedo.size === 0) return;
 
-        // Phase 2 (in-memory replay): redo committed ops in WAL order, and
-        // collect undo entries for crashed (uncommitted, unaborted) transactions.
-        const undoByTx = new Map<string, LogEntry[]>();
-        for (const entry of replay) {
-            if (committedTransactions.has(entry.transactionId)) {
-                if (entry.operation === 'WRITE') {
-                    this.redoOperation(entry);
-                } else if (entry.operation === 'DELETE') {
-                    this.redoDelete(entry);
-                }
-            } else if (!abortedTransactions.has(entry.transactionId) && entry.key) {
-                let arr = undoByTx.get(entry.transactionId);
-                if (!arr) { arr = []; undoByTx.set(entry.transactionId, arr); }
-                arr.push(entry);
-            }
-        }
-
-        // Phase 3: reverse undo — per-transaction reverse WAL order, globally LSN-descending
-        const allUndoEntries: LogEntry[] = [];
-        for (const arr of undoByTx.values()) {
-            allUndoEntries.push(...arr);
-        }
-        allUndoEntries.sort((a, b) => b.lsn - a.lsn);
-        for (const entry of allUndoEntries) {
-            this.undoOperation(entry);
-        }
+        this.wal.streamSince(floorLsn, (entry) => {
+            if (entry.lsn < floorLsn) return;
+            if (!toRedo.has(entry.transactionId)) return;
+            if (entry.operation === 'WRITE') this.redoOperation(entry);
+            else if (entry.operation === 'DELETE') this.redoDelete(entry);
+        });
     }
 
     private redoOperation(entry: LogEntry): void {
@@ -1783,23 +1972,6 @@ export class ACIDStorageEngine {
         }
     }
 
-    private undoOperation(entry: LogEntry): void {
-        if (!entry.key) return;
-
-        const filePath = partitionedPath(this.dbPath, entry.key!);
-
-        if (entry.operation === 'WRITE') {
-            if (entry.beforeImage === null || entry.beforeImage === undefined) {
-                if (existsSync(filePath)) {
-                    unlinkSync(filePath);
-                }
-            } else {
-                this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
-            }
-        } else if (entry.operation === 'DELETE' && entry.beforeImage !== undefined && entry.beforeImage !== null) {
-            this.atomicWriteFile(filePath, JSON.stringify(entry.beforeImage));
-        }
-    }
 
     /**
      * Atomic data file write: write to a temp file then atomically rename over
@@ -1863,7 +2035,7 @@ export class ACIDStorageEngine {
      * `Promise<void>` only when the lock is contended and we must wait in queue.
      * Callers should check: `if (result !== undefined) await result;`
      */
-    write(transactionId: string, key: string, data: any, cachedBeforeImage?: any): void | Promise<void> {
+    write(transactionId: string, key: string, data: any, cachedBeforeImage?: any, replace = false, dataJson?: string): void | Promise<void> {
         const transaction = this.activeTransactions.get(transactionId);
         if (!transaction || transaction.status !== 'active') {
             throw new Error(`Invalid transaction: ${transactionId}`);
@@ -1877,7 +2049,7 @@ export class ACIDStorageEngine {
             return lockResult.then(() => {
                 transaction.waitingLocks.delete(key);
                 transaction.heldLocks.add(key);
-                this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage);
+                this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage, replace, dataJson);
             }).catch((err) => {
                 transaction.waitingLocks.delete(key);
                 throw err;
@@ -1886,7 +2058,7 @@ export class ACIDStorageEngine {
 
         // Fast path: lock granted synchronously — do the write work sync, return void
         transaction.heldLocks.add(key);
-        this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage);
+        this.doWriteSync(transactionId, key, data, transaction, cachedBeforeImage, replace, dataJson);
     }
 
     /**
@@ -1894,12 +2066,13 @@ export class ACIDStorageEngine {
      * Pure in-memory + buffer operations: before-image lookup, deepMerge, WAL buffer,
      * pendingWrites tracking. No syscalls, no Promises.
      */
-    private doWriteSync(transactionId: string, key: string, data: any, transaction: any, cachedBeforeImage?: any): void {
+    private doWriteSync(transactionId: string, key: string, data: any, transaction: any, cachedBeforeImage?: any, replace = false, dataJson?: string): void {
         try {
             const pendingTx = this.pendingWrites.get(transactionId)!;
 
             // Determine "before image" — check pending writes, then committedBuffer, then cached, then disk
             let currentData: any = null;
+            let beforeUnknown = false;
             const pending = pendingTx.get(key);
             if (pending) {
                 if (pending.op === 'delete') {
@@ -1912,6 +2085,12 @@ export class ACIDStorageEngine {
                 currentData = committed.op === 'write' ? committed.data : null;
             } else if (cachedBeforeImage !== undefined) {
                 currentData = cachedBeforeImage;
+            } else if (replace) {
+                // A replace never merges, so the old document is only needed if a snapshot
+                // is running when this commits. Reading + parsing it from disk on every
+                // write doubled the cost of rewriting a large document; resolve it lazily
+                // at commit instead (see commitTransaction).
+                beforeUnknown = true;
             } else {
                 const filePath = partitionedPath(this.dbPath, key);
                 if (existsSync(filePath)) {
@@ -1924,18 +2103,28 @@ export class ACIDStorageEngine {
                 }
             }
 
-            const beforeImage = currentData;
-            const afterImage = this.deepMerge(currentData || {}, data);
+            // The before-image is the state before this TRANSACTION, not before this write.
+            const beforeImage = pending ? pending.beforeImage : currentData;
+            if (pending) beforeUnknown = pending.beforeUnknown === true;
+            // replace: the document becomes exactly `data` (fields absent from it are
+            // removed). Default: deep-merge into the current document.
+            // replace adopts `data` as-is: callers (Tero.write, _writeRaw) pass a
+            // private JSON copy, so cloning again here would only cost time.
+            const afterImage = replace ? data : this.deepMerge(currentData || {}, data);
 
+            // The before-image stays in memory (pendingWrites) for snapshots; the WAL
+            // only needs the after-image for redo, which halves its volume.
+            // For a replace the after-image IS the caller's document, so its JSON (if
+            // supplied) is reused for the WAL record and later the data file.
+            const json = replace ? dataJson : undefined;
             this.wal.writeLog({
                 operation: 'WRITE',
                 transactionId,
                 key,
-                beforeImage,
                 afterImage
-            });
+            }, json);
 
-            pendingTx.set(key, { beforeImage, afterImage, op: 'write' });
+            pendingTx.set(key, { beforeImage, afterImage, op: 'write', json, beforeUnknown });
             transaction.operations.push({ key, operation: 'write' });
 
         } catch (error) {
@@ -2108,11 +2297,10 @@ export class ACIDStorageEngine {
                 operation: 'DELETE',
                 transactionId,
                 key,
-                beforeImage,
                 afterImage: null
             });
 
-            pendingTx.set(key, { beforeImage, afterImage: null, op: 'delete' });
+            pendingTx.set(key, { beforeImage, afterImage: null, op: 'delete', beforeUnknown: pending ? pending.beforeUnknown === true : false });
             transaction.operations.push({ key, operation: 'delete' });
 
         } catch (error) {
@@ -2156,29 +2344,38 @@ export class ACIDStorageEngine {
                 // If a snapshot is active at ckptLsn and this commit is after ckptLsn, preserve pre-snapshot state
                 if (this.activeSnapshotLsn !== null && commitLsn > this.activeSnapshotLsn) {
                     if (!this.snapshotBeforeImages.has(key)) {
+                        // This key's committed state right now (its own commit is not in
+                        // committedBuffer yet) is exactly the pre-snapshot image.
+                        const before = op.beforeUnknown ? this.readCommittedState(key) : op.beforeImage;
                         this.snapshotBeforeImages.set(key, {
-                            state: op.beforeImage === null || op.beforeImage === undefined ? 'deleted' : 'present',
-                            data: op.beforeImage !== null && op.beforeImage !== undefined ? cloneJson(op.beforeImage) : undefined
+                            state: before === null || before === undefined ? 'deleted' : 'present',
+                            data: before !== null && before !== undefined ? cloneJson(before) : undefined
                         });
                     }
                 }
 
                 if (op.op === 'write' && op.afterImage !== undefined && op.afterImage !== null) {
-                    this.committedBuffer.set(key, { data: op.afterImage, op: 'write' });
-                    this.dirtyKeys.set(key, {
-                        key,
-                        lsn: commitLsn,
-                        state: 'present',
-                        data: cloneJson(op.afterImage)
-                    });
+                    this.committedBuffer.set(key, { data: op.afterImage, op: 'write', json: op.json });
+                    if (this.trackDirty) {
+                        // By reference: committed images are never mutated, and
+                        // peekDirtyKeys() clones on the way out.
+                        this.dirtyKeys.set(key, {
+                            key,
+                            lsn: commitLsn,
+                            state: 'present',
+                            data: op.afterImage
+                        });
+                    }
                 } else if (op.op === 'delete') {
                     this.committedBuffer.set(key, { data: null, op: 'delete' });
-                    this.dirtyKeys.set(key, {
-                        key,
-                        lsn: commitLsn,
-                        state: 'deleted',
-                        data: undefined
-                    });
+                    if (this.trackDirty) {
+                        this.dirtyKeys.set(key, {
+                            key,
+                            lsn: commitLsn,
+                            state: 'deleted',
+                            data: undefined
+                        });
+                    }
                 }
             }
         }
@@ -2197,6 +2394,7 @@ export class ACIDStorageEngine {
 
         // Bound WAL growth: periodically rotate when no active transactions are left.
         this.commitCount++;
+        this.commitsSinceDurableCheckpoint++;
         if (this.commitCount % this.COMMIT_INTERVAL === 0 &&
             this.getActiveTransactions().length === 0) {
             try {
@@ -2241,6 +2439,25 @@ export class ACIDStorageEngine {
         if (this.finishedTransactions.size > 1000) {
             const first = this.finishedTransactions.keys().next().value;
             if (first) this.finishedTransactions.delete(first);
+        }
+    }
+
+    /** Last committed image of a key: committedBuffer first, then the data file. null when absent. */
+    private readCommittedState(key: string): any {
+        const committed = this.committedBuffer.get(key);
+        if (committed) return committed.op === 'write' ? committed.data : null;
+        const filePath = partitionedPath(this.dbPath, key);
+        let content: string;
+        try {
+            content = readFileSync(filePath, 'utf-8');
+        } catch (err: any) {
+            if (err?.code === 'ENOENT') return null;
+            throw err;
+        }
+        try {
+            return content.trim() ? JSON.parse(content) : {};
+        } catch {
+            throw new DataCorruptionError(`Data corruption detected in document '${key}': invalid JSON content at ${filePath}`);
         }
     }
 
@@ -2297,13 +2514,92 @@ export class ACIDStorageEngine {
         );
     }
 
+    private checkpointInFlight = false;
+
+    /**
+     * forceCheckpoint() without blocking the event loop on fsync: data files are
+     * written now, fsynced on the libuv pool, and only then is the durable
+     * CHECKPOINT logged. Used by the periodic timer; close() uses the sync form.
+     */
+    async forceCheckpointAsync(): Promise<void> {
+        if (this.checkpointInFlight) return;
+        this.checkpointInFlight = true;
+        const lsn = this.lastCommittedLSN;
+        const floorLsn = this.getReplayFloorLsn();
+        const commitsAtCapture = this.commitsSinceDurableCheckpoint;
+        try {
+            this.flushCommittedBuffer(false, Infinity); // write everything committed so far (no fsync)
+            // That flush is synchronous and unbounded, so anything still buffered failed
+            // to write (disk full, I/O error). Never log a durable checkpoint over it.
+            if (this.committedBuffer.size > 0) {
+                throw new Error(`Checkpoint aborted: ${this.committedBuffer.size} committed document(s) could not be written to their data files`);
+            }
+            const files = [...this.unsyncedFiles];
+            const dirs = [...this.unsyncedDirs];
+            this.unsyncedFiles.clear();
+            this.unsyncedDirs.clear();
+            // Visible to a synchronous checkpoint (close()) that runs meanwhile.
+            this.inFlightFsync = { files, dirs };
+            const fsyncPath = (p: string) => new Promise<void>((resolve, reject) => {
+                openCb(p, 'r', (err, fd) => {
+                    if (err) { if ((err as any).code === 'ENOENT') resolve(); else reject(err); return; }
+                    fsyncCb(fd, (e2) => closeCb(fd, () => (e2 ? reject(e2) : resolve())));
+                });
+            });
+            try {
+                for (let i = 0; i < files.length; i += 32) await Promise.all(files.slice(i, i + 32).map(fsyncPath));
+                for (let i = 0; i < dirs.length; i += 32) await Promise.all(dirs.slice(i, i + 32).map(fsyncPath));
+            } catch (err) {
+                for (const f of files) this.unsyncedFiles.add(f);
+                for (const d of dirs) this.unsyncedDirs.add(d);
+                throw err;
+            }
+            // durableLsn = the LSN captured BEFORE the await above. Commits that landed
+            // while the fsyncs ran have LSNs below this record but are NOT covered by it;
+            // recovery redoes everything above durableLsn.
+            const ckpt = this.wal.writeLog({ operation: 'CHECKPOINT', transactionId: 'SYSTEM', durable: true, floorLsn, durableLsn: lsn });
+            this.wal.forceFlush();
+            this.durableCheckpoint = { lsn, floorLsn };
+            this.wal.setRecoveryFloor(floorLsn);
+            this.commitsSinceDurableCheckpoint = Math.max(0, this.commitsSinceDurableCheckpoint - commitsAtCapture);
+        } finally {
+            this.checkpointInFlight = false;
+            this.inFlightFsync = null;
+        }
+    }
+    private inFlightFsync: { files: string[]; dirs: string[] } | null = null;
+
+    /**
+     * Durable checkpoint. Afterwards every commit up to now is fsynced into the data
+     * files, so crash recovery only replays WAL written after this point.
+     *
+     * Order matters: capture the LSN and replay floor first (synchronously, so no
+     * commit can slip between), then make data durable, then log the CHECKPOINT.
+     */
     forceCheckpoint(): void {
+        const lsn = this.lastCommittedLSN;
+        const floorLsn = this.getReplayFloorLsn();
         this.flushCommittedBuffer(true);
-        this.wal.writeLog({
+        // Files the background flush wrote without fsync (normal mode) must be
+        // durable too before the checkpoint may claim them.
+        const pending = this.inFlightFsync;
+        for (const file of [...this.unsyncedFiles, ...(pending?.files ?? [])]) {
+            try { this.fsyncFile(file); } catch (err: any) { if (err?.code !== 'ENOENT') throw err; }
+        }
+        for (const dir of [...this.unsyncedDirs, ...(pending?.dirs ?? [])]) this.fsyncDir(dir);
+        this.unsyncedFiles.clear();
+        this.unsyncedDirs.clear();
+        const ckpt = this.wal.writeLog({
             operation: 'CHECKPOINT',
-            transactionId: 'SYSTEM'
+            transactionId: 'SYSTEM',
+            durable: true,
+            floorLsn,
+            durableLsn: lsn,
         });
         this.wal.forceFlush(); // explicit barrier — always fsync regardless of mode
+        this.durableCheckpoint = { lsn: Math.max(lsn, ckpt), floorLsn };
+        this.wal.setRecoveryFloor(floorLsn);
+        this.commitsSinceDurableCheckpoint = 0;
     }
 
     /**
@@ -2391,7 +2687,8 @@ export class ACIDStorageEngine {
             let success = false;
             if (entry.op === 'write') {
                 try {
-                    this.atomicWriteFile(filePath, JSON.stringify(entry.data), syncNeeded);
+                    this.atomicWriteFile(filePath, entry.json ?? JSON.stringify(entry.data), syncNeeded);
+                    if (!syncNeeded) this.unsyncedFiles.add(filePath);
                     success = true;
                 } catch (err) {
                     if (forceFsync) throw err;
@@ -2412,6 +2709,9 @@ export class ACIDStorageEngine {
             }
         }
 
+        if (!syncNeeded) {
+            for (const dir of touchedDirs) this.unsyncedDirs.add(dir);
+        }
         if (syncNeeded) {
             for (const dir of touchedDirs) {
                 try {
@@ -2451,8 +2751,20 @@ export class ACIDStorageEngine {
             this.dataFlushTimer = undefined;
         }
 
-        // Final flush of any unflushed committed data (force=true: drain entire buffer before teardown)
-        this.flushCommittedBuffer(true);
+        if (this.durableCheckpointTimer) {
+            clearInterval(this.durableCheckpointTimer);
+            this.durableCheckpointTimer = undefined;
+        }
+
+        // Final durable checkpoint: drains the buffer, fsyncs, and lets the next
+        // boot skip replaying this session's WAL entirely.
+        try {
+            this.forceCheckpoint();
+        } catch {
+            // Directory gone or unwritable — fall back to a plain drain; the WAL
+            // (if it still exists) remains the source of truth for recovery.
+            this.flushCommittedBuffer(true);
+        }
 
         // Clean up memory
         this.activeTransactions.clear();
