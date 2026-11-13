@@ -7,12 +7,7 @@ RecoveryTestDB/**
 BackupFormatTestDB/**
 MyDatabase/**
 scheduled-backups/**
-tero-live-test/**
-TeroLive/**
-TeroLive**/**
-TestConc/**
-TestConc2/**
-tmp_*/**
+tero-live-test/** 
 *.wal
 *.wal.*
 *.tar.gz
@@ -30,3 +25,4 @@ ChaosSoakDB
 test_**
 ProdTestDB/
 .DS_Store
+Tero**/**
